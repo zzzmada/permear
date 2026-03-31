@@ -1,0 +1,46 @@
+# =============================================================================
+# PERMEAR — Add these blocks to your configuration.yaml
+# =============================================================================
+
+shell_command:
+  # Daily memory
+  append_daily_event: 'python3 /config/scripts/append_daily.py event "{{ detail }}"'
+  append_daily_interaction: 'python3 /config/scripts/append_daily.py interaction "{{ detail }}"'
+  append_daily_memory: 'python3 /config/scripts/append_daily.py memory "{{ detail }}"'
+  append_daily_flag: 'python3 /config/scripts/append_daily.py flag "{{ detail }}"'
+  
+  # Briefing
+  build_briefing_prompt: 'python3 /config/scripts/build_briefing.py'
+  update_daily_memory: "python3 /config/scripts/update_daily_memory.py '{{ response }}'"
+  
+  # Pre-briefing
+  build_prebriefing_prompt: 'python3 /config/scripts/build_prebriefing.py "{{ state }}"'
+  apply_quick_learning: "python3 /config/scripts/apply_quick_learning.py '{{ response }}'"
+  
+  # Weekly compilation
+  build_weekly_prompt: 'python3 /config/scripts/build_weekly_prompt.py'
+  weekly_compile: "python3 /config/scripts/weekly_compile.py '{{ response }}'"
+
+# Command-line sensors for memory exposure
+command_line:
+  # Current day's memory — refreshes every 5 minutes
+  - sensor:
+      name: "Current Day Memory"
+      command: 'python3 /config/scripts/sensor_current_day.py'
+      scan_interval: 300
+      value_template: "ok"
+      json_attributes:
+        - events
+        - interactions
+        - daily_memories
+
+  # Perennial files — refreshes every hour
+  - sensor:
+      name: "Perennial Memory"
+      command: 'python3 /config/scripts/sensor_perennial.py'
+      scan_interval: 3600
+      value_template: "ok"
+      json_attributes:
+        - soul
+        - users
+        - insights

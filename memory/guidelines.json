@@ -1,0 +1,38 @@
+{
+  "_warning": "This file is IMMUTABLE. chmod 444. The agent cannot and must not edit it. Only the human owner edits this file.",
+  "_description": "These are the rules the agent MUST follow when editing perennial files during weekly compilation.",
+
+  "guidelines_insights": {
+    "purpose": "Record observable and verifiable behavioral patterns of the house and its residents.",
+    "rules": [
+      "Only record a pattern if observed on at least 3 distinct days.",
+      "Each pattern must be a short, factual sentence — no emotional interpretation.",
+      "Maximum 30 patterns. If full, replace the oldest or least relevant.",
+      "Never record medical, financial, or private conversation data as patterns.",
+      "Pending items must be actionable: something the agent or user can resolve.",
+      "Remove a pending item when resolved or after 30 days without mention."
+    ]
+  },
+
+  "guidelines_soul": {
+    "purpose": "Define the agent's personality, tone, and behavioral rules.",
+    "rules": [
+      "The agent may propose adjustments to soul.json but must NEVER alter: name, mission, or values.",
+      "Allowed adjustments: refine behavioral rules based on explicit user feedback.",
+      "Example allowed: 'User asked to include tomorrow's forecast in the briefing' → add rule.",
+      "Example forbidden: changing tone from 'direct' to 'expansive' without explicit request.",
+      "Maximum 15 behavioral rules. Consolidate if necessary."
+    ]
+  },
+
+  "guidelines_users": {
+    "purpose": "Maintain updated profiles of residents based on observation and interaction.",
+    "rules": [
+      "Update preferences only when the user demonstrates consistently (3+ times) or asks explicitly.",
+      "Never infer emotional or health states as permanent preferences.",
+      "Schedules and routine patterns may be updated based on daily log data.",
+      "New residents or frequent visitors may be added after 3+ appearances.",
+      "Keep minimal data: name, role, comfort preferences, interaction style."
+    ]
+  }
+}
