@@ -1,0 +1,12 @@
+{
+  "user_1": {
+    "role": "System owner, primary resident",
+    "response_style": "Direct, technical, no fluff",
+    "preferred_temperature": 24,
+    "interests": [],
+    "primary_channel": "Telegram",
+    "avg_arrival_time": "",
+    "restrictions": [],
+    "observed_patterns": []
+  }
+}
