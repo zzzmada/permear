@@ -1,0 +1,29 @@
+{
+  "_description": "Actions the agent is allowed to execute autonomously. Every action MUST notify via Telegram. Actions in 'proposed' are suggestions from the weekly compilation — move to 'approved' to activate.",
+
+  "approved": [],
+
+  "proposed": [],
+
+  "_example_action": {
+    "id": "ac_suite_humidity",
+    "description": "Turn on suite AC at 24 degrees when humidity >= 70% after 18h",
+    "conditions": [
+      {"entity": "sensor.YOUR_HUMIDITY_SENSOR", "operator": ">=", "value": 70},
+      {"type": "time_after", "value": "18:00"},
+      {"type": "time_before", "value": "23:00"},
+      {"entity": "person.YOUR_PERSON", "operator": "==", "value": "home"}
+    ],
+    "action": {
+      "service": "climate.set_temperature",
+      "data": {
+        "entity_id": "climate.YOUR_AC",
+        "temperature": 24,
+        "hvac_mode": "cool"
+      }
+    },
+    "notification": "Turned on suite AC at 24 degrees — humidity was at {trigger_value}%.",
+    "cooldown_minutes": 120,
+    "last_executed": null
+  }
+}

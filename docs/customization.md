@@ -9,6 +9,69 @@ All prompts are in English by default. To have the agent respond in another lang
 
 You can simply add "Respond in [your language]." to the end of each prompt. The JSON keys and file structure remain in English regardless of the agent's response language.
 
+## Localizing Rejection Keywords (Quick Learning)
+
+**This is critical for non-English users.** The `permear_quick_learning` automation detects when the user rejects a pre-briefing alert by matching keywords in the Telegram message. These keywords are hardcoded in the automation's condition template and **must match the language the user actually types in**.
+
+If your users communicate in a language other than English, you **must** update the keyword list or the quick-learning system will never trigger.
+
+### Default keywords (English)
+
+```yaml
+{{ 'irrelevant' in text or
+   'unnecessary' in text or
+   'already know' in text or
+   'stop alerting' in text or
+   'dont alert' in text or
+   "don't alert" in text or
+   'not important' in text or
+   'dont care' in text or
+   "don't care" in text or
+   'stop telling' in text or
+   'i know' in text }}
+```
+
+### Example: Portuguese (pt-BR)
+
+Replace or extend the keyword list in `permear_quick_learning`:
+
+```yaml
+{{ 'irrelevante' in text or
+   'desnecessario' in text or
+   'desnecessário' in text or
+   'já sei' in text or
+   'ja sei' in text or
+   'não preciso' in text or
+   'nao preciso' in text or
+   'para de avisar' in text or
+   'não me avise' in text or
+   'nao me avise' in text or
+   'não importa' in text or
+   'nao importa' in text or
+   'sem importancia' in text or
+   'sem importância' in text }}
+```
+
+### Example: Spanish
+
+```yaml
+{{ 'irrelevante' in text or
+   'innecesario' in text or
+   'ya lo sé' in text or
+   'ya lo se' in text or
+   'no me avises' in text or
+   'deja de avisar' in text or
+   'no importa' in text or
+   'no me interesa' in text }}
+```
+
+### Tips for keyword selection
+
+- Include both accented and non-accented versions (e.g., `desnecessário` and `desnecessario`) since users may type without accents on mobile keyboards.
+- Use `| lower` in the template (already applied) so capitalization does not matter.
+- Test by sending each keyword phrase to your bot and verifying the automation triggers in the HA automation trace.
+- You can support multiple languages simultaneously by combining all keywords in a single condition.
+
 ## Guidelines
 
 The `guidelines.json` file is your constitution. Examples of customizations:
@@ -129,7 +192,3 @@ Add triggers to `permear_buffer_events` for any HA entity you want tracked:
 ```
 
 The more relevant events you capture, the richer the daily briefing and the better the weekly compilation's pattern detection.
-
-## Quick-Learn Keywords
-
-The `permear_quick_learning` automation triggers on rejection keywords. To customize for your language or preferences, edit the keyword list in the automation's condition template. Add any phrase your household naturally uses to dismiss unwanted alerts.

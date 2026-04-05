@@ -34,5 +34,19 @@
       "New residents or frequent visitors may be added after 3+ appearances.",
       "Keep minimal data: name, role, comfort preferences, interaction style."
     ]
+  },
+
+  "guidelines_allowed_actions": {
+    "purpose": "Propose autonomous actions the agent can execute without asking for confirmation.",
+    "rules": [
+      "Every proposed action MUST include a Telegram notification — no silent actions ever.",
+      "Only propose actions based on patterns observed consistently (3+ occurrences).",
+      "Actions must be reversible or low-risk: climate control, lights, notifications. Never propose actions involving locks, alarms, purchases, or irreversible changes.",
+      "Each action must have a cooldown of at least 60 minutes to prevent loops.",
+      "Conditions must be specific and verifiable: use exact entity_ids, numeric thresholds, and time ranges.",
+      "Maximum 10 approved actions at any time.",
+      "The agent proposes, the user approves. NEVER auto-approve actions.",
+      "If an action was repeatedly overridden by the user (3+ times), propose its removal."
+    ]
   }
 }

@@ -3,11 +3,15 @@
 Weekly compilation. Receives JSON from the LLM with proposed edits
 to perennial files. Applies them respecting guidelines.
 Creates backups before any edit.
+
+v4.0: Handles proposed_actions for allowed_actions.json
+v4.0: Detects truncated JSON from MAX_TOKENS limit
 """
 import json, sys, os, shutil
 from datetime import datetime
 
 MEMORY_DIR = "/config/memory"
+LOG_DIR = "/config/logs"
 
 def load_json(path, default=None):
     if default is None:
@@ -22,6 +26,45 @@ def backup_file(path):
     if os.path.exists(path):
         backup = path + f".bak.{datetime.now().strftime('%Y%m%d')}"
         shutil.copy2(path, backup)
+
+def detect_truncation(raw_text):
+    """
+    Detect if the LLM response was truncated due to MAX_TOKENS.
+    Signs: unbalanced braces, trailing incomplete strings, no closing brace.
+    """
+    if not raw_text or not raw_text.strip():
+        return True, "Empty response"
+
+    stripped = raw_text.strip()
+
+    # Count braces
+    open_braces = stripped.count('{')
+    close_braces = stripped.count('}')
+    open_brackets = stripped.count('[')
+    close_brackets = stripped.count(']')
+
+    if open_braces > close_braces:
+        return True, f"Unbalanced braces: {open_braces} open vs {close_braces} close"
+    if open_brackets > close_brackets:
+        return True, f"Unbalanced brackets: {open_brackets} open vs {close_brackets} close"
+
+    # Check if it ends with valid JSON termination
+    if stripped and stripped[-1] not in ['}', ']', '"', 'e', 'l']:
+        return True, f"Response ends with '{stripped[-20:]}' — likely truncated"
+
+    return False, None
+
+def log_error(raw_text, error_msg):
+    """Log truncated/failed response for debugging."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_file = os.path.join(LOG_DIR, f"weekly_compile_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    with open(log_file, 'w') as f:
+        f.write(f"Error: {error_msg}\n")
+        f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+        f.write(f"Raw response length: {len(raw_text)}\n")
+        f.write(f"--- RAW RESPONSE ---\n")
+        f.write(raw_text)
+    print(f"Error log saved to {log_file}")
 
 def apply_insights(current, edits, guidelines):
     max_patterns = 30
@@ -94,6 +137,39 @@ def apply_users(current, edits, guidelines):
 
     return current
 
+def apply_proposed_actions(proposed_actions):
+    """Add proposed actions to allowed_actions.json (as proposed, NOT approved)."""
+    actions_path = os.path.join(MEMORY_DIR, "allowed_actions.json")
+    actions_data = load_json(actions_path, {"approved": [], "proposed": []})
+
+    existing_ids = set()
+    for a in actions_data.get("approved", []):
+        existing_ids.add(a.get("id"))
+    for a in actions_data.get("proposed", []):
+        existing_ids.add(a.get("id"))
+
+    added = 0
+    for action in proposed_actions:
+        action_id = action.get("id")
+        if not action_id or action_id in existing_ids:
+            continue
+
+        # Ensure cooldown has a default
+        if "cooldown_minutes" not in action:
+            action["cooldown_minutes"] = 60
+        action["last_executed"] = None
+
+        actions_data.setdefault("proposed", []).append(action)
+        existing_ids.add(action_id)
+        added += 1
+
+    if added > 0:
+        backup_file(actions_path)
+        with open(actions_path, 'w') as f:
+            json.dump(actions_data, f, ensure_ascii=False, indent=2)
+
+    return added
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: weekly_compile.py '<json_from_llm>'")
@@ -101,12 +177,23 @@ def main():
 
     raw = " ".join(sys.argv[1:])
 
+    # Check for truncation BEFORE attempting parse
+    is_truncated, truncation_reason = detect_truncation(raw)
+    if is_truncated:
+        print(f"ERROR: Response appears truncated — {truncation_reason}")
+        print("This usually means max_tokens is too low.")
+        print("Fix: Settings → Google Generative AI → uncheck 'Recommended model settings' → set Maximum tokens to 8192 or higher.")
+        log_error(raw, truncation_reason)
+        return
+
+    # Try to extract JSON
     try:
         start = raw.index('{')
         end = raw.rindex('}') + 1
         edits = json.loads(raw[start:end])
-    except (ValueError, json.JSONDecodeError):
-        print("ERROR: Invalid JSON. Compilation aborted.")
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"ERROR: Invalid JSON — {e}")
+        log_error(raw, str(e))
         return
 
     if edits.get("no_changes"):
@@ -141,6 +228,13 @@ def main():
         with open(os.path.join(MEMORY_DIR, "users.json"), 'w') as f:
             json.dump(users, f, ensure_ascii=False, indent=2)
         results.append("users.json updated")
+
+    if "proposed_actions" in edits:
+        proposed = edits["proposed_actions"]
+        if isinstance(proposed, list) and len(proposed) > 0:
+            added = apply_proposed_actions(proposed)
+            if added > 0:
+                results.append(f"allowed_actions.json: {added} new action(s) proposed — awaiting user approval")
 
     summary = ", ".join(results) if results else "No files modified"
     print(f"Weekly compilation complete: {summary}")

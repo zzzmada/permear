@@ -1,6 +1,12 @@
 # =============================================================================
-# PERMEAR — Add these blocks to your configuration.yaml
+# PERMEAR v4.0 — Add these blocks to your configuration.yaml
 # =============================================================================
+
+# Input text for Telegram reply context
+input_text:
+  permear_last_agent_message:
+    name: "PERMEAR Last Agent Message"
+    max: 255
 
 shell_command:
   # Daily memory
@@ -17,13 +23,16 @@ shell_command:
   build_prebriefing_prompt: 'python3 /config/scripts/build_prebriefing.py "{{ state }}"'
   apply_quick_learning: "python3 /config/scripts/apply_quick_learning.py '{{ response }}'"
   
+  # Allowed actions (v4.0)
+  execute_allowed_actions: 'python3 /config/scripts/execute_allowed_actions.py'
+  process_action_approval: "python3 /config/scripts/process_action_approval.py '{{ command }}'"
+  
   # Weekly compilation
   build_weekly_prompt: 'python3 /config/scripts/build_weekly_prompt.py'
   weekly_compile: "python3 /config/scripts/weekly_compile.py '{{ response }}'"
 
 # Command-line sensors for memory exposure
 command_line:
-  # Current day's memory — refreshes every 5 minutes
   - sensor:
       name: "Current Day Memory"
       command: 'python3 /config/scripts/sensor_current_day.py'
@@ -34,7 +43,6 @@ command_line:
         - interactions
         - daily_memories
 
-  # Perennial files — refreshes every hour
   - sensor:
       name: "Perennial Memory"
       command: 'python3 /config/scripts/sensor_perennial.py'

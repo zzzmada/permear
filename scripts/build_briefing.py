@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build the daily briefing prompt for the LLM."""
+"""
+Build the daily briefing prompt for the LLM.
+v4.0: Compact format, prioritizes pending action approvals.
+"""
 import json, os
 from datetime import datetime
 
@@ -27,62 +30,66 @@ def main():
     insights = load_json(os.path.join(MEMORY_DIR, "insights.json"))
     daily = load_json(os.path.join(MEMORY_DIR, "daily", f"{day_name}.json"),
                       {"events": [], "interactions": [], "daily_memories": []})
+    allowed_actions = load_json(os.path.join(MEMORY_DIR, "allowed_actions.json"),
+                                {"approved": [], "proposed": []})
 
     if daily.get("date") != date_str:
         daily = {"events": [], "interactions": [], "daily_memories": []}
 
-    events_txt = ""
-    for e in daily.get("events", []):
-        events_txt += f"  {e.get('time','?')} - {e.get('detail','?')}\n"
-    if not events_txt:
-        events_txt = "  No events recorded today.\n"
+    # Events — count + last 10 highlights only
+    events = daily.get("events", [])
+    events_txt = f"  {len(events)} events total."
+    if events:
+        events_txt += " Highlights:\n"
+        for e in events[-10:]:
+            events_txt += f"  {e.get('time','?')} - {e.get('detail','?')}\n"
 
-    interactions_txt = ""
-    for i in daily.get("interactions", []):
-        interactions_txt += f"  {i.get('time','?')} ({i.get('channel','?')}): {i.get('summary','?')}\n"
-    if not interactions_txt:
-        interactions_txt = "  No interactions recorded today.\n"
+    # Interactions — count only
+    interactions = daily.get("interactions", [])
+    interactions_txt = f"  {len(interactions)} interactions today."
 
+    # Memories
+    memories = daily.get("daily_memories", [])
     memories_txt = ""
-    for m in daily.get("daily_memories", []):
-        memories_txt += f"  - {m}\n"
-    if not memories_txt:
-        memories_txt = "  No new memories today.\n"
+    if memories:
+        for m in memories:
+            memories_txt += f"  - {m}\n"
+        memories_txt += "  (Note: these were extracted during earlier pre-briefings today.)\n"
+    else:
+        memories_txt = "  No memories extracted today.\n"
 
-    patterns_txt = ""
-    for p in insights.get("detected_patterns", []):
-        patterns_txt += f"  - {p}\n"
-    if not patterns_txt:
-        patterns_txt = "  No patterns recorded yet.\n"
+    # Pending action approvals
+    proposed = allowed_actions.get("proposed", [])
+    approvals_txt = ""
+    if proposed:
+        approvals_txt = "PENDING ACTION APPROVALS:\n"
+        for i, action in enumerate(proposed, 1):
+            approvals_txt += f"  {i}. {action.get('description', 'No description')}\n"
+        approvals_txt += "  → Tell the user to reply: approve 1, approve 2, reject 1, etc.\n"
 
+    # Pending items — compact
+    pending = insights.get("pending_items", [])
     pending_txt = ""
-    for p in insights.get("pending_items", []):
-        pending_txt += f"  - {p}\n"
-    if not pending_txt:
-        pending_txt = "  No pending items.\n"
+    if pending:
+        pending_txt = "OPEN ITEMS: " + "; ".join(pending) + "\n"
 
     prompt = f"""You are {soul.get('name', 'Assistant')}, a residential assistant.
 
 TASK: Generate the daily briefing for {day_display}, {date_str}.
-This text will be sent as a Telegram message.
-Format: flowing text, concise, max 200 words. No emojis, no markdown.
+Sent as Telegram message. Be CONCISE: max 120 words. No emojis, no markdown.
 
-TODAY'S EVENTS:
-{events_txt}
-TODAY'S INTERACTIONS (voice and Telegram):
+{approvals_txt}
+TODAY: {events_txt}
 {interactions_txt}
-MEMORIES RECORDED TODAY:
-{memories_txt}
-LONG-TERM PATTERNS (insights):
-{patterns_txt}
-OPEN PENDING ITEMS:
+MEMORIES LEARNED: {memories_txt}
 {pending_txt}
-INSTRUCTIONS:
-1. Summarize the day intelligently: what happened, what was different from the usual pattern.
-2. Highlight memories recorded today — the user wants to know what the system learned.
-3. If there are relevant pending items, mention briefly.
-4. If nothing special happened, say so in one sentence and mention something useful.
-5. Tone: direct, informative, like a shift report."""
+STRUCTURE YOUR RESPONSE IN THIS ORDER:
+1. FIRST — If there are pending action approvals, present them clearly and ask the user to approve or reject each one by number (e.g., "reply approve 1 or reject 1"). This is the priority.
+2. SECOND — One or two sentences about the day: what happened, anything unusual.
+3. THIRD — What the system learned today (memories), in one sentence.
+4. Skip anything routine or already known from patterns.
+
+Tone: direct, like a brief shift report. If nothing notable happened, say so in one sentence."""
 
     print(prompt)
 

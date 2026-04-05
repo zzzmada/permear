@@ -6,7 +6,7 @@ A three-layer persistent memory system that transforms Home Assistant's Gemini (
 
 ## What This Is
 
-Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture inspired by [OpenClaw's](https://github.com/AICraftAlchemy/OpenClaw) `SOUL.md` / `MEMORY.md` / `USER.md` concept — but without the middleware overhead.
+Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture that gives your agent a persistent soul, user profiles, and learned insights — without external databases or middleware.
 
 **The system runs entirely on local JSON files + Python scripts + HA automations.** The LLM itself manages its own memory through structured prompts and a weekly self-improvement cycle.
 
@@ -45,9 +45,11 @@ Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory betwe
 ┌──────────────────────────────────────────────────────────────┐
 │                        CYCLES                                 │
 │                                                               │
-│  Every 30 min ─── PRE-BRIEFING ──── Evaluate house state     │
-│  (08h-20h)        Read perennials    Alert if relevant        │
-│                   Read daily          SILENCE if not           │
+│  Every 30 min ─── PRE-BRIEFING ──── 1. Execute allowed       │
+│  (08h-20h)                              actions (if any)     │
+│                                      2. Evaluate house state  │
+│                   Read perennials       Alert if relevant     │
+│                   Read daily            SILENCE if not        │
 │                   Quick-learn from    ◄── User feedback        │
 │                   rejections                                  │
 │                                                               │
@@ -57,8 +59,8 @@ Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory betwe
 │                                                               │
 │  Sunday 00:05 ─── WEEKLY COMPILE ─── Read all 7 dailies       │
 │                   Read guidelines     Update perennials        │
-│                   Detect patterns     Backup before edit       │
-│                   Self-improve        Report via Telegram      │
+│                   Detect patterns     Propose new actions      │
+│                   Self-improve        Backup + report          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -79,6 +81,10 @@ The pre-briefing system starts noisy (the agent alerts about everything) and bec
 ### 7-Day Rotation Without Cleanup
 
 Daily files are named by weekday (`monday.json` through `sunday.json`), not by date. Next Monday's events overwrite this Monday's file automatically. No cron jobs to delete old files, no growing storage. The weekly compilation on Sunday extracts patterns before the files get overwritten.
+
+### Allowed Actions: Supervised Autonomy
+
+The agent can propose autonomous actions based on patterns it detects (e.g., "turn on AC when humidity exceeds 70% after 6pm"). These go to `allowed_actions.json` as **proposed** — they do nothing until you manually move them to **approved**. Every executed action sends a Telegram notification. The agent proposes, you approve, the system executes, and always tells you what it did.
 
 ## Requirements
 
@@ -124,6 +130,7 @@ memory/
 ├── soul.json           →  /config/memory/soul.json
 ├── users.json          →  /config/memory/users.json
 ├── insights.json       →  /config/memory/insights.json
+├── allowed_actions.json →  /config/memory/allowed_actions.json
 
 scripts/
 ├── append_daily.py             →  /config/scripts/append_daily.py
@@ -133,6 +140,7 @@ scripts/
 ├── update_daily_memory.py      →  /config/scripts/update_daily_memory.py
 ├── weekly_compile.py           →  /config/scripts/weekly_compile.py
 ├── apply_quick_learning.py     →  /config/scripts/apply_quick_learning.py
+├── execute_allowed_actions.py  →  /config/scripts/execute_allowed_actions.py
 ├── sensor_current_day.py       →  /config/scripts/sensor_current_day.py
 └── sensor_perennial.py         →  /config/scripts/sensor_perennial.py
 ```
@@ -145,7 +153,37 @@ chmod 444 /config/memory/guidelines.json
 
 This prevents the agent (or any script bug) from modifying the file at the OS level.
 
-### Step 4: Customize the memory files
+### Step 4: Create HA access token (required for allowed actions)
+
+The `execute_allowed_actions.py` script calls the HA REST API to read sensor states and execute services. It needs a long-lived access token:
+
+1. Go to your HA profile (click your username in the sidebar)
+2. Scroll to **Long-Lived Access Tokens** → **Create Token**
+3. Name it "PERMEAR" and copy the token
+4. Save it:
+
+```bash
+echo "YOUR_TOKEN_HERE" > /config/.permear_token
+chmod 600 /config/.permear_token
+```
+
+If you don't plan to use allowed actions, you can skip this step — the rest of PERMEAR works without it.
+
+### Step 5: Configure max_tokens for weekly compilation
+
+The weekly compilation prompt sends all 7 daily files to the LLM and expects a structured JSON response. The default `max_tokens` in most HA LLM integrations is too low and will cause truncated responses.
+
+**For Google Generative AI integration:**
+1. Settings → Integrations → Google Generative AI → Configure
+2. Uncheck "Recommended model settings"
+3. Set **Maximum tokens to return in response** to `8192` or higher
+
+**For OpenAI integration:**
+Set `max_tokens: 8192` in the integration configuration.
+
+If the weekly compilation fails with "Invalid JSON" or "Response appears truncated," this is almost certainly the cause.
+
+### Step 6: Customize the memory files
 
 Edit these files to match your household:
 
@@ -155,13 +193,14 @@ Edit these files to match your household:
 
 **`guidelines.json`** — The rules for how the agent is allowed to edit the perennial files during weekly compilation. See [Customization Guide](docs/customization.md) for details.
 
-### Step 5: Add to configuration.yaml
+### Step 7: Add to configuration.yaml
 
 Add the contents of [`configuration_additions.yaml`](configuration_additions.yaml) to your `configuration.yaml`. This includes:
+- An `input_text` helper for Telegram reply context
 - Shell commands for all scripts
 - Command-line sensors for daily and perennial memory
 
-### Step 6: Configure Telegram
+### Step 8: Configure Telegram
 
 If not already done, set up the [Telegram bot integration](https://www.home-assistant.io/integrations/telegram/) in polling mode:
 
@@ -170,7 +209,7 @@ If not already done, set up the [Telegram bot integration](https://www.home-assi
 3. Configure via the HA UI (Settings → Integrations → Telegram Bot)
 4. If you previously used webhook mode, clear it: `https://api.telegram.org/botYOUR_TOKEN/deleteWebhook`
 
-### Step 7: Add automations
+### Step 9: Add automations
 
 Copy [`automations/permear.yaml`](automations/permear.yaml) and update:
 - `YOUR_CHAT_ID` → your Telegram chat_id (integer)
@@ -178,7 +217,7 @@ Copy [`automations/permear.yaml`](automations/permear.yaml) and update:
 - Sensor entity_ids to match your actual devices
 - Time windows to match your schedule
 
-### Step 8: Create a Telegram send script
+### Step 10: Create a Telegram send script
 
 Create a script in HA (Settings → Automations & Scenes → Scripts) that the agent can use for outbound Telegram:
 
@@ -199,7 +238,7 @@ fields:
 
 Expose this script to your conversation agent.
 
-### Step 9: Restart and test
+### Step 11: Restart and test
 
 ```bash
 # Validate YAML first
@@ -229,6 +268,7 @@ Developer Tools → Services → shell_command.build_briefing_prompt
 | `soul.json` | Agent personality and behavior | Weekly compile | Weekly |
 | `users.json` | Household member profiles | Weekly compile + quick-learn | Weekly + on rejection |
 | `insights.json` | Detected patterns and learnings | Weekly compile | Weekly |
+| `allowed_actions.json` | Autonomous actions the agent can execute | Weekly compile (propose) + human (approve) | Weekly |
 | `daily/*.json` | Day's events, interactions, memories | Automations + briefing | Continuously |
 
 ### Scripts
@@ -242,6 +282,8 @@ Developer Tools → Services → shell_command.build_briefing_prompt
 | `build_weekly_prompt.py` | Weekly compilation (Sunday) | Assemble prompt with all 7 dailies + perennials |
 | `weekly_compile.py` | Weekly compilation (Sunday) | Apply LLM's proposed edits to perennials |
 | `apply_quick_learning.py` | Quick-learn automation | Save rejection-based restrictions to users.json |
+| `execute_allowed_actions.py` | Pre-briefing automation | Evaluate and execute approved autonomous actions |
+| `process_action_approval.py` | Action approval automation | Move actions between proposed/approved on user command |
 | `sensor_current_day.py` | Command-line sensor | Expose current day's memory as HA attributes |
 | `sensor_perennial.py` | Command-line sensor | Expose perennial files as HA attributes |
 
@@ -250,10 +292,11 @@ Developer Tools → Services → shell_command.build_briefing_prompt
 | Automation | Trigger | Purpose |
 |---|---|---|
 | `permear_buffer_events` | State changes (sensors, presence) | Log house events to daily file |
-| `permear_telegram_handler` | `telegram_text` event | Process Telegram messages via LLM + log interaction |
+| `permear_telegram_handler` | `telegram_text` event | Process Telegram messages via LLM + log interaction + inject last message context |
 | `permear_daily_briefing` | Time: 21:00 | Daily intelligent summary via Telegram |
 | `permear_prebriefing` | Time pattern: every 30min | Proactive house evaluation, alert if relevant |
 | `permear_quick_learning` | `telegram_text` with rejection keywords | Quick-learn restrictions from user feedback |
+| `permear_action_approval` | `telegram_text` with approve/reject + number | Process action approval/rejection via Telegram |
 | `permear_weekly_compile` | Sunday 00:05 | Weekly self-improvement cycle |
 | `permear_daily_reset` | Midnight | Emit day-reset event |
 
@@ -283,6 +326,14 @@ These are hard-won lessons from months of debugging on a real system.
 
 11. **`shell_command` with `response_variable`** requires HA 2023.7+. The command's stdout becomes `result.stdout`.
 
+12. **Short Telegram replies lose context.** When the agent asks "Should I turn on the AC?" and the user replies "yes", the LLM receives only "yes" with no reference to the question. PERMEAR stores the agent's last outbound message in `input_text.permear_last_agent_message` (255-char cap) and injects it as a context prefix in the Telegram handler. This is a supplement to `conversation_id`, which doesn't always preserve enough context.
+
+13. **Quick-learn keywords must match the user's language.** The `permear_quick_learning` automation matches rejection words like "irrelevant" and "unnecessary" in English. If your users type in another language, these keywords won't trigger and the agent won't learn from rejections. See [Customization Guide](docs/customization.md) for localization examples.
+
+14. **Weekly compilation requires `max_tokens` >= 8192.** The default in most HA LLM integrations is too low. If the compilation fails with "Invalid JSON" or "Response appears truncated," increase it: Settings → Google Generative AI → uncheck "Recommended model settings" → set Maximum tokens to 8192. The `weekly_compile.py` script detects truncation and logs the raw response to `/config/logs/` for debugging.
+
+15. **Allowed actions require a long-lived HA access token.** The `execute_allowed_actions.py` script calls the HA REST API directly. Create a token in your HA profile and save it to `/config/.permear_token`. Without it, the action execution system won't work (but the rest of PERMEAR runs fine).
+
 ## Adapting to Other LLMs
 
 The architecture is LLM-agnostic. Replace `conversation.google_generative_ai` with your agent's entity_id:
@@ -310,6 +361,44 @@ A: The `weekly_compile.py` script creates `.bak` files before every edit. Protec
 **Q: The pre-briefing is too noisy / too quiet. How do I tune it?**
 A: It self-tunes. Reply to unwanted alerts with "irrelevant" or "don't need to know" and the quick-learn system adds the restriction immediately. For the opposite problem (too quiet), edit `guidelines.json` to loosen the relevance criteria, or adjust the prompt in `build_prebriefing.py`.
 
+**Q: How do I approve an action proposed by the agent?**
+A: The daily briefing (21h) presents pending proposals with numbers. Reply "approve 1" to approve the first proposal, "reject 2" to reject the second, etc. Approved actions start executing on the next pre-briefing cycle (within 30 minutes). You can also approve multiple: just send separate messages.
+
+**Q: Can the agent approve its own actions?**
+A: No. By design, actions go to `proposed` and stay there until you explicitly approve via Telegram. The agent proposes, you decide. This is enforced in the `guidelines.json` and in the script logic.
+
+**Q: What if an allowed action keeps firing when I don't want it to?**
+A: Send "reject" followed by the action ID via Telegram, or edit `allowed_actions.json` and remove it from `approved`. Each action also has a `cooldown_minutes` to prevent rapid re-execution.
+
+## Changelog
+
+### v4.0 (2026-04-06)
+- **Allowed actions**: New `allowed_actions.json` file for autonomous agent actions. The agent proposes actions during weekly compilation, the user approves/rejects via Telegram, and approved actions execute automatically during pre-briefing cycles with mandatory Telegram notification.
+- **Telegram approval flow**: Daily briefing presents pending action proposals with numbered options. User replies "approve 1" or "reject 2" directly in Telegram — no need to edit JSON files manually.
+- **Compact briefing**: Daily briefing reduced from 200 to 120 words max. Prioritizes pending approvals first, then notable events, then memories learned. Skips routine information.
+- **MAX_TOKENS fix**: `weekly_compile.py` now detects truncated LLM responses before attempting JSON parse. Logs raw response to `/config/logs/` for debugging. Documentation updated to require `max_tokens >= 8192`.
+- **Prompt compaction**: `build_weekly_prompt.py` limits events to 20 per day and interactions to 10 per day to reduce prompt size and avoid token limits.
+- **New files**: `execute_allowed_actions.py`, `process_action_approval.py`, `allowed_actions.json`
+- **Requires**: Long-lived HA access token in `/config/.permear_token` (for action execution only)
+
+### v3.2 (2026-03-31)
+- **Telegram context injection**: Agent's last outbound message is stored in `input_text.permear_last_agent_message` and injected as context prefix in the Telegram handler. Fixes the problem where short replies ("yes", "no", "do it") lost reference to the agent's question.
+- **Briefing memory timing note**: `build_briefing.py` prompt now clarifies that listed memories were extracted during earlier pre-briefings, not after the current briefing. Prevents the LLM from incorrectly reporting "no memories today."
+- **Quick-learn localization guide**: `docs/customization.md` now includes a full section on localizing rejection keywords for non-English users, with ready-to-use examples for Portuguese (pt-BR) and Spanish.
+
+### v3.1 (2026-03-29)
+- Pre-briefing proactive system (every 30 min, 08h-20h)
+- Quick-learning from user rejection (immediate restriction update)
+- `apply_quick_learning.py` script
+
+### v3.0 (2026-03-29)
+- Initial public release
+- 7-day rotating daily memory files
+- 3 perennial files (soul, users, insights) + immutable guidelines
+- Weekly self-improvement compilation
+- Daily briefing via Telegram
+- Bidirectional Telegram chat with LLM
+
 ## License
 
 MIT — Use it, fork it, improve it.
@@ -317,4 +406,3 @@ MIT — Use it, fork it, improve it.
 ## Credits
 
 - Architecture designed in collaboration with Claude (Anthropic)
-- Inspired by [OpenClaw](https://github.com/AICraftAlchemy/OpenClaw)'s memory concepts (SOUL.md, MEMORY.md, USER.md)

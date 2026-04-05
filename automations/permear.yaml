@@ -1,5 +1,5 @@
 # =============================================================================
-# PERMEAR — Persistent Memory Automations
+# PERMEAR v4.0 — Persistent Memory Automations
 #
 # BEFORE USING: Replace all placeholders:
 #   YOUR_CHAT_ID   → Your Telegram chat_id (integer)
@@ -37,10 +37,6 @@
     #   to: "on"
     #   for: "00:05:00"
     #   id: "window_open_5min"
-    # - platform: state
-    #   entity_id: climate.YOUR_AC
-    #   to: "cool"
-    #   id: "ac_turned_on"
   action:
     - service: shell_command.append_daily_event
       data:
@@ -48,6 +44,7 @@
 
 # -----------------------------------------------------------------------------
 # 2. TELEGRAM HANDLER — Bidirectional chat via LLM
+#    Injects last agent message as context for short replies.
 # -----------------------------------------------------------------------------
 - alias: "PERMEAR - Telegram handler"
   id: permear_telegram_handler
@@ -60,22 +57,29 @@
     - condition: template
       value_template: "{{ trigger.event.data.chat_id == YOUR_CHAT_ID }}"
   action:
-    # Log the interaction
     - service: shell_command.append_daily_interaction
       data:
         detail: "telegram:{{ trigger.event.data.text[:100] }}"
-    # Process via LLM
     - service: conversation.process
       data:
         agent_id: YOUR_AGENT_ID
-        text: "{{ trigger.event.data.text }}"
+        text: >
+          {% set last_msg = states('input_text.permear_last_agent_message') %}
+          {% if last_msg and last_msg not in ['unknown', 'unavailable', ''] %}
+          [Context: your last message to the user was: "{{ last_msg }}"]
+          {% endif %}
+          {{ trigger.event.data.text }}
         conversation_id: "telegram_main"
       response_variable: response
-    # Reply on Telegram
     - service: telegram_bot.send_message
       data:
         chat_id: YOUR_CHAT_ID
         message: "{{ response.response.speech.plain.speech }}"
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.permear_last_agent_message
+      data:
+        value: "{{ response.response.speech.plain.speech[:255] }}"
 
 # -----------------------------------------------------------------------------
 # 3. DAILY BRIEFING — Intelligent summary at 21h via Telegram
@@ -86,21 +90,22 @@
     - platform: time
       at: "21:00:00"
   action:
-    # 1. Build prompt
     - service: shell_command.build_briefing_prompt
       response_variable: prompt_result
-    # 2. Send to LLM
     - service: conversation.process
       data:
         agent_id: YOUR_AGENT_ID
         text: "{{ prompt_result.stdout }}"
       response_variable: briefing
-    # 3. Send via Telegram
     - service: telegram_bot.send_message
       data:
         chat_id: YOUR_CHAT_ID
         message: "{{ briefing.response.speech.plain.speech }}"
-    # 4. Extract memories from today
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.permear_last_agent_message
+      data:
+        value: "{{ briefing.response.speech.plain.speech[:255] }}"
     - delay:
         seconds: 5
     - service: conversation.process
@@ -113,17 +118,17 @@
           Events: {{ state_attr('sensor.current_day_memory', 'events') }}
           Interactions: {{ state_attr('sensor.current_day_memory', 'interactions') }}
       response_variable: memories
-    # 5. Save memories
     - service: shell_command.update_daily_memory
       data:
         response: "{{ memories.response.speech.plain.speech }}"
-    # 6. Flag
     - service: shell_command.append_daily_flag
       data:
         detail: "briefing_sent"
 
 # -----------------------------------------------------------------------------
-# 4. PRE-BRIEFING — Proactive house evaluation every 30 minutes
+# 4. PRE-BRIEFING — Proactive evaluation every 30 min
+#    v4.0: Executes allowed_actions BEFORE the LLM evaluation.
+#    Actions that fire are notified individually via Telegram.
 # -----------------------------------------------------------------------------
 - alias: "PERMEAR - Pre-briefing"
   id: permear_prebriefing
@@ -135,42 +140,72 @@
       after: "08:00:00"
       before: "20:00:00"
   action:
-    # 1. Build house state as compact text
+    # --- STEP 1: Execute allowed actions ---
+    - service: shell_command.execute_allowed_actions
+      response_variable: actions_result
+    # Notify each executed action via Telegram
+    - variables:
+        actions_output: "{{ actions_result.stdout | trim }}"
+    - if:
+        - condition: template
+          value_template: "{{ actions_output != 'NO_ACTIONS' and 'executed' in actions_output }}"
+      then:
+        - variables:
+            executed_actions: "{{ (actions_output | from_json).executed }}"
+        - repeat:
+            count: "{{ executed_actions | length }}"
+            sequence:
+              - service: telegram_bot.send_message
+                data:
+                  chat_id: YOUR_CHAT_ID
+                  message: "{{ executed_actions[repeat.index - 1].notification }}"
+              - service: input_text.set_value
+                target:
+                  entity_id: input_text.permear_last_agent_message
+                data:
+                  value: "{{ executed_actions[repeat.index - 1].notification[:255] }}"
+              - service: shell_command.append_daily_interaction
+                data:
+                  detail: "allowed_action:{{ executed_actions[repeat.index - 1].id }}"
+
+    # --- STEP 2: LLM proactive evaluation (unchanged from v3.2) ---
     # === CUSTOMIZE THESE SENSOR REFERENCES ===
     - variables:
         house_state: >
           Time: {{ now().strftime('%H:%M') }}.
           User: {{ states('person.YOUR_PERSON') }}.
           Weather: {{ states('weather.forecast_home') }}, {{ state_attr('weather.forecast_home', 'temperature') }} degrees.
-    # 2. Build prompt
     - service: shell_command.build_prebriefing_prompt
       data:
         state: "{{ house_state }}"
       response_variable: prompt_result
-    # 3. Send to LLM
     - service: conversation.process
       data:
         agent_id: YOUR_AGENT_ID
         text: "{{ prompt_result.stdout }}"
       response_variable: evaluation
-    # 4. Decide: send or silence
     - variables:
         answer: "{{ evaluation.response.speech.plain.speech | trim }}"
     - condition: template
       value_template: >
         {{ 'SILENCE' not in answer.upper() and answer | length > 2 }}
-    # 5. Send via Telegram
     - service: telegram_bot.send_message
       data:
         chat_id: YOUR_CHAT_ID
         message: "{{ answer }}"
-    # 6. Log as agent interaction
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.permear_last_agent_message
+      data:
+        value: "{{ answer[:255] }}"
     - service: shell_command.append_daily_interaction
       data:
         detail: "prebriefing:{{ answer[:100] }}"
 
 # -----------------------------------------------------------------------------
 # 5. QUICK LEARNING — Learn from user rejection of pre-briefing alerts
+#    NOTE: Keywords must match the user's language.
+#    See docs/customization.md for localization examples.
 # -----------------------------------------------------------------------------
 - alias: "PERMEAR - Quick learning"
   id: permear_quick_learning
@@ -211,7 +246,53 @@
         response: "{{ learning.response.speech.plain.speech }}"
 
 # -----------------------------------------------------------------------------
-# 6. WEEKLY COMPILATION — Self-improvement cycle (Sunday 00:05)
+# 6. ACTION APPROVAL — Process approve/reject commands via Telegram
+#    User replies "approve 1", "reject 2" etc. to manage proposed actions.
+#    Numbers reference the position in the proposed array.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - Action approval"
+  id: permear_action_approval
+  trigger:
+    - platform: event
+      event_type: telegram_text
+  condition:
+    - condition: template
+      value_template: >
+        {% set text = trigger.event.data.text | lower | trim %}
+        {{ trigger.event.data.chat_id == YOUR_CHAT_ID and
+           (text.startswith('approve') or text.startswith('reject')) and
+           text.split() | length == 2 and
+           text.split()[1] | int(0) > 0 }}
+  action:
+    - service: shell_command.process_action_approval
+      data:
+        command: "{{ trigger.event.data.text | lower | trim }}"
+      response_variable: approval_result
+    - variables:
+        result_text: "{{ approval_result.stdout | trim }}"
+    - if:
+        - condition: template
+          value_template: "{{ 'INVALID' not in result_text and 'ERROR' not in result_text }}"
+      then:
+        - variables:
+            parsed: "{{ result_text | from_json }}"
+        - service: telegram_bot.send_message
+          data:
+            chat_id: YOUR_CHAT_ID
+            message: "{{ parsed.message }}"
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.permear_last_agent_message
+          data:
+            value: "{{ parsed.message[:255] }}"
+      else:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: YOUR_CHAT_ID
+            message: "{{ result_text }}"
+
+# -----------------------------------------------------------------------------
+# 7. WEEKLY COMPILATION — Self-improvement cycle (Sunday 00:05)
 # -----------------------------------------------------------------------------
 - alias: "PERMEAR - Weekly compilation"
   id: permear_weekly_compile
@@ -222,28 +303,24 @@
     - condition: time
       weekday: [sun]
   action:
-    # 1. Build weekly prompt
     - service: shell_command.build_weekly_prompt
       response_variable: weekly_prompt
-    # 2. Send to LLM
     - service: conversation.process
       data:
         agent_id: YOUR_AGENT_ID
         text: "{{ weekly_prompt.stdout }}"
       response_variable: compilation
-    # 3. Apply edits
     - service: shell_command.weekly_compile
       data:
         response: "{{ compilation.response.speech.plain.speech }}"
       response_variable: compile_result
-    # 4. Notify result
     - service: telegram_bot.send_message
       data:
         chat_id: YOUR_CHAT_ID
         message: "Weekly compilation complete. {{ compile_result.stdout }}"
 
 # -----------------------------------------------------------------------------
-# 7. DAILY RESET — Midnight event
+# 8. DAILY RESET — Midnight event
 # -----------------------------------------------------------------------------
 - alias: "PERMEAR - Daily reset"
   id: permear_daily_reset
