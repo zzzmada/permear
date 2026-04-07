@@ -1,24 +1,16 @@
 # =============================================================================
-# PERMEAR v4.0 — Persistent Memory Automations
+# PERMEAR v5.0 — Persistent Memory + System Caretaker Automations
 #
-# BEFORE USING: Replace all placeholders:
-#   YOUR_CHAT_ID   → Your Telegram chat_id (integer)
-#   YOUR_AGENT_ID  → Your conversation agent entity_id
-#                    (e.g., conversation.google_generative_ai)
-#
-# CUSTOMIZE: Sensor entity_ids in permear_buffer_events and
-#            permear_prebriefing must match YOUR actual devices.
+# Replace: YOUR_CHAT_ID, YOUR_AGENT_ID, person.YOUR_PERSON
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# 1. EVENT BUFFER — Collects house events throughout the day
-# -----------------------------------------------------------------------------
+# 1. EVENT BUFFER
 - alias: "PERMEAR - Buffer events"
   id: permear_buffer_events
   mode: queued
   max: 20
   trigger:
-    # === CUSTOMIZE THESE TRIGGERS FOR YOUR DEVICES ===
+    # === CUSTOMIZE FOR YOUR DEVICES ===
     - platform: state
       entity_id: person.YOUR_PERSON
       to: "home"
@@ -27,25 +19,13 @@
       entity_id: person.YOUR_PERSON
       from: "home"
       id: "user_left"
-    # Add your own sensor triggers below. Examples:
-    # - platform: numeric_state
-    #   entity_id: sensor.YOUR_TEMPERATURE_SENSOR
-    #   above: 28
-    #   id: "hot_room"
-    # - platform: state
-    #   entity_id: binary_sensor.YOUR_WINDOW_SENSOR
-    #   to: "on"
-    #   for: "00:05:00"
-    #   id: "window_open_5min"
+    # Add your own triggers here
   action:
     - service: shell_command.append_daily_event
       data:
         detail: "{{ trigger.id }}"
 
-# -----------------------------------------------------------------------------
-# 2. TELEGRAM HANDLER — Bidirectional chat via LLM
-#    Injects last agent message as context for short replies.
-# -----------------------------------------------------------------------------
+# 2. TELEGRAM HANDLER
 - alias: "PERMEAR - Telegram handler"
   id: permear_telegram_handler
   mode: queued
@@ -79,18 +59,20 @@
       target:
         entity_id: input_text.permear_last_agent_message
       data:
-        value: "{{ response.response.speech.plain.speech[:255] }}"
+        value: "{{ response.response.speech.plain.speech | truncate(255, False, '') }}"
 
-# -----------------------------------------------------------------------------
-# 3. DAILY BRIEFING — Intelligent summary at 21h via Telegram
-# -----------------------------------------------------------------------------
+# 3. DAILY BRIEFING (21h)
 - alias: "PERMEAR - Daily briefing"
   id: permear_daily_briefing
   trigger:
     - platform: time
       at: "21:00:00"
   action:
+    - service: shell_command.ha_updates_check
+      response_variable: updates_result
     - service: shell_command.build_briefing_prompt
+      data:
+        updates: "{{ updates_result.stdout | default('') }}"
       response_variable: prompt_result
     - service: conversation.process
       data:
@@ -105,7 +87,7 @@
       target:
         entity_id: input_text.permear_last_agent_message
       data:
-        value: "{{ briefing.response.speech.plain.speech[:255] }}"
+        value: "{{ briefing.response.speech.plain.speech | truncate(255, False, '') }}"
     - delay:
         seconds: 5
     - service: conversation.process
@@ -114,7 +96,7 @@
         text: >
           Analyze today's events and interactions and extract relevant memories.
           Return ONLY JSON: {"daily_memories": ["memory 1", "memory 2"]}
-          If nothing relevant, return: {"daily_memories": []}
+          If nothing relevant: {"daily_memories": []}
           Events: {{ state_attr('sensor.current_day_memory', 'events') }}
           Interactions: {{ state_attr('sensor.current_day_memory', 'interactions') }}
       response_variable: memories
@@ -125,11 +107,7 @@
       data:
         detail: "briefing_sent"
 
-# -----------------------------------------------------------------------------
-# 4. PRE-BRIEFING — Proactive evaluation every 30 min
-#    v4.0: Executes allowed_actions BEFORE the LLM evaluation.
-#    Actions that fire are notified individually via Telegram.
-# -----------------------------------------------------------------------------
+# 4. PRE-BRIEFING (every 30min) — with HA health monitoring
 - alias: "PERMEAR - Pre-briefing"
   id: permear_prebriefing
   trigger:
@@ -140,44 +118,11 @@
       after: "08:00:00"
       before: "20:00:00"
   action:
-    # --- STEP 1: Execute allowed actions ---
-    - service: shell_command.execute_allowed_actions
-      response_variable: actions_result
-    # Notify each executed action via Telegram
-    - variables:
-        actions_output: "{{ actions_result.stdout | trim }}"
-    - if:
-        - condition: template
-          value_template: "{{ actions_output != 'NO_ACTIONS' and 'executed' in actions_output }}"
-      then:
-        - variables:
-            executed_actions: "{{ (actions_output | from_json).executed }}"
-        - repeat:
-            count: "{{ executed_actions | length }}"
-            sequence:
-              - service: telegram_bot.send_message
-                data:
-                  chat_id: YOUR_CHAT_ID
-                  message: "{{ executed_actions[repeat.index - 1].notification }}"
-              - service: input_text.set_value
-                target:
-                  entity_id: input_text.permear_last_agent_message
-                data:
-                  value: "{{ executed_actions[repeat.index - 1].notification[:255] }}"
-              - service: shell_command.append_daily_interaction
-                data:
-                  detail: "allowed_action:{{ executed_actions[repeat.index - 1].id }}"
-
-    # --- STEP 2: LLM proactive evaluation (unchanged from v3.2) ---
-    # === CUSTOMIZE THESE SENSOR REFERENCES ===
-    - variables:
-        house_state: >
-          Time: {{ now().strftime('%H:%M') }}.
-          User: {{ states('person.YOUR_PERSON') }}.
-          Weather: {{ states('weather.forecast_home') }}, {{ state_attr('weather.forecast_home', 'temperature') }} degrees.
+    - service: shell_command.ha_log_monitor
+      response_variable: health_result
     - service: shell_command.build_prebriefing_prompt
       data:
-        state: "{{ house_state }}"
+        health: "{{ health_result.stdout | default('HEALTH: OK') }}"
       response_variable: prompt_result
     - service: conversation.process
       data:
@@ -197,16 +142,13 @@
       target:
         entity_id: input_text.permear_last_agent_message
       data:
-        value: "{{ answer[:255] }}"
+        value: "{{ answer | truncate(255, False, '') }}"
     - service: shell_command.append_daily_interaction
       data:
         detail: "prebriefing:{{ answer[:100] }}"
 
-# -----------------------------------------------------------------------------
-# 5. QUICK LEARNING — Learn from user rejection of pre-briefing alerts
-#    NOTE: Keywords must match the user's language.
-#    See docs/customization.md for localization examples.
-# -----------------------------------------------------------------------------
+# 5. QUICK LEARNING
+#    NOTE: Keywords must match user's language. See docs/customization.md
 - alias: "PERMEAR - Quick learning"
   id: permear_quick_learning
   trigger:
@@ -221,10 +163,8 @@
             'unnecessary' in text or
             'already know' in text or
             'stop alerting' in text or
-            'dont alert' in text or
             "don't alert" in text or
             'not important' in text or
-            'dont care' in text or
             "don't care" in text or
             'stop telling' in text or
             'i know' in text) }}
@@ -233,67 +173,25 @@
       data:
         agent_id: YOUR_AGENT_ID
         text: >
-          The user responded to one of your alerts with: "{{ trigger.event.data.text }}"
-          This indicates the alert was irrelevant or unwanted.
-          
-          Analyze the response and return ONLY JSON:
-          {"new_restriction": "short description of what NOT to alert about"}
-          
-          If you cannot extract a clear restriction, return: {"new_restriction": null}
+          The user responded to an alert with: "{{ trigger.event.data.text }}"
+          This indicates the alert was irrelevant.
+          Return ONLY JSON: {"new_restriction": "what NOT to alert about"}
+          If unclear: {"new_restriction": null}
       response_variable: learning
     - service: shell_command.apply_quick_learning
       data:
         response: "{{ learning.response.speech.plain.speech }}"
 
-# -----------------------------------------------------------------------------
-# 6. ACTION APPROVAL — Process approve/reject commands via Telegram
-#    User replies "approve 1", "reject 2" etc. to manage proposed actions.
-#    Numbers reference the position in the proposed array.
-# -----------------------------------------------------------------------------
-- alias: "PERMEAR - Action approval"
-  id: permear_action_approval
+# 6. ENTITY DISCOVERY (daily 06:00)
+- alias: "PERMEAR - Entity discovery"
+  id: permear_entity_discovery
   trigger:
-    - platform: event
-      event_type: telegram_text
-  condition:
-    - condition: template
-      value_template: >
-        {% set text = trigger.event.data.text | lower | trim %}
-        {{ trigger.event.data.chat_id == YOUR_CHAT_ID and
-           (text.startswith('approve') or text.startswith('reject')) and
-           text.split() | length == 2 and
-           text.split()[1] | int(0) > 0 }}
+    - platform: time
+      at: "06:00:00"
   action:
-    - service: shell_command.process_action_approval
-      data:
-        command: "{{ trigger.event.data.text | lower | trim }}"
-      response_variable: approval_result
-    - variables:
-        result_text: "{{ approval_result.stdout | trim }}"
-    - if:
-        - condition: template
-          value_template: "{{ 'INVALID' not in result_text and 'ERROR' not in result_text }}"
-      then:
-        - variables:
-            parsed: "{{ result_text | from_json }}"
-        - service: telegram_bot.send_message
-          data:
-            chat_id: YOUR_CHAT_ID
-            message: "{{ parsed.message }}"
-        - service: input_text.set_value
-          target:
-            entity_id: input_text.permear_last_agent_message
-          data:
-            value: "{{ parsed.message[:255] }}"
-      else:
-        - service: telegram_bot.send_message
-          data:
-            chat_id: YOUR_CHAT_ID
-            message: "{{ result_text }}"
+    - service: shell_command.discover_entities
 
-# -----------------------------------------------------------------------------
-# 7. WEEKLY COMPILATION — Self-improvement cycle (Sunday 00:05)
-# -----------------------------------------------------------------------------
+# 7. WEEKLY COMPILATION (Sunday 00:05)
 - alias: "PERMEAR - Weekly compilation"
   id: permear_weekly_compile
   trigger:
@@ -319,9 +217,7 @@
         chat_id: YOUR_CHAT_ID
         message: "Weekly compilation complete. {{ compile_result.stdout }}"
 
-# -----------------------------------------------------------------------------
-# 8. DAILY RESET — Midnight event
-# -----------------------------------------------------------------------------
+# 8. DAILY RESET
 - alias: "PERMEAR - Daily reset"
   id: permear_daily_reset
   trigger:

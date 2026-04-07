@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Build the pre-briefing proactive evaluation prompt."""
+"""
+Build the pre-briefing proactive evaluation prompt.
+v5.0: Reads monitored_entities.json for dynamic house state.
+      Receives HA health summary as argument from automation.
+      Queries entity states via REST API.
+"""
 import json, os, sys
 from datetime import datetime
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 MEMORY_DIR = "/config/memory"
+ENTITIES_PATH = "/config/memory/monitored_entities.json"
+TOKEN_PATH = "/config/.permear_token"
+HA_URL = "http://localhost:8123"
 DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
 def load_json(path, default=None):
@@ -15,10 +25,52 @@ def load_json(path, default=None):
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
+def load_token():
+    try:
+        with open(TOKEN_PATH, 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+def get_entity_state(entity_id, token):
+    url = f"{HA_URL}/api/states/{entity_id}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("state", "unknown")
+    except (URLError, Exception):
+        return "unavailable"
+
+def build_house_state(token):
+    """Build compact house state from monitored entities."""
+    monitored = load_json(ENTITIES_PATH, {"entities": []})
+    entities = monitored.get("entities", [])
+
+    if not entities or not token:
+        return "House state: not available (no monitored entities or no token)."
+
+    lines = []
+    for ent in entities:
+        eid = ent.get("entity_id", "")
+        name = ent.get("friendly_name", eid)
+        state = get_entity_state(eid, token)
+        if state not in ["unavailable", "unknown"]:
+            lines.append(f"{name}: {state}")
+    
+    return "\n".join(lines) if lines else "No entity states available."
+
 def main():
+    # Health summary passed as first positional argument
+    health_txt = ""
+    if len(sys.argv) > 1:
+        health_txt = " ".join(sys.argv[1:])
+
     idx = datetime.now().weekday()
     day_name = DAYS[idx]
     timestamp = datetime.now().strftime("%H:%M")
+    token = load_token()
 
     soul = load_json(os.path.join(MEMORY_DIR, "soul.json"))
     users = load_json(os.path.join(MEMORY_DIR, "users.json"))
@@ -30,58 +82,53 @@ def main():
     if daily.get("date") != today:
         daily = {"events": [], "interactions": [], "daily_memories": []}
 
-    house_state = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "State not available."
+    house_state = build_house_state(token)
 
+    # Compact events
+    events = daily.get("events", [])
     events_txt = ""
-    for e in daily.get("events", []):
-        events_txt += f"  {e.get('time','?')} - {e.get('detail','?')}\n"
-    if not events_txt:
-        events_txt = "  No events yet.\n"
+    if events:
+        for e in events[-5:]:
+            events_txt += f"  {e.get('time','?')} {e.get('detail','?')}\n"
 
-    interactions_txt = ""
-    for i in daily.get("interactions", []):
-        interactions_txt += f"  {i.get('time','?')} ({i.get('channel','?')}): {i.get('summary','?')}\n"
-    if not interactions_txt:
-        interactions_txt = "  No interactions yet.\n"
+    # Compact interactions (to detect if same alert already sent)
+    interactions = daily.get("interactions", [])
+    recent_alerts = [i.get("summary", "")[:50] for i in interactions[-5:]
+                     if i.get("channel") == "prebriefing"]
 
-    patterns_txt = ""
-    for p in insights.get("detected_patterns", []):
-        patterns_txt += f"  - {p}\n"
-    if not patterns_txt:
-        patterns_txt = "  No patterns recorded.\n"
+    # Patterns
+    patterns = insights.get("detected_patterns", [])
+    patterns_txt = "; ".join(patterns[-10:]) if patterns else "None"
 
-    restrictions_all = []
-    for user_key, user_data in users.items():
-        for r in user_data.get("restrictions", []):
-            restrictions_all.append(f"  - [{user_key}] {r}")
-    restrictions_txt = "\n".join(restrictions_all) if restrictions_all else "  None."
+    # Restrictions from all users
+    restrictions = []
+    for uk, ud in users.items():
+        for r in ud.get("restrictions", []):
+            restrictions.append(r)
+    restrictions_txt = "; ".join(restrictions) if restrictions else "None"
 
-    prompt = f"""You are {soul.get('name', 'Assistant')}, a residential assistant.
+    # Health
+    health_section = f"\nSYSTEM HEALTH:\n{health_txt}" if health_txt and health_txt != "HEALTH: OK" else ""
 
-TASK: Evaluate the current house state and decide if anything warrants contacting the user right now ({timestamp}).
+    prompt = f"""You are {soul.get('name', 'Assistant')}, residential assistant and system caretaker. Time: {timestamp}.
 
-CURRENT HOUSE STATE:
+HOUSE STATE:
 {house_state}
+{health_section}
 
-TODAY'S EVENTS SO FAR:
-{events_txt}
-TODAY'S INTERACTIONS:
-{interactions_txt}
-KNOWN PATTERNS (insights — what you already know is normal):
-{patterns_txt}
-USER RESTRICTIONS (things they said they do NOT want to be alerted about):
-{restrictions_txt}
+Today's events: {len(events)}. Recent alerts sent: {', '.join(recent_alerts) if recent_alerts else 'none'}
+Known patterns: {patterns_txt}
+User restrictions: {restrictions_txt}
 
-DECISION RULES:
-1. If something RELEVANT that the user probably doesn't know and would benefit from knowing now → write a short message (max 2 sentences). Can be an alert, question, or observation.
-2. If NOTHING relevant or the situation is known/expected per patterns → respond EXACTLY: SILENCE
-3. NEVER alert about things already in known patterns as normal.
-4. NEVER alert about things in user restrictions.
-5. Questions are welcome: "The window has been open for 2 hours, should I close it?" or "The AC is off and the room is 29 degrees, should I turn it on?"
-6. If you already sent an alert about the same topic today (check interactions), do NOT repeat.
-7. Prefer SILENCE when in doubt. Less is more.
+RULES:
+1. RELEVANT issue the user doesn't know about → short message (max 2 sentences).
+2. Nothing relevant → respond EXACTLY: SILENCE
+3. Never alert about known patterns or user restrictions.
+4. Never repeat an alert already sent today (check recent alerts).
+5. System health issues (errors, unavailable entities): alert if critical.
+6. Prefer SILENCE when in doubt.
 
-RESPOND ONLY: the short message OR the word SILENCE. Nothing else."""
+RESPOND: the message OR SILENCE. Nothing else."""
 
     print(prompt)
 

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Build the weekly compilation prompt — reads all 7 dailies + guidelines +
-perennials + allowed_actions. Includes prompt compaction for large daily files.
+Build the weekly compilation prompt.
+v5.0: Reviews agent automations, prompt compaction, no allowed_actions.
 """
 import json, os
 from datetime import datetime
 
 MEMORY_DIR = "/config/memory"
 DAILY_DIR = os.path.join(MEMORY_DIR, "daily")
+AGENT_YAML = "/config/automations/agent_automations.yaml"
 DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
 MAX_EVENTS_PER_DAY = 20
@@ -22,62 +23,65 @@ def load_json(path, default=None):
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
+def load_agent_automations():
+    try:
+        import yaml
+        with open(AGENT_YAML, 'r') as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
 def main():
     guidelines = load_json(os.path.join(MEMORY_DIR, "guidelines.json"))
     soul = load_json(os.path.join(MEMORY_DIR, "soul.json"))
     users = load_json(os.path.join(MEMORY_DIR, "users.json"))
     insights = load_json(os.path.join(MEMORY_DIR, "insights.json"))
-    allowed_actions = load_json(os.path.join(MEMORY_DIR, "allowed_actions.json"),
-                                {"approved": [], "proposed": []})
 
+    # Week data (compacted)
     week_txt = ""
     for day in DAYS:
         daily = load_json(os.path.join(DAILY_DIR, f"{day}.json"),
                           {"date": "no data", "events": [], "interactions": [], "daily_memories": []})
         week_txt += f"\n=== {day.upper()} ({daily.get('date', '?')}) ===\n"
 
-        # Compact events if too many
         events = daily.get("events", [])
         if len(events) > MAX_EVENTS_PER_DAY:
-            week_txt += f"Events: {len(events)} (showing last {MAX_EVENTS_PER_DAY})\n"
+            week_txt += f"Events: {len(events)} (last {MAX_EVENTS_PER_DAY} shown)\n"
             events = events[-MAX_EVENTS_PER_DAY:]
         else:
             week_txt += f"Events: {len(events)}\n"
         for e in events:
-            week_txt += f"  {e.get('time','?')} - {e.get('detail','?')}\n"
+            week_txt += f"  {e.get('time','?')} {e.get('detail','?')}\n"
 
-        # Compact interactions if too many
         interactions = daily.get("interactions", [])
         if len(interactions) > MAX_INTERACTIONS_PER_DAY:
-            week_txt += f"Interactions: {len(interactions)} (showing last {MAX_INTERACTIONS_PER_DAY})\n"
+            week_txt += f"Interactions: {len(interactions)} (last {MAX_INTERACTIONS_PER_DAY} shown)\n"
             interactions = interactions[-MAX_INTERACTIONS_PER_DAY:]
         else:
             week_txt += f"Interactions: {len(interactions)}\n"
         for i in interactions:
             week_txt += f"  {i.get('time','?')} ({i.get('channel','?')}): {i.get('summary','?')}\n"
 
-        week_txt += f"Daily memories:\n"
-        for m in daily.get("daily_memories", []):
-            week_txt += f"  - {m}\n"
+        memories = daily.get("daily_memories", [])
+        if memories:
+            week_txt += "Memories: " + "; ".join(memories) + "\n"
 
-    # Allowed actions summary
-    actions_txt = ""
-    approved = allowed_actions.get("approved", [])
-    if approved:
-        actions_txt += "CURRENTLY APPROVED ACTIONS:\n"
-        for a in approved:
-            exec_info = f" (last executed: {a.get('last_executed', 'never')})" if a.get('last_executed') else ""
-            actions_txt += f"  - {a.get('id','?')}: {a.get('description','?')}{exec_info}\n"
+    # Agent automations
+    agent_autos = load_agent_automations()
+    autos_txt = "AGENT AUTOMATIONS (review — propose removing unused ones):\n"
+    if agent_autos:
+        for a in agent_autos:
+            autos_txt += f"  - {a.get('alias','?')} (id: {a.get('id','?')})\n"
     else:
-        actions_txt += "CURRENTLY APPROVED ACTIONS: None\n"
+        autos_txt += "  None currently active.\n"
 
     prompt = f"""WEEKLY COMPILATION — Analyze the week and propose edits to perennial files.
 
-GUIDELINES (IMMUTABLE — follow strictly):
+GUIDELINES (IMMUTABLE):
 {json.dumps(guidelines, ensure_ascii=False, indent=2)}
 
-CURRENT STATE OF PERENNIAL FILES:
-
+CURRENT PERENNIAL FILES:
 --- insights.json ---
 {json.dumps(insights, ensure_ascii=False, indent=2)}
 
@@ -87,60 +91,40 @@ CURRENT STATE OF PERENNIAL FILES:
 --- users.json ---
 {json.dumps(users, ensure_ascii=False, indent=2)}
 
-{actions_txt}
+{autos_txt}
 
 WEEK DATA:
 {week_txt}
 
 INSTRUCTIONS:
-1. Analyze all 7 days and identify patterns, anomalies, and learnings.
-2. Propose edits ONLY following each file's guidelines.
-3. Based on observed patterns, you may propose NEW allowed actions the agent could execute autonomously. These go in "proposed_actions" — they will NOT be active until the user approves them.
-4. Keep your response concise. Return ONLY valid JSON. No text before or after.
+1. Analyze all 7 days. Identify patterns, anomalies, learnings.
+2. Propose edits following each file's guidelines.
+3. Review agent automations — propose removing obsolete ones.
+4. You may suggest new automations based on observed patterns.
+5. Return ONLY valid JSON. No text before or after.
 
-RESPONSE FORMAT (pure JSON):
+RESPONSE FORMAT:
 {{
   "insights": {{
-    "new_patterns": ["pattern 1"],
-    "remove_patterns": ["obsolete pattern"],
-    "new_pending": ["pending item"],
-    "remove_pending": ["resolved item"],
-    "new_suggestions": ["automation suggestion"]
+    "new_patterns": [], "remove_patterns": [],
+    "new_pending": [], "remove_pending": [],
+    "new_suggestions": []
   }},
   "soul": {{
-    "behavior_rules": {{
-      "add": ["new rule"],
-      "remove": ["obsolete rule"]
-    }}
+    "behavior_rules": {{"add": [], "remove": []}}
   }},
   "users": {{
-    "user_1": {{
-      "observed_patterns": {{
-        "add": ["new pattern"],
-        "remove": ["outdated pattern"]
-      }}
+    "user_key": {{
+      "field_name": {{"add": [], "remove": []}}
     }}
   }},
-  "proposed_actions": [
-    {{
-      "id": "short_snake_case_id",
-      "description": "Human-readable description of when and what the action does",
-      "conditions": [
-        {{"entity": "sensor.example", "operator": ">=", "value": 70}},
-        {{"type": "time_after", "value": "18:00"}},
-        {{"type": "time_before", "value": "23:00"}}
-      ],
-      "action": {{
-        "service": "climate.set_temperature",
-        "data": {{"entity_id": "climate.example", "temperature": 24, "hvac_mode": "cool"}}
-      }},
-      "notification": "Description of what was done — use {{trigger_value}} for the sensor value that triggered it.",
-      "cooldown_minutes": 120
-    }}
-  ]
+  "automation_suggestions": [
+    {{"alias": "name", "description": "what it does and when", "trigger_type": "numeric_state|state|time", "entity": "sensor.x"}}
+  ],
+  "automations_to_remove": ["alias_or_id"]
 }}
 
-If no edits for a section, omit the key. If nothing changed, return: {{"no_changes": true}}"""
+Omit empty sections. If nothing changed: {{"no_changes": true}}"""
 
     print(prompt)
 

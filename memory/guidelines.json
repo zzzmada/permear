@@ -1,6 +1,5 @@
 {
-  "_warning": "This file is IMMUTABLE. chmod 444. The agent cannot and must not edit it. Only the human owner edits this file.",
-  "_description": "These are the rules the agent MUST follow when editing perennial files during weekly compilation.",
+  "_warning": "This file is IMMUTABLE. chmod 444. The agent cannot and must not edit it.",
 
   "guidelines_insights": {
     "purpose": "Record observable and verifiable behavioral patterns of the house and its residents.",
@@ -19,8 +18,6 @@
     "rules": [
       "The agent may propose adjustments to soul.json but must NEVER alter: name, mission, or values.",
       "Allowed adjustments: refine behavioral rules based on explicit user feedback.",
-      "Example allowed: 'User asked to include tomorrow's forecast in the briefing' → add rule.",
-      "Example forbidden: changing tone from 'direct' to 'expansive' without explicit request.",
       "Maximum 15 behavioral rules. Consolidate if necessary."
     ]
   },
@@ -31,22 +28,33 @@
       "Update preferences only when the user demonstrates consistently (3+ times) or asks explicitly.",
       "Never infer emotional or health states as permanent preferences.",
       "Schedules and routine patterns may be updated based on daily log data.",
-      "New residents or frequent visitors may be added after 3+ appearances.",
       "Keep minimal data: name, role, comfort preferences, interaction style."
     ]
   },
 
-  "guidelines_allowed_actions": {
-    "purpose": "Propose autonomous actions the agent can execute without asking for confirmation.",
+  "guidelines_agent_automations": {
+    "purpose": "The agent can propose and create simple native HA automations.",
     "rules": [
-      "Every proposed action MUST include a Telegram notification — no silent actions ever.",
-      "Only propose actions based on patterns observed consistently (3+ occurrences).",
-      "Actions must be reversible or low-risk: climate control, lights, notifications. Never propose actions involving locks, alarms, purchases, or irreversible changes.",
-      "Each action must have a cooldown of at least 60 minutes to prevent loops.",
-      "Conditions must be specific and verifiable: use exact entity_ids, numeric thresholds, and time ranges.",
-      "Maximum 10 approved actions at any time.",
-      "The agent proposes, the user approves. NEVER auto-approve actions.",
-      "If an action was repeatedly overridden by the user (3+ times), propose its removal."
+      "Every automation requires explicit approval from the user via Telegram before creation.",
+      "Keep automations simple: one trigger, one action. No Jinja2 templates in actions.",
+      "Maximum 20 automations in the agent automation file. If full, propose replacement.",
+      "Never create automations with platform: conversation triggers.",
+      "Never touch any file outside the designated agent automation file.",
+      "Confirm via Telegram after creation with the alias and id.",
+      "User can remove automations by saying 'remove automation [alias]'.",
+      "In weekly compilation, review all agent automations and propose removing unused ones."
+    ]
+  },
+
+  "guidelines_monitoring": {
+    "purpose": "Monitor HA health and inform proactively when necessary.",
+    "rules": [
+      "Critical errors (integration failures, device offline): inform immediately via Telegram.",
+      "Available updates: include in the 21h daily briefing only.",
+      "Security updates: inform immediately via Telegram.",
+      "New devices detected: ask the user if they want to name and configure.",
+      "Do not repeat the same error alert more than once per hour.",
+      "When reporting issues, suggest a fix if possible."
     ]
   }
 }

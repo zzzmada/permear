@@ -1,8 +1,13 @@
 # =============================================================================
-# PERMEAR v4.0 — Add these blocks to your configuration.yaml
+# PERMEAR v5.0 — Add these blocks to your configuration.yaml
 # =============================================================================
 
-# Input text for Telegram reply context
+# Verify this exists (required for agent automations file):
+# automation: !include_dir_merge_list automations/
+# If you have "automation: !include automations.yaml" instead,
+# change it to the directory include above.
+
+# Context for Telegram replies
 input_text:
   permear_last_agent_message:
     name: "PERMEAR Last Agent Message"
@@ -14,28 +19,38 @@ shell_command:
   append_daily_interaction: 'python3 /config/scripts/append_daily.py interaction "{{ detail }}"'
   append_daily_memory: 'python3 /config/scripts/append_daily.py memory "{{ detail }}"'
   append_daily_flag: 'python3 /config/scripts/append_daily.py flag "{{ detail }}"'
-  
+
   # Briefing
-  build_briefing_prompt: 'python3 /config/scripts/build_briefing.py'
+  build_briefing_prompt: 'python3 /config/scripts/build_briefing.py --updates "{{ updates }}"'
   update_daily_memory: "python3 /config/scripts/update_daily_memory.py '{{ response }}'"
-  
+
   # Pre-briefing
-  build_prebriefing_prompt: 'python3 /config/scripts/build_prebriefing.py "{{ state }}"'
+  build_prebriefing_prompt: 'python3 /config/scripts/build_prebriefing.py "{{ health }}"'
   apply_quick_learning: "python3 /config/scripts/apply_quick_learning.py '{{ response }}'"
-  
-  # Allowed actions (v4.0)
-  execute_allowed_actions: 'python3 /config/scripts/execute_allowed_actions.py'
-  process_action_approval: "python3 /config/scripts/process_action_approval.py '{{ command }}'"
-  
+
+  # Agent automations (v5.0)
+  manage_agent_auto_create: "python3 /config/scripts/manage_agent_automations.py create '{{ spec }}'"
+  manage_agent_auto_remove: "python3 /config/scripts/manage_agent_automations.py remove '{{ identifier }}'"
+  manage_agent_auto_list: "python3 /config/scripts/manage_agent_automations.py list"
+
+  # HA monitoring (v5.0)
+  ha_log_monitor: "python3 /config/scripts/ha_log_monitor.py"
+  ha_updates_check: "python3 /config/scripts/ha_updates_check.py"
+
+  # Entity discovery (v5.0)
+  discover_entities: "python3 /config/scripts/discover_entities.py"
+  add_monitored_entity: "python3 /config/scripts/discover_entities.py --add '{{ entity_id }}' '{{ friendly_name }}'"
+  remove_monitored_entity: "python3 /config/scripts/discover_entities.py --remove '{{ entity_id }}'"
+
   # Weekly compilation
-  build_weekly_prompt: 'python3 /config/scripts/build_weekly_prompt.py'
+  build_weekly_prompt: "python3 /config/scripts/build_weekly_prompt.py"
   weekly_compile: "python3 /config/scripts/weekly_compile.py '{{ response }}'"
 
 # Command-line sensors for memory exposure
 command_line:
   - sensor:
       name: "Current Day Memory"
-      command: 'python3 /config/scripts/sensor_current_day.py'
+      command: "python3 /config/scripts/sensor_current_day.py"
       scan_interval: 300
       value_template: "ok"
       json_attributes:
@@ -45,7 +60,7 @@ command_line:
 
   - sensor:
       name: "Perennial Memory"
-      command: 'python3 /config/scripts/sensor_perennial.py'
+      command: "python3 /config/scripts/sensor_perennial.py"
       scan_interval: 3600
       value_template: "ok"
       json_attributes:

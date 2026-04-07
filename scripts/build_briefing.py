@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Build the daily briefing prompt for the LLM.
-v4.0: Compact format, prioritizes pending action approvals.
+Build the daily briefing prompt (21h).
+v5.0: Compact (120 words max), includes HA updates and agent automations.
+      Accepts --updates argument from automation.
 """
-import json, os
+import json, os, sys
 from datetime import datetime
 
 MEMORY_DIR = "/config/memory"
+AGENT_YAML = "/config/automations/agent_automations.yaml"
 DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 DAYS_DISPLAY = ['Monday', 'Tuesday', 'Wednesday', 'Thursday',
                 'Friday', 'Saturday', 'Sunday']
@@ -20,7 +22,24 @@ def load_json(path, default=None):
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
+def count_agent_automations():
+    try:
+        import yaml
+        with open(AGENT_YAML, 'r') as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, list):
+            return len(data)
+    except Exception:
+        pass
+    return 0
+
 def main():
+    # Parse --updates argument
+    updates_txt = ""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--updates" and i + 1 < len(sys.argv):
+            updates_txt = sys.argv[i + 1]
+
     idx = datetime.now().weekday()
     day_name = DAYS[idx]
     day_display = DAYS_DISPLAY[idx]
@@ -30,66 +49,54 @@ def main():
     insights = load_json(os.path.join(MEMORY_DIR, "insights.json"))
     daily = load_json(os.path.join(MEMORY_DIR, "daily", f"{day_name}.json"),
                       {"events": [], "interactions": [], "daily_memories": []})
-    allowed_actions = load_json(os.path.join(MEMORY_DIR, "allowed_actions.json"),
-                                {"approved": [], "proposed": []})
 
     if daily.get("date") != date_str:
         daily = {"events": [], "interactions": [], "daily_memories": []}
 
-    # Events — count + last 10 highlights only
     events = daily.get("events", [])
-    events_txt = f"  {len(events)} events total."
-    if events:
-        events_txt += " Highlights:\n"
-        for e in events[-10:]:
-            events_txt += f"  {e.get('time','?')} - {e.get('detail','?')}\n"
-
-    # Interactions — count only
     interactions = daily.get("interactions", [])
-    interactions_txt = f"  {len(interactions)} interactions today."
+    memories = daily.get("daily_memories", [])
+
+    # Compact events: count + last 10
+    events_txt = f"{len(events)} events"
+    if events:
+        highlights = events[-10:]
+        events_txt += ": " + ", ".join(f"{e.get('time','?')}-{e.get('detail','?')}" for e in highlights)
 
     # Memories
-    memories = daily.get("daily_memories", [])
     memories_txt = ""
     if memories:
-        for m in memories:
-            memories_txt += f"  - {m}\n"
-        memories_txt += "  (Note: these were extracted during earlier pre-briefings today.)\n"
-    else:
-        memories_txt = "  No memories extracted today.\n"
+        memories_txt = "Memories learned today: " + "; ".join(memories[:10])
+        memories_txt += "\n(Note: extracted during earlier pre-briefings. More will be extracted after this briefing.)"
 
-    # Pending action approvals
-    proposed = allowed_actions.get("proposed", [])
-    approvals_txt = ""
-    if proposed:
-        approvals_txt = "PENDING ACTION APPROVALS:\n"
-        for i, action in enumerate(proposed, 1):
-            approvals_txt += f"  {i}. {action.get('description', 'No description')}\n"
-        approvals_txt += "  → Tell the user to reply: approve 1, approve 2, reject 1, etc.\n"
-
-    # Pending items — compact
+    # Pending items
     pending = insights.get("pending_items", [])
-    pending_txt = ""
-    if pending:
-        pending_txt = "OPEN ITEMS: " + "; ".join(pending) + "\n"
+    pending_txt = "Open items: " + "; ".join(pending) if pending else ""
 
-    prompt = f"""You are {soul.get('name', 'Assistant')}, a residential assistant.
+    # Agent automations count
+    auto_count = count_agent_automations()
+    auto_txt = f"Agent automations: {auto_count} active." if auto_count > 0 else ""
 
-TASK: Generate the daily briefing for {day_display}, {date_str}.
-Sent as Telegram message. Be CONCISE: max 120 words. No emojis, no markdown.
+    # Updates
+    updates_section = f"HA UPDATES:\n{updates_txt}" if updates_txt and "up to date" not in updates_txt.lower() else ""
 
-{approvals_txt}
+    prompt = f"""You are {soul.get('name', 'Assistant')}, a residential assistant and system caretaker.
+
+TASK: Daily briefing for {day_display}, {date_str}. Telegram message. Max 120 words. No emojis, no markdown.
+
 TODAY: {events_txt}
-{interactions_txt}
-MEMORIES LEARNED: {memories_txt}
+Interactions: {len(interactions)}
+{memories_txt}
 {pending_txt}
-STRUCTURE YOUR RESPONSE IN THIS ORDER:
-1. FIRST — If there are pending action approvals, present them clearly and ask the user to approve or reject each one by number (e.g., "reply approve 1 or reject 1"). This is the priority.
-2. SECOND — One or two sentences about the day: what happened, anything unusual.
-3. THIRD — What the system learned today (memories), in one sentence.
-4. Skip anything routine or already known from patterns.
+{auto_txt}
+{updates_section}
 
-Tone: direct, like a brief shift report. If nothing notable happened, say so in one sentence."""
+STRUCTURE:
+1. One or two sentences about the day — what happened, anything unusual.
+2. What the system learned today (memories), in one sentence.
+3. If there are HA updates available, mention them.
+4. Skip anything routine.
+Tone: direct, like a brief shift report."""
 
     print(prompt)
 
