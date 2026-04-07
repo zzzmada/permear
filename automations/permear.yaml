@@ -10,7 +10,9 @@
   mode: queued
   max: 20
   trigger:
-    # === CUSTOMIZE FOR YOUR DEVICES ===
+    # === CUSTOMIZE: Add your device triggers, or define events in
+    # === monitored_entities.json and run generate_buffer_events.py
+    # [BEGIN buffer_events triggers — generated]
     - platform: state
       entity_id: person.YOUR_PERSON
       to: "home"
@@ -20,6 +22,7 @@
       from: "home"
       id: "user_left"
     # Add your own triggers here
+    # [END buffer_events triggers — generated]
   action:
     - service: shell_command.append_daily_event
       data:

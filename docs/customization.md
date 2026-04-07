@@ -163,32 +163,75 @@ To support multiple Telegram users:
       {{ trigger.event.data.text }}
 ```
 
-## Extending the Event Buffer
+## Entity Monitoring vs. Event Logging
 
-Add triggers to `permear_buffer_events` for any HA entity you want tracked:
+PERMEAR has two separate systems for tracking entities. Understanding the difference avoids confusion:
+
+**Monitored entities** (`monitored_entities.json`) — What the pre-briefing **reads right now**. Every 30 minutes, the pre-briefing queries the current state of each entity in this file and includes it in the prompt. This list is autodiscovered daily at 06:00 from entities exposed to your conversation agent. You can also add/remove entries manually via Telegram ("monitor sensor.x" / "stop monitoring sensor.x").
+
+**Event buffer** (`permear_buffer_events` automation) — What gets **logged as an event** in the daily file when a state change occurs. These are HA automation triggers and must be hardcoded in YAML — HA does not support dynamic triggers. The buffer captures discrete events ("user arrived at 17:30", "AC turned on") that the briefing and weekly compilation analyze for patterns.
+
+In short: monitored entities = "what is the state now?", event buffer = "what changed today?"
+
+### Customizing the Event Buffer
+
+There are two ways to manage event buffer triggers:
+
+**Option A — Define events in `monitored_entities.json` (recommended)**
+
+Add an `events` array to any entity in the file:
+
+```json
+{
+  "entity_id": "lock.front_door",
+  "friendly_name": "Front Door Lock",
+  "domain": "lock",
+  "monitor": false,
+  "events": [
+    {"trigger_type": "state", "to": "unlocked", "id": "door_unlocked"},
+    {"trigger_type": "state", "to": "locked", "id": "door_locked"}
+  ]
+}
+```
+
+Then regenerate the automation YAML:
+
+```bash
+# Via Developer Tools → Services → shell_command.generate_buffer_events
+# Or via SSH: python3 /config/scripts/generate_buffer_events.py
+```
+
+The script reads all `events` fields and writes the triggers between `[BEGIN]` and `[END]` markers in your automation file. Then reload automations in HA.
+
+This keeps `monitored_entities.json` as the single source of truth for both what the pre-briefing reads (`monitor: true`) and what the event buffer logs (`events` array).
+
+**Option B — Edit the automation YAML directly**
+
+Add triggers manually between the markers in your automation file:
 
 ```yaml
-# Door lock
-- platform: state
-  entity_id: lock.front_door
-  to: "unlocked"
-  id: "door_unlocked"
-
-# Energy spike
+# [BEGIN buffer_events triggers — generated]
 - platform: numeric_state
   entity_id: sensor.energy_consumption
   above: 3000
   id: "high_energy"
-
-# Motion in unexpected hours
-- platform: state
-  entity_id: binary_sensor.hallway_motion
-  to: "on"
-  id: "hallway_motion"
-  conditions:
-    - condition: time
-      after: "00:00:00"
-      before: "05:00:00"
+# [END buffer_events triggers — generated]
 ```
 
-The more relevant events you capture, the richer the daily briefing and the better the weekly compilation's pattern detection.
+If you use Option B, be aware that running `generate_buffer_events.py` will overwrite your manual edits between the markers. Use Option A instead for anything you want to persist.
+
+### Supported trigger types in events
+
+| Field | Values | Used in |
+|---|---|---|
+| `trigger_type` | `state`, `numeric_state` | Both |
+| `to`, `from` | Any state string | `state` |
+| `for` | Duration string (e.g., `"00:05:00"`) | `state` |
+| `above`, `below` | Numeric value | `numeric_state` |
+| `id` | Unique identifier logged in daily file | Both |
+
+### Entity Discovery Frequency
+
+The `discover_entities.py` script runs daily at 06:00 to keep `monitored_entities.json` in sync with entities exposed to your conversation agent. This is a maintenance task — it picks up entities you expose or unexpose via the HA UI.
+
+Proposals for **new entities to monitor** (things the agent notices but doesn't currently track) happen during the **weekly compilation**, not daily. The weekly compilation has 7 days of context to justify why something new should be tracked. Daily proposals would be noisy and lack sufficient evidence.

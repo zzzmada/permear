@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 Autodiscover entities exposed to the conversation agent.
-Filters by entity_registry's should_expose flag to match exactly
-what the LLM can see — avoids sending 150+ irrelevant entities.
+Reads entity_registry's should_expose flag to match what the LLM sees.
+Preserves 'events' and 'monitor' fields set by user or previous runs.
 
 Usage:
   discover_entities.py              # Full discovery
-  discover_entities.py --add <id> <name>   # Add manual entry
-  discover_entities.py --remove <id>       # Remove entry
-
-IMPORTANT: The entity_registry file location varies by HA version.
-Common paths: /config/.storage/core.entity_registry
+  discover_entities.py --add <id> <friendly_name>
+  discover_entities.py --remove <id>
 """
 import json, sys, os
 from datetime import datetime
@@ -21,14 +18,14 @@ ENTITIES_PATH = "/config/memory/monitored_entities.json"
 ENTITY_REGISTRY_PATH = "/config/.storage/core.entity_registry"
 TOKEN_PATH = "/config/.permear_token"
 HA_URL = "http://localhost:8123"
-MAX_ENTITIES = 50
 
-# Entities to always exclude even if exposed
 EXCLUDE_PATTERNS = [
     "sensor.sun_", "sensor.time", "sensor.date",
     "sensor.uptime", "sensor.last_boot",
     "binary_sensor.updater"
 ]
+
+MAX_ENTITIES = 80
 
 def load_token():
     try:
@@ -51,7 +48,6 @@ def get_exposed_entity_ids():
     """Read entity_registry to find entities with should_expose=true."""
     if not os.path.exists(ENTITY_REGISTRY_PATH):
         return None
-
     try:
         with open(ENTITY_REGISTRY_PATH, 'r') as f:
             registry = json.load(f)
@@ -63,11 +59,9 @@ def get_exposed_entity_ids():
     for entity in entities:
         entity_id = entity.get("entity_id", "")
         options = entity.get("options", {})
-        # Check conversation integration exposure
         conv_options = options.get("conversation", {})
         if conv_options.get("should_expose", False):
             exposed.add(entity_id)
-
     return exposed if exposed else None
 
 def is_excluded(entity_id):
@@ -81,77 +75,79 @@ def load_current():
         with open(ENTITIES_PATH, 'r') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"last_update": None, "source": "none", "entities": []}
+        return {"updated_at": None, "count": 0, "entities": []}
 
 def save_entities(data):
     os.makedirs(os.path.dirname(ENTITIES_PATH), exist_ok=True)
+    data["count"] = len(data.get("entities", []))
     with open(ENTITIES_PATH, 'w') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def discover(token):
-    # Get exposed entity IDs from registry
     exposed_ids = get_exposed_entity_ids()
-
-    # Get all states from REST API
     states = ha_api("states", token) if token else None
     if not states:
         print("ERROR: Cannot read HA states API")
         return False
 
-    # Build lookup of states
-    state_map = {}
-    for s in states:
-        state_map[s.get("entity_id", "")] = s
+    state_map = {s.get("entity_id", ""): s for s in states}
 
-    # Preserve manual entries
+    # Build lookup of existing entries to preserve events/monitor fields
     current = load_current()
-    manual_entries = [e for e in current.get("entities", []) if e.get("manual", False)]
+    existing_lookup = {}
+    for e in current.get("entities", []):
+        existing_lookup[e["entity_id"]] = e
 
     discovered = []
     for eid, state in state_map.items():
-        # If we have registry data, only include exposed entities
         if exposed_ids is not None and eid not in exposed_ids:
             continue
-
         if is_excluded(eid):
-            continue
-        if state.get("state") in ["unavailable"]:
             continue
 
         friendly = state.get("attributes", {}).get("friendly_name", eid)
         domain = eid.split(".")[0] if "." in eid else ""
 
-        discovered.append({
+        entry = {
             "entity_id": eid,
             "friendly_name": friendly,
             "domain": domain,
-            "manual": False
-        })
+            "monitor": False
+        }
 
-    # Merge: manual first, then discovered (dedup)
-    seen_ids = set()
-    merged = []
+        # Preserve existing fields (monitor, events) from previous data
+        if eid in existing_lookup:
+            old = existing_lookup[eid]
+            entry["monitor"] = old.get("monitor", False)
+            if "events" in old:
+                entry["events"] = old["events"]
 
-    for e in manual_entries:
-        if e["entity_id"] not in seen_ids:
-            merged.append(e)
-            seen_ids.add(e["entity_id"])
+        discovered.append(entry)
 
-    for e in discovered:
-        if e["entity_id"] not in seen_ids and len(merged) < MAX_ENTITIES:
-            merged.append(e)
-            seen_ids.add(e["entity_id"])
+    # Also keep manually added entities not in discovery
+    discovered_ids = {e["entity_id"] for e in discovered}
+    for eid, old in existing_lookup.items():
+        if eid not in discovered_ids:
+            # Keep it — might be manually added or temporarily unavailable
+            discovered.append(old)
 
-    source = "entity_registry" if exposed_ids else "api_all_domains"
+    discovered.sort(key=lambda e: e["entity_id"])
+
+    if len(discovered) > MAX_ENTITIES:
+        discovered = discovered[:MAX_ENTITIES]
+
+    source = "entity_registry" if exposed_ids else "api_all"
     result = {
-        "last_update": datetime.now().isoformat(),
-        "source": source,
-        "entities": merged
+        "updated_at": datetime.now().isoformat(),
+        "count": len(discovered),
+        "entities": discovered
     }
 
     save_entities(result)
-    print(f"OK: {len(merged)} entities ({len(manual_entries)} manual + "
-          f"{len(merged) - len(manual_entries)} discovered via {source})")
+    monitored = sum(1 for e in discovered if e.get("monitor"))
+    with_events = sum(1 for e in discovered if e.get("events"))
+    print(f"OK: {len(discovered)} entities ({monitored} monitored, "
+          f"{with_events} with event triggers) via {source}")
     return True
 
 def add_entity(entity_id, friendly_name):
@@ -160,19 +156,19 @@ def add_entity(entity_id, friendly_name):
 
     for e in entities:
         if e["entity_id"] == entity_id:
-            print(f"Already monitored: {entity_id}")
+            print(f"Already exists: {entity_id}")
             return
 
     entities.append({
         "entity_id": entity_id,
         "friendly_name": friendly_name or entity_id,
         "domain": entity_id.split(".")[0] if "." in entity_id else "unknown",
-        "manual": True
+        "monitor": True
     })
 
     current["entities"] = entities
     save_entities(current)
-    print(f"Added: {entity_id} (manual)")
+    print(f"Added: {entity_id} (monitor: true)")
 
 def remove_entity(entity_id):
     current = load_current()
@@ -203,7 +199,7 @@ def main():
 
     token = load_token()
     if not token:
-        print("ERROR: No token found at /config/.permear_token")
+        print("ERROR: No token at /config/.permear_token")
         return
     discover(token)
 

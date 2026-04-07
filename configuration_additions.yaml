@@ -41,6 +41,7 @@ shell_command:
   discover_entities: "python3 /config/scripts/discover_entities.py"
   add_monitored_entity: "python3 /config/scripts/discover_entities.py --add '{{ entity_id }}' '{{ friendly_name }}'"
   remove_monitored_entity: "python3 /config/scripts/discover_entities.py --remove '{{ entity_id }}'"
+  generate_buffer_events: "python3 /config/scripts/generate_buffer_events.py"
 
   # Weekly compilation
   build_weekly_prompt: "python3 /config/scripts/build_weekly_prompt.py"

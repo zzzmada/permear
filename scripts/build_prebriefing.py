@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Build the pre-briefing proactive evaluation prompt.
-v5.0: Reads monitored_entities.json for dynamic house state.
-      Receives HA health summary as argument from automation.
-      Queries entity states via REST API.
+v5.0: Reads monitored_entities.json, filters by monitor: true,
+      queries entity states via REST API, injects HA health summary.
 """
 import json, os, sys
 from datetime import datetime
@@ -44,25 +43,29 @@ def get_entity_state(entity_id, token):
         return "unavailable"
 
 def build_house_state(token):
-    """Build compact house state from monitored entities."""
+    """Build compact house state from entities with monitor: true."""
     monitored = load_json(ENTITIES_PATH, {"entities": []})
     entities = monitored.get("entities", [])
 
     if not entities or not token:
-        return "House state: not available (no monitored entities or no token)."
+        return "House state: not available."
 
     lines = []
     for ent in entities:
+        if not ent.get("monitor", False):
+            continue
         eid = ent.get("entity_id", "")
         name = ent.get("friendly_name", eid)
         state = get_entity_state(eid, token)
         if state not in ["unavailable", "unknown"]:
             lines.append(f"{name}: {state}")
-    
-    return "\n".join(lines) if lines else "No entity states available."
+        else:
+            lines.append(f"{name}: unavailable")
+
+    return "\n".join(lines) if lines else "No monitored entities."
 
 def main():
-    # Health summary passed as first positional argument
+    # Health summary passed as argument from automation
     health_txt = ""
     if len(sys.argv) > 1:
         health_txt = " ".join(sys.argv[1:])
@@ -91,7 +94,7 @@ def main():
         for e in events[-5:]:
             events_txt += f"  {e.get('time','?')} {e.get('detail','?')}\n"
 
-    # Compact interactions (to detect if same alert already sent)
+    # Recent alerts (to avoid repeats)
     interactions = daily.get("interactions", [])
     recent_alerts = [i.get("summary", "")[:50] for i in interactions[-5:]
                      if i.get("channel") == "prebriefing"]

@@ -33,6 +33,7 @@ CARETAKER (v5.0)
 ├── ha_log_monitor.py        ← Parse HA logs for errors/warnings
 ├── ha_updates_check.py      ← Check HA/addon updates via Supervisor API
 ├── discover_entities.py     ← Autodiscover exposed entities
+├── generate_buffer_events.py ← Regenerate event triggers from JSON
 └── manage_agent_automations.py ← Create/remove HA automations
 ```
 
@@ -234,16 +235,29 @@ A: Almost certainly `max_tokens` is too low. Set to 8192+. Check `/config/logs/`
 
 ## Changelog
 
+### v5.2 (2026-04-07)
+- **`monitored_entities.json` as single source of truth**: The file now serves two roles — entities with `monitor: true` are read by the pre-briefing prompt, and entities with an `events` array define triggers for the event buffer automation. No more maintaining two separate lists.
+- **`generate_buffer_events.py`**: New script that reads `events` from `monitored_entities.json` and regenerates the automation YAML triggers between `[BEGIN]`/`[END]` markers. Run after editing events in the JSON.
+- **`discover_entities.py` preserves user fields**: Discovery now preserves existing `monitor` and `events` fields when updating entities. Previously, rediscovery could overwrite user-set flags.
+- **`build_prebriefing.py` filters by `monitor: true`**: Only entities explicitly marked for monitoring are included in the pre-briefing prompt.
+- **`customization.md` rewritten**: New section "Entity Monitoring vs. Event Logging" explains the two systems and the `generate_buffer_events.py` workflow.
+
+### v5.1 (2026-04-06)
+- **Agent ID fix**: Documented that the correct entity_id is often `conversation.google_ai_conversation`, NOT `conversation.google_generative_ai`. Must be verified in Developer Tools.
+- **`discover_entities.py` filters by `should_expose`**: Now reads `core.entity_registry` and only includes entities with `options.conversation.should_expose: true`. Without this, 150+ entities were sent to the LLM instead of ~30.
+- **`weekly_compile.py` apply_users fix**: Now handles ANY field in `{add, remove}` diff format, not just `observed_patterns`. Prevents data corruption when the LLM sends restrictions or other fields in diff format.
+- **Truncation detection**: `weekly_compile.py` detects unbalanced braces/brackets before parsing. Logs raw response to `/config/logs/`.
+- **Jinja2 fix**: Uses `| truncate()` instead of `[:255]` slice in HA templates (slice syntax causes KeyError in HA's Jinja2).
+- **HA triggers are static**: Documented that automation triggers cannot be generated dynamically — they must be hardcoded in YAML.
+- **`ha_updates_check.py` requires SUPERVISOR_TOKEN**: Documented that this only works inside the HAOS container, not from SSH addons.
+- **Prompt compaction**: Weekly prompt limits to 20 events and 10 interactions per day to avoid MAX_TOKENS truncation.
+
 ### v5.0 (2026-04-06)
-- **Agent as system caretaker**: The agent now monitors HA health, checks for updates, autodiscovers entities, and can create native HA automations.
-- **Allowed actions removed**: The v4.0 `allowed_actions.json` approach is replaced by agent-created HA automations (`agent_automations.yaml` + `manage_agent_automations.py`). Native automations are more reliable — HA executes them directly instead of polling a JSON file.
-- **HA health monitoring**: `ha_log_monitor.py` parses HA logs for errors/warnings/unavailable entities. Injected into pre-briefing prompt.
-- **Update checking**: `ha_updates_check.py` queries Supervisor API for HA Core and addon updates. Included in daily briefing.
-- **Entity autodiscovery**: `discover_entities.py` reads the entity registry's `should_expose` flag to match exactly what the LLM can see. Runs daily at 06:00. Replaces hardcoded entity lists in pre-briefing.
-- **Truncation detection**: `weekly_compile.py` detects truncated LLM responses (unbalanced braces) before parsing. Logs raw response to `/config/logs/`.
-- **Prompt compaction**: Weekly prompt limits to 20 events and 10 interactions per day.
-- **apply_users fix**: `weekly_compile.py` now handles ANY field in `{add, remove}` format, not just `observed_patterns`. Prevents data corruption.
-- **Jinja2 fix**: Uses `| truncate()` instead of `[:255]` slice in HA templates.
+- **Agent as system caretaker**: The agent monitors HA health, checks for updates, autodiscovers entities, and can create native HA automations.
+- **Allowed actions removed**: The v4.0 `allowed_actions.json` approach replaced by agent-created HA automations (`agent_automations.yaml` + `manage_agent_automations.py`).
+- **HA health monitoring**: `ha_log_monitor.py` parses HA logs for errors/warnings/unavailable entities.
+- **Update checking**: `ha_updates_check.py` queries Supervisor API for HA Core and addon updates.
+- **Entity autodiscovery**: `discover_entities.py` runs daily at 06:00, replaces hardcoded entity lists.
 
 ### v3.2 (2026-03-31)
 - Telegram context injection (`input_text.permear_last_agent_message`)
