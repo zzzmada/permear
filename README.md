@@ -30,6 +30,7 @@ Now your assistant can:
 
 ## 🧬 At a Glance
 
+```text
 USER / VOICE / TELEGRAM
             │
             ▼
@@ -45,8 +46,7 @@ MEMORY    SCRIPTS   AUTOMATIONS
    └────┬────┴────┬──────┘
         ▼         ▼
  SELF-LEARNING   SYSTEM CARETAKER
-
-
+```
 ---
 
 ## ⏱️ System Cycles
