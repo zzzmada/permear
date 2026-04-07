@@ -1,26 +1,118 @@
 # PERMEAR — Persistent Memory Architecture for Home Assistant AI Agents
 
-A persistent memory and self-improvement system that transforms Home Assistant's conversation agent from a stateless chatbot into an intelligent assistant that **remembers, learns, monitors, and maintains** your smart home over time.
+> Transform your Home Assistant agent from a stateless chatbot into a system that **remembers, learns, and takes care of your home over time**.
 
-> Built and battle-tested on a Raspberry Pi 4 (2GB RAM) running HAOS. No external databases, no cloud storage, no paid services beyond what you already use.
+---
+
+## 🧠 The Problem
+
+Home Assistant conversation agents (Gemini, OpenAI, etc.) are **stateless**.
+
+Every interaction:
+- ❌ No memory  
+- ❌ No learning  
+- ❌ No continuity  
+
+---
+
+## ⚡ The Solution
+
+PERMEAR adds a **persistent memory layer + automation brain** on top of your agent.
+
+Now your assistant can:
+- ✅ Remember users and preferences  
+- ✅ Learn from interactions  
+- ✅ Detect patterns  
+- ✅ Monitor system health  
+- ✅ Create automations (with approval)  
+
+---
+
+## 🧬 At a Glance
+
+USER / VOICE / TELEGRAM
+            │
+            ▼
+   ┌─────────────────────┐
+   │   LLM AGENT (HA)    │
+   └─────────┬───────────┘
+             │
+   ┌─────────┼─────────┐
+   ▼         ▼         ▼
+MEMORY    SCRIPTS   AUTOMATIONS
+(JSON)    (Python)     (YAML)
+   │         │           │
+   └────┬────┴────┬──────┘
+        ▼         ▼
+ SELF-LEARNING   SYSTEM CARETAKER
+
+
+---
+
+## ⏱️ System Cycles
+
+    ┌──────────────────────────────┐
+    │        EVERY 30 MIN          │
+    │      (08h → 20h)             │
+    │   Pre-briefing (health + home)
+    └─────────────┬────────────────┘
+                  │
+                  ▼
+    ┌──────────────────────────────┐
+    │          DAILY (21h)         │
+    │   Briefing + memory write    │
+    └─────────────┬────────────────┘
+                  │
+                  ▼
+    ┌──────────────────────────────┐
+    │      DAILY (06:00)           │
+    │   Entity autodiscovery       │
+    └─────────────┬────────────────┘
+                  │
+                  ▼
+    ┌──────────────────────────────┐
+    │     WEEKLY (Sunday)          │
+    │ Pattern detection + evolve   │
+    └──────────────────────────────┘
+
+---
 
 ## What This Is
 
-Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture that gives your agent a persistent soul, user profiles, learned insights, and the ability to create automations and monitor system health — all through local JSON files, Python scripts, and HA automations.
+Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero.
 
-**In v5.0, the agent evolves from household assistant to system caretaker** — it monitors HA health, detects errors, checks for updates, autodiscovers entities, and can create native HA automations with user approval.
+PERMEAR fixes that with a **file-based memory architecture** that gives your agent:
+- persistent memory  
+- user profiles  
+- learned insights  
+- system monitoring  
+- automation capabilities  
+
+All through:
+- local JSON files  
+- Python scripts  
+- Home Assistant automations  
+
+In **v5.0**, the agent evolves into a **system caretaker**:
+- monitors HA health  
+- detects errors  
+- checks updates  
+- autodiscovers entities  
+- creates automations with approval  
+
+---
 
 ## Architecture
 
-```
+
 MEMORY (persistent JSON files)
-├── guidelines.json          ← IMMUTABLE constitution (chmod 444)
-├── soul.json                ← Agent personality (edited weekly by agent)
-├── users.json               ← Household profiles (edited weekly + quick-learn)
-├── insights.json            ← Detected patterns (edited weekly)
-├── monitored_entities.json  ← Autodiscovered entities (daily 06:00)
+├── guidelines.json ← IMMUTABLE constitution (chmod 444)
+├── soul.json ← Agent personality (edited weekly by agent)
+├── users.json ← Household profiles (edited weekly + quick-learn)
+├── insights.json ← Detected patterns (edited weekly)
+├── monitored_entities.json ← Autodiscovered entities (daily 06:00)
 └── daily/
-    └── monday..sunday.json  ← 7-day rotating event logs
+└── monday..sunday.json ← 7-day rotating event logs
 
 CYCLES
 ├── Every 30 min (08-20h) ── Pre-briefing: health check + house evaluation
@@ -30,30 +122,44 @@ CYCLES
 └── On demand ────────────── Telegram chat + voice commands
 
 CARETAKER (v5.0)
-├── ha_log_monitor.py        ← Parse HA logs for errors/warnings
-├── ha_updates_check.py      ← Check HA/addon updates via Supervisor API
-├── discover_entities.py     ← Autodiscover exposed entities
-├── generate_buffer_events.py ← Regenerate event triggers from JSON
-└── manage_agent_automations.py ← Create/remove HA automations
-```
+├── ha_log_monitor.py
+├── ha_updates_check.py
+├── discover_entities.py
+├── generate_buffer_events.py
+└── manage_agent_automations.py
+
+
+---
 
 ## Key Concepts
 
-### Self-Calibrating Proactivity
+### 🧠 Self-Calibrating Proactivity
+The system starts noisy and improves based on feedback.  
+User responses like *"irrelevant"* instantly tune behavior.
 
-The pre-briefing system starts noisy and becomes precise over time. When you tell the agent "that's irrelevant," it immediately learns the restriction. No manual tuning — your natural responses are the training data.
+---
 
-### 7-Day Rotation
+### 🔄 7-Day Rotation
+- Files rotate automatically  
+- No storage growth  
+- Weekly compile extracts patterns  
 
-Daily files are named by weekday (`monday.json` through `sunday.json`). Next Monday overwrites this Monday automatically. No cleanup jobs, no growing storage. The weekly compilation extracts patterns before files get overwritten.
+---
 
-### Agent-Created Automations
+### 🤖 Agent-Created Automations
+- Proposes via Telegram  
+- Requires approval  
+- Activates instantly (no restart)  
+- Isolated in `agent_automations.yaml`  
 
-The agent can create native HA automations in a dedicated file (`agent_automations.yaml`). It proposes via Telegram, the user approves, and the automation activates immediately via `automation.reload` — no HA restart needed. The agent never touches other automation files.
+---
 
-### Guidelines: The Immutable Constitution
+### 📜 Guidelines: The Immutable Constitution
+- `guidelines.json` (chmod 444)  
+- Defines memory rules  
+- Cannot be changed by the agent  
 
-`guidelines.json` (chmod 444) defines the rules for how the agent edits its own memory. The agent operates within these boundaries but cannot change them.
+---
 
 ## Requirements
 
