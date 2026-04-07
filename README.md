@@ -104,7 +104,7 @@ In **v5.0**, the agent evolves into a **system caretaker**:
 
 ## Architecture
 
-
+```text
 MEMORY (persistent JSON files)
 ├── guidelines.json ← IMMUTABLE constitution (chmod 444)
 ├── soul.json ← Agent personality (edited weekly by agent)
@@ -127,8 +127,7 @@ CARETAKER (v5.0)
 ├── discover_entities.py
 ├── generate_buffer_events.py
 └── manage_agent_automations.py
-
-
+```
 ---
 
 ## Key Concepts
