@@ -1,60 +1,86 @@
 #!/usr/bin/env python3
 """
-Parse HA log file and return compact summary of errors, warnings,
-and unavailable entities. Output optimized for token economy.
+Parse HA log file. Returns compact summary with two error categories:
+- SELF_ERRORS: errors from components PERMEAR uses directly (telegram, conversation,
+  automation, shell_command). These are likely caused by the agent's own actions.
+- ERRORS: errors from other HA components (external integrations, devices, etc.)
 """
 import re, os
 from datetime import datetime, timedelta
-from collections import defaultdict
 
-LOG_PATH = "/config/home-assistant.log"
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from permear_config import HA_LOG_PATH, SELF_COMPONENTS
+
 MAX_ERRORS = 10
 MAX_WARNINGS = 5
 LOOKBACK_HOURS = 2
 
+def is_self_component(component_str):
+    """Check if the error component matches a PERMEAR-related component."""
+    comp_lower = component_str.lower()
+    return any(sc in comp_lower for sc in SELF_COMPONENTS)
+
 def main():
-    if not os.path.exists(LOG_PATH):
+    if not os.path.exists(HA_LOG_PATH):
         print("HEALTH: Log file not found")
         return
 
     cutoff = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
-    errors = []
+    self_errors = []
+    other_errors = []
     warnings = []
-    unavailable = set()
     new_devices = []
+    unavailable = set()
     seen = set()
 
     try:
-        with open(LOG_PATH, 'r', errors='replace') as f:
+        with open(HA_LOG_PATH, 'r', errors='replace') as f:
             lines = f.readlines()
     except Exception as e:
         print(f"HEALTH: Read error — {e}")
         return
 
-    # Process last 500 lines max (performance on low-RAM devices)
     for line in lines[-500:]:
         ts_match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
         if ts_match:
             try:
-                ts = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
-                if ts < cutoff:
+                if datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S") < cutoff:
                     continue
             except ValueError:
                 continue
 
-        # Dedup by first 80 chars
         dedup_key = line[:80]
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
 
         if " ERROR " in line:
+            # Try structured format: ERROR (thread) [component] message
             match = re.search(r'ERROR \((\w+)\) \[([^\]]+)\] (.+)', line)
-            if match and len(errors) < MAX_ERRORS:
-                component = match.group(2).split('.')[-1]
-                msg = match.group(3)[:60]
+            if match:
+                component = match.group(2)
+                component_short = component.split('.')[-1]
+                msg = match.group(3)[:80]
                 time_str = ts_match.group(1)[11:16] if ts_match else "?"
-                errors.append(f"{component} {time_str}: {msg}")
+                entry = f"{component_short} {time_str}: {msg}"
+
+                if is_self_component(component):
+                    if len(self_errors) < MAX_ERRORS:
+                        self_errors.append(entry)
+                else:
+                    if len(other_errors) < MAX_ERRORS:
+                        other_errors.append(entry)
+            else:
+                # Unstructured error — check if it mentions a self component
+                line_lower = line.lower()
+                if any(sc in line_lower for sc in SELF_COMPONENTS):
+                    if len(self_errors) < MAX_ERRORS:
+                        time_str = ts_match.group(1)[11:16] if ts_match else "?"
+                        self_errors.append(f"{time_str}: {line.strip()[:80]}")
+                elif len(other_errors) < MAX_ERRORS:
+                    time_str = ts_match.group(1)[11:16] if ts_match else "?"
+                    other_errors.append(f"{time_str}: {line.strip()[:80]}")
 
         elif " WARNING " in line:
             if "unavailable" in line.lower():
@@ -64,20 +90,19 @@ def main():
             elif len(warnings) < MAX_WARNINGS:
                 match = re.search(r'WARNING \((\w+)\) \[([^\]]+)\] (.+)', line)
                 if match:
-                    component = match.group(2).split('.')[-1]
-                    msg = match.group(3)[:60]
-                    warnings.append(f"{component}: {msg}")
+                    warnings.append(f"{match.group(2).split('.')[-1]}: {match.group(3)[:60]}")
 
         # New Zigbee/Z-Wave devices
-        line_lower = line.lower()
-        if ("interview" in line_lower or "new device" in line_lower) and \
-           ("zigbee" in line_lower or "zwave" in line_lower or "z2m" in line_lower):
+        ll = line.lower()
+        if ("interview" in ll or "new device" in ll) and ("zigbee" in ll or "z2m" in ll):
             new_devices.append(line.strip()[:80])
 
     # Build compact output
     parts = []
-    if errors:
-        parts.append(f"ERRORS({len(errors)}): " + " | ".join(errors))
+    if self_errors:
+        parts.append(f"SELF_ERRORS({len(self_errors)}): " + " | ".join(self_errors))
+    if other_errors:
+        parts.append(f"ERRORS({len(other_errors)}): " + " | ".join(other_errors))
     if warnings:
         parts.append(f"WARNINGS({len(warnings)}): " + " | ".join(warnings))
     if unavailable:

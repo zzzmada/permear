@@ -1,5 +1,5 @@
 # =============================================================================
-# PERMEAR v5.0 — Persistent Memory + System Caretaker Automations
+# PERMEAR v5.4 — Persistent Memory + System Caretaker Automations
 #
 # Replace: YOUR_CHAT_ID, YOUR_AGENT_ID, person.YOUR_PERSON
 # =============================================================================
@@ -10,8 +10,6 @@
   mode: queued
   max: 20
   trigger:
-    # === CUSTOMIZE: Add your device triggers, or define events in
-    # === monitored_entities.json and run generate_buffer_events.py
     # [BEGIN buffer_events triggers — generated]
     - platform: state
       entity_id: person.YOUR_PERSON
@@ -21,7 +19,6 @@
       entity_id: person.YOUR_PERSON
       from: "home"
       id: "user_left"
-    # Add your own triggers here
     # [END buffer_events triggers — generated]
   action:
     - service: shell_command.append_daily_event
@@ -54,15 +51,26 @@
           {{ trigger.event.data.text }}
         conversation_id: "telegram_main"
       response_variable: response
-    - service: telegram_bot.send_message
-      data:
-        chat_id: YOUR_CHAT_ID
-        message: "{{ response.response.speech.plain.speech }}"
-    - service: input_text.set_value
-      target:
-        entity_id: input_text.permear_last_agent_message
-      data:
-        value: "{{ response.response.speech.plain.speech | truncate(255, False, '') }}"
+    - variables:
+        speech: "{{ response.response.speech.plain.speech | default('') | trim }}"
+    - if:
+        - condition: template
+          value_template: "{{ speech | length > 0 }}"
+      then:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: YOUR_CHAT_ID
+            message: "{{ speech }}"
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.permear_last_agent_message
+          data:
+            value: "{{ speech | truncate(255, False, '') }}"
+      else:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: YOUR_CHAT_ID
+            message: "Sorry, I got an empty response. Could you repeat?"
 
 # 3. DAILY BRIEFING (21h)
 - alias: "PERMEAR - Daily briefing"
@@ -82,15 +90,21 @@
         agent_id: YOUR_AGENT_ID
         text: "{{ prompt_result.stdout }}"
       response_variable: briefing
-    - service: telegram_bot.send_message
-      data:
-        chat_id: YOUR_CHAT_ID
-        message: "{{ briefing.response.speech.plain.speech }}"
-    - service: input_text.set_value
-      target:
-        entity_id: input_text.permear_last_agent_message
-      data:
-        value: "{{ briefing.response.speech.plain.speech | truncate(255, False, '') }}"
+    - variables:
+        speech: "{{ briefing.response.speech.plain.speech | default('') | trim }}"
+    - if:
+        - condition: template
+          value_template: "{{ speech | length > 0 }}"
+      then:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: YOUR_CHAT_ID
+            message: "{{ speech }}"
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.permear_last_agent_message
+          data:
+            value: "{{ speech | truncate(255, False, '') }}"
     - delay:
         seconds: 5
     - service: conversation.process
@@ -110,7 +124,7 @@
       data:
         detail: "briefing_sent"
 
-# 4. PRE-BRIEFING (every 30min) — with HA health monitoring
+# 4. PRE-BRIEFING (every 30min) with HA health monitoring
 - alias: "PERMEAR - Pre-briefing"
   id: permear_prebriefing
   trigger:
@@ -133,7 +147,7 @@
         text: "{{ prompt_result.stdout }}"
       response_variable: evaluation
     - variables:
-        answer: "{{ evaluation.response.speech.plain.speech | trim }}"
+        answer: "{{ evaluation.response.speech.plain.speech | default('') | trim }}"
     - condition: template
       value_template: >
         {{ 'SILENCE' not in answer.upper() and answer | length > 2 }}
@@ -150,8 +164,7 @@
       data:
         detail: "prebriefing:{{ answer[:100] }}"
 
-# 5. QUICK LEARNING
-#    NOTE: Keywords must match user's language. See docs/customization.md
+# 5. QUICK LEARNING — keywords must match user's language
 - alias: "PERMEAR - Quick learning"
   id: permear_quick_learning
   trigger:
@@ -162,14 +175,10 @@
       value_template: >
         {% set text = trigger.event.data.text | lower %}
         {{ trigger.event.data.chat_id == YOUR_CHAT_ID and
-           ('irrelevant' in text or
-            'unnecessary' in text or
-            'already know' in text or
-            'stop alerting' in text or
-            "don't alert" in text or
-            'not important' in text or
-            "don't care" in text or
-            'stop telling' in text or
+           ('irrelevant' in text or 'unnecessary' in text or
+            'already know' in text or 'stop alerting' in text or
+            "don't alert" in text or 'not important' in text or
+            "don't care" in text or 'stop telling' in text or
             'i know' in text) }}
   action:
     - service: conversation.process
@@ -177,7 +186,6 @@
         agent_id: YOUR_AGENT_ID
         text: >
           The user responded to an alert with: "{{ trigger.event.data.text }}"
-          This indicates the alert was irrelevant.
           Return ONLY JSON: {"new_restriction": "what NOT to alert about"}
           If unclear: {"new_restriction": null}
       response_variable: learning

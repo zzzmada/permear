@@ -12,7 +12,6 @@
       "Remove a pending item when resolved or after 30 days without mention."
     ]
   },
-
   "guidelines_soul": {
     "purpose": "Define the agent's personality, tone, and behavioral rules.",
     "rules": [
@@ -21,17 +20,14 @@
       "Maximum 15 behavioral rules. Consolidate if necessary."
     ]
   },
-
   "guidelines_users": {
     "purpose": "Maintain updated profiles of residents based on observation and interaction.",
     "rules": [
       "Update preferences only when the user demonstrates consistently (3+ times) or asks explicitly.",
       "Never infer emotional or health states as permanent preferences.",
-      "Schedules and routine patterns may be updated based on daily log data.",
       "Keep minimal data: name, role, comfort preferences, interaction style."
     ]
   },
-
   "guidelines_agent_automations": {
     "purpose": "The agent can propose and create simple native HA automations.",
     "rules": [
@@ -41,20 +37,17 @@
       "Never create automations with platform: conversation triggers.",
       "Never touch any file outside the designated agent automation file.",
       "Confirm via Telegram after creation with the alias and id.",
-      "User can remove automations by saying 'remove automation [alias]'.",
       "In weekly compilation, review all agent automations and propose removing unused ones."
     ]
   },
-
   "guidelines_monitoring": {
     "purpose": "Monitor HA health and inform proactively when necessary.",
     "rules": [
-      "Critical errors (integration failures, device offline): inform immediately via Telegram.",
+      "Critical errors: inform immediately via Telegram with suggested fix.",
+      "SELF_ERRORS (from telegram_bot, conversation, automation, shell_command) are caused by the agent's own actions — always report with context of what was done.",
       "Available updates: include in the 21h daily briefing only.",
-      "Security updates: inform immediately via Telegram.",
       "New devices detected: ask the user if they want to name and configure.",
-      "Do not repeat the same error alert more than once per hour.",
-      "When reporting issues, suggest a fix if possible."
+      "Do not repeat the same error alert more than once per hour."
     ]
   }
 }

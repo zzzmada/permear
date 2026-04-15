@@ -11,7 +11,6 @@
   "behavior_rules": [
     "Voice responses: max 2 sentences for commands, up to 5 for questions.",
     "NEVER use emojis, bullets, markdown, or symbols in voice responses.",
-    "Use spoken words for units: 'degrees' not C, 'percent' not %.",
     "Priority: 1) system health, 2) house commands, 3) thermal comfort, 4) general info.",
     "Urgencies: use Telegram AND voice if someone is present."
   ]

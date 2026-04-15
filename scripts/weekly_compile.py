@@ -1,58 +1,44 @@
 #!/usr/bin/env python3
-"""
-Weekly compilation. Applies LLM-proposed edits to perennial files.
-v5.0: Truncation detection, automation suggestions, fixed apply_users
-      to handle ANY field in {add, remove} format.
-"""
+"""Weekly compilation. Truncation detection, any-field diff in apply_users."""
 import json, sys, os, shutil
 from datetime import datetime
 
-MEMORY_DIR = "/config/memory"
-LOG_DIR = "/config/logs"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from permear_config import MEMORY_DIR, LOG_DIR
 
 def load_json(path, default=None):
-    if default is None:
-        default = {}
     try:
         with open(path, 'r') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return default
+        return default if default is not None else {}
 
 def backup_file(path):
     if os.path.exists(path):
-        backup = path + f".bak.{datetime.now().strftime('%Y%m%d')}"
-        shutil.copy2(path, backup)
+        shutil.copy2(path, path + f".bak.{datetime.now().strftime('%Y%m%d')}")
 
-def detect_truncation(raw_text):
-    if not raw_text or not raw_text.strip():
+def detect_truncation(raw):
+    if not raw or not raw.strip():
         return True, "Empty response"
-    stripped = raw_text.strip()
-    open_b = stripped.count('{') - stripped.count('}')
-    open_k = stripped.count('[') - stripped.count(']')
-    if open_b > 0:
-        return True, f"Unbalanced braces: {open_b} unclosed"
-    if open_k > 0:
-        return True, f"Unbalanced brackets: {open_k} unclosed"
+    s = raw.strip()
+    if s.count('{') - s.count('}') > 0:
+        return True, f"Unbalanced braces: {s.count('{') - s.count('}')} unclosed"
+    if s.count('[') - s.count(']') > 0:
+        return True, f"Unbalanced brackets: {s.count('[') - s.count(']')} unclosed"
     return False, None
 
-def log_error(raw_text, error_msg):
+def log_error(raw, msg):
     os.makedirs(LOG_DIR, exist_ok=True)
-    log_file = os.path.join(LOG_DIR,
-        f"weekly_compile_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    with open(log_file, 'w') as f:
-        f.write(f"Error: {error_msg}\n")
-        f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-        f.write(f"Raw length: {len(raw_text)}\n---\n")
-        f.write(raw_text)
-    print(f"Error log saved to {log_file}")
+    f = os.path.join(LOG_DIR, f"weekly_compile_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    with open(f, 'w') as fh:
+        fh.write(f"Error: {msg}\nTimestamp: {datetime.now().isoformat()}\nLength: {len(raw)}\n---\n{raw}")
+    print(f"Error log saved to {f}")
 
-def apply_insights(current, edits, guidelines):
-    max_patterns = 30
+def apply_insights(current, edits, _):
     for p in edits.get("new_patterns", []):
         if p not in current.get("detected_patterns", []):
             current.setdefault("detected_patterns", []).append(p)
-    current["detected_patterns"] = current.get("detected_patterns", [])[-max_patterns:]
+    current["detected_patterns"] = current.get("detected_patterns", [])[-30:]
     for p in edits.get("remove_patterns", []):
         if p in current.get("detected_patterns", []):
             current["detected_patterns"].remove(p)
@@ -70,115 +56,81 @@ def apply_insights(current, edits, guidelines):
     current["last_compilation"] = datetime.now().isoformat()
     return current
 
-def apply_soul(current, edits, guidelines):
-    protected = ["name", "mission", "values"]
+def apply_soul(current, edits, _):
     for field in edits:
-        if field in protected:
+        if field in ["name", "mission", "values"]:
             continue
-        if field == "behavior_rules":
-            rules = edits[field]
-            if isinstance(rules, dict):
-                for r in rules.get("add", []):
-                    if r not in current.get("behavior_rules", []):
-                        current.setdefault("behavior_rules", []).append(r)
-                for r in rules.get("remove", []):
-                    if r in current.get("behavior_rules", []):
-                        current["behavior_rules"].remove(r)
+        if field == "behavior_rules" and isinstance(edits[field], dict):
+            for r in edits[field].get("add", []):
+                if r not in current.get("behavior_rules", []):
+                    current.setdefault("behavior_rules", []).append(r)
+            for r in edits[field].get("remove", []):
+                if r in current.get("behavior_rules", []):
+                    current["behavior_rules"].remove(r)
             current["behavior_rules"] = current.get("behavior_rules", [])[:15]
         elif field == "tone":
             current["tone"] = edits["tone"]
     return current
 
-def apply_users(current, edits, guidelines):
-    """
-    Apply edits to users.json. Handles ANY field in {add, remove} format,
-    not just observed_patterns. This prevents corruption when Gemini sends
-    fields like restrictions in diff format.
-    """
+def apply_users(current, edits, _):
     for user_key, user_edits in edits.items():
         if user_key not in current:
             if "role" in user_edits:
                 current[user_key] = user_edits
             continue
-
         for field, value in user_edits.items():
             if isinstance(value, dict) and ("add" in value or "remove" in value):
-                # Diff format: {"add": [...], "remove": [...]}
-                current_list = current[user_key].get(field, [])
-                if not isinstance(current_list, list):
-                    current_list = []
+                lst = current[user_key].get(field, [])
+                if not isinstance(lst, list):
+                    lst = []
                 for item in value.get("add", []):
-                    if item not in current_list:
-                        current_list.append(item)
+                    if item not in lst:
+                        lst.append(item)
                 for item in value.get("remove", []):
-                    if item in current_list:
-                        current_list.remove(item)
-                current[user_key][field] = current_list[-20:]
+                    if item in lst:
+                        lst.remove(item)
+                current[user_key][field] = lst[-20:]
             else:
-                # Direct value replacement
                 current[user_key][field] = value
-
     return current
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: weekly_compile.py '<json_from_llm>'")
         return
-
     raw = " ".join(sys.argv[1:])
-
-    is_truncated, reason = detect_truncation(raw)
-    if is_truncated:
+    is_trunc, reason = detect_truncation(raw)
+    if is_trunc:
         print(f"ERROR: Response appears truncated — {reason}")
         print("Fix: Set max_tokens to 8192+ in your LLM integration settings.")
         log_error(raw, reason)
         return
-
     try:
-        start = raw.index('{')
-        end = raw.rindex('}') + 1
-        edits = json.loads(raw[start:end])
+        edits = json.loads(raw[raw.index('{'):raw.rindex('}') + 1])
     except (ValueError, json.JSONDecodeError) as e:
         print(f"ERROR: Invalid JSON — {e}")
         log_error(raw, str(e))
         return
-
     if edits.get("no_changes"):
         print("No changes proposed. Compilation complete.")
         return
 
     guidelines = load_json(os.path.join(MEMORY_DIR, "guidelines.json"))
     results = []
-
-    if "insights" in edits:
-        path = os.path.join(MEMORY_DIR, "insights.json")
-        backup_file(path)
-        insights = load_json(path, {"detected_patterns": [], "pending_items": [], "automation_suggestions": []})
-        insights = apply_insights(insights, edits["insights"], guidelines)
-        with open(path, 'w') as f:
-            json.dump(insights, f, ensure_ascii=False, indent=2)
-        results.append("insights.json updated")
-
-    if "soul" in edits:
-        path = os.path.join(MEMORY_DIR, "soul.json")
-        backup_file(path)
-        soul = load_json(path)
-        soul = apply_soul(soul, edits["soul"], guidelines)
-        with open(path, 'w') as f:
-            json.dump(soul, f, ensure_ascii=False, indent=2)
-        results.append("soul.json updated")
-
-    if "users" in edits:
-        path = os.path.join(MEMORY_DIR, "users.json")
-        backup_file(path)
-        users = load_json(path)
-        users = apply_users(users, edits["users"], guidelines)
-        with open(path, 'w') as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
-        results.append("users.json updated")
-
-    summary = ", ".join(results) if results else "No files modified"
-    print(f"Weekly compilation complete: {summary}")
+    for key, apply_fn, default in [
+        ("insights", apply_insights, {"detected_patterns": [], "pending_items": [], "automation_suggestions": []}),
+        ("soul", apply_soul, None),
+        ("users", apply_users, None),
+    ]:
+        if key in edits:
+            path = os.path.join(MEMORY_DIR, f"{key}.json")
+            backup_file(path)
+            current = load_json(path, default)
+            current = apply_fn(current, edits[key], guidelines)
+            with open(path, 'w') as f:
+                json.dump(current, f, ensure_ascii=False, indent=2)
+            results.append(f"{key}.json updated")
+    print(f"Weekly compilation complete: {', '.join(results) if results else 'No files modified'}")
 
 if __name__ == "__main__":
     main()

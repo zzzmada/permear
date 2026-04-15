@@ -1,43 +1,12 @@
 {
   "updated_at": null,
+  "source": "none",
   "count": 0,
   "entities": [],
-
-  "_example_entity_with_monitoring": {
-    "entity_id": "climate.living_room_ac",
-    "friendly_name": "Living Room AC",
-    "domain": "climate",
-    "monitor": true,
-    "events": [
-      {"trigger_type": "state", "to": "cool", "id": "ac_living_on"},
-      {"trigger_type": "state", "to": "off", "id": "ac_living_off"}
-    ]
-  },
-
-  "_example_entity_monitoring_only": {
-    "entity_id": "sensor.bedroom_temperature",
-    "friendly_name": "Bedroom Temperature",
-    "domain": "sensor",
-    "monitor": true
-  },
-
-  "_example_entity_events_only": {
-    "entity_id": "binary_sensor.front_door_contact",
-    "friendly_name": "Front Door",
-    "domain": "binary_sensor",
-    "monitor": false,
-    "events": [
-      {"trigger_type": "state", "to": "on", "id": "front_door_opened"},
-      {"trigger_type": "state", "to": "off", "id": "front_door_closed"}
-    ]
-  },
-
   "_field_reference": {
-    "monitor": "If true, entity state is included in the pre-briefing prompt. If false, entity is known but not actively monitored.",
-    "events": "Optional. Defines HA automation triggers for the event buffer. Run generate_buffer_events.py after editing to regenerate the automation YAML.",
+    "monitor": "If true, entity state included in pre-briefing. Default false.",
+    "events": "Optional. HA triggers for event buffer. Run generate_buffer_events.py after editing.",
     "trigger_type": "state or numeric_state",
-    "to/from/for": "Standard HA trigger parameters",
-    "above/below": "For numeric_state triggers",
-    "id": "Unique trigger identifier — logged in the daily file when the event fires"
+    "id": "Unique trigger identifier logged in daily file"
   }
 }

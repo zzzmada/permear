@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
-"""
-Build the pre-briefing proactive evaluation prompt.
-v5.0: Reads monitored_entities.json, filters by monitor: true,
-      queries entity states via REST API, injects HA health summary.
-"""
+"""Build the pre-briefing proactive evaluation prompt. v5.4: SELF_ERRORS awareness."""
 import json, os, sys
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-MEMORY_DIR = "/config/memory"
-ENTITIES_PATH = "/config/memory/monitored_entities.json"
-TOKEN_PATH = "/config/.permear_token"
-HA_URL = "http://localhost:8123"
-DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from permear_config import MEMORY_DIR, ENTITIES_PATH, TOKEN_PATH, HA_URL, DAYS
 
 def load_json(path, default=None):
-    if default is None:
-        default = {}
     try:
         with open(path, 'r') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return default
+        return default if default is not None else {}
 
 def load_token():
     try:
@@ -38,47 +29,35 @@ def get_entity_state(entity_id, token):
     try:
         with urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-            return data.get("state", "unknown")
+            state = data.get("state", "unavailable")
+            unit = data.get("attributes", {}).get("unit_of_measurement", "")
+            return f"{state}{' ' + unit if unit else ''}"
     except (URLError, Exception):
         return "unavailable"
 
 def build_house_state(token):
-    """Build compact house state from entities with monitor: true."""
     monitored = load_json(ENTITIES_PATH, {"entities": []})
-    entities = monitored.get("entities", [])
-
+    entities = [e for e in monitored.get("entities", []) if e.get("monitor", False)]
     if not entities or not token:
         return "House state: not available."
-
     lines = []
-    for ent in entities:
-        if not ent.get("monitor", False):
-            continue
+    for ent in entities[:30]:
         eid = ent.get("entity_id", "")
         name = ent.get("friendly_name", eid)
         state = get_entity_state(eid, token)
-        if state not in ["unavailable", "unknown"]:
-            lines.append(f"{name}: {state}")
-        else:
-            lines.append(f"{name}: unavailable")
-
-    return "\n".join(lines) if lines else "No monitored entities."
+        lines.append(f"  {name}: {state}")
+    return "\n".join(lines)
 
 def main():
-    # Health summary passed as argument from automation
-    health_txt = ""
-    if len(sys.argv) > 1:
-        health_txt = " ".join(sys.argv[1:])
-
+    health_txt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
     idx = datetime.now().weekday()
-    day_name = DAYS[idx]
     timestamp = datetime.now().strftime("%H:%M")
     token = load_token()
 
     soul = load_json(os.path.join(MEMORY_DIR, "soul.json"))
     users = load_json(os.path.join(MEMORY_DIR, "users.json"))
     insights = load_json(os.path.join(MEMORY_DIR, "insights.json"))
-    daily = load_json(os.path.join(MEMORY_DIR, "daily", f"{day_name}.json"),
+    daily = load_json(os.path.join(MEMORY_DIR, "daily", f"{DAYS[idx]}.json"),
                       {"events": [], "interactions": [], "daily_memories": []})
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -87,31 +66,32 @@ def main():
 
     house_state = build_house_state(token)
 
-    # Compact events
     events = daily.get("events", [])
-    events_txt = ""
-    if events:
-        for e in events[-5:]:
-            events_txt += f"  {e.get('time','?')} {e.get('detail','?')}\n"
-
-    # Recent alerts (to avoid repeats)
-    interactions = daily.get("interactions", [])
-    recent_alerts = [i.get("summary", "")[:50] for i in interactions[-5:]
+    recent_alerts = [i.get("summary", "")[:50] for i in daily.get("interactions", [])[-5:]
                      if i.get("channel") == "prebriefing"]
 
-    # Patterns
     patterns = insights.get("detected_patterns", [])
     patterns_txt = "; ".join(patterns[-10:]) if patterns else "None"
 
-    # Restrictions from all users
     restrictions = []
-    for uk, ud in users.items():
-        for r in ud.get("restrictions", []):
-            restrictions.append(r)
+    for ud in users.values():
+        restrictions.extend(ud.get("restrictions", []))
     restrictions_txt = "; ".join(restrictions) if restrictions else "None"
 
-    # Health
-    health_section = f"\nSYSTEM HEALTH:\n{health_txt}" if health_txt and health_txt != "HEALTH: OK" else ""
+    health_section = ""
+    has_self_errors = False
+    if health_txt and health_txt != "HEALTH: OK":
+        health_section = f"\nSYSTEM HEALTH:\n{health_txt}"
+        has_self_errors = "SELF_ERRORS" in health_txt
+
+    self_errors_instruction = ""
+    if has_self_errors:
+        self_errors_instruction = """
+7. SELF_ERRORS are failures in YOUR OWN actions (Telegram, conversation, automation, shell_command). These were caused by something YOU did. Report immediately with:
+   - What you think went wrong
+   - What your last action was (check today's interactions)
+   - A suggested fix
+   Do NOT dismiss SELF_ERRORS as routine HA issues."""
 
     prompt = f"""You are {soul.get('name', 'Assistant')}, residential assistant and system caretaker. Time: {timestamp}.
 
@@ -128,8 +108,8 @@ RULES:
 2. Nothing relevant → respond EXACTLY: SILENCE
 3. Never alert about known patterns or user restrictions.
 4. Never repeat an alert already sent today (check recent alerts).
-5. System health issues (errors, unavailable entities): alert if critical.
-6. Prefer SILENCE when in doubt.
+5. ERRORS in system health (external issues): alert if critical, suggest fix.
+6. Prefer SILENCE when in doubt.{self_errors_instruction}
 
 RESPOND: the message OR SILENCE. Nothing else."""
 
