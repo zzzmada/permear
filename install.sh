@@ -58,7 +58,6 @@ fi
 echo ""
 read -p "Proceed? [y/N]: " ans && [[ "$ans" =~ ^[Yy]$ ]] || exit 1
 
-# Step 1: Directories
 echo ""
 echo ">>> Step 1: Creating directories..."
 mkdir -p "$DAILY_DIR"
@@ -67,7 +66,6 @@ mkdir -p "$LOGS_DIR"
 touch "$AUTOMATION_DIR/$DEFAULT_AUTOMATION_FILE"
 echo "  OK: directories created."
 
-# Step 2: Access token
 echo ""
 echo ">>> Step 2: Access token..."
 echo "  To create: HA sidebar → profile → Long-Lived Access Tokens → Create"
@@ -90,7 +88,6 @@ else
     echo -e "\n  Token saved to $TOKEN_FILE"
 fi
 
-# Step 3: Secrets
 echo ""
 echo ">>> Step 3: secrets.yaml configuration..."
 echo ""
@@ -117,7 +114,6 @@ else
     echo "  Keeping existing values."
 fi
 
-# Step 4: Copy files
 echo ""
 echo ">>> Step 4: Copying files..."
 
@@ -126,7 +122,6 @@ MEMORY_SRC="./memory"
 AUTOMATIONS_SRC="./automations"
 
 if [ -d "$SCRIPTS_SRC" ]; then
-    # Protect user's permear_config.py from overwrite
     if [ -f "$SCRIPT_DIR/permear_config.py" ]; then
         chattr +i "$SCRIPT_DIR/permear_config.py" 2>/dev/null || true
     fi
@@ -157,7 +152,6 @@ else
     echo "  [WARNING] Automations directory not found: $AUTOMATIONS_SRC"
 fi
 
-# Step 5: Lock guidelines
 GUIDELINES_FILE="$MEMORY_DIR/guidelines.json"
 if [ -f "$GUIDELINES_FILE" ]; then
     echo ""
@@ -166,7 +160,6 @@ if [ -f "$GUIDELINES_FILE" ]; then
     echo "  Locked $GUIDELINES_FILE (read-only)"
 fi
 
-# Step 6: Package configuration
 echo ""
 echo ">>> Step 6: Configuration..."
 if [ -n "$PACKAGE_DIR" ]; then
