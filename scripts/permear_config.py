@@ -17,7 +17,8 @@ ENTITIES_PATH = "/config/memory/monitored_entities.json"
 ENTITY_REGISTRY_PATH = "/config/.storage/core.entity_registry"
 
 # Day names (must match daily filenames: monday.json, etc.)
-# For non-English setups, change to match your file names.
+# Change for your language. Example Portuguese:
+# DAYS = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
 DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 DAYS_DISPLAY = ['Monday', 'Tuesday', 'Wednesday', 'Thursday',
                 'Friday', 'Saturday', 'Sunday']
@@ -29,7 +30,6 @@ MAX_EVENTS_PER_DAY = 20
 MAX_INTERACTIONS_PER_DAY = 10
 
 # Components used by PERMEAR — errors from these are SELF_ERRORS
-# (the agent caused them, not external factors)
 SELF_COMPONENTS = [
     "telegram_bot", "telegram", "conversation",
     "google_generative_ai", "google_ai",

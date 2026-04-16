@@ -4,9 +4,9 @@
   "count": 0,
   "entities": [],
   "_field_reference": {
-    "monitor": "If true, entity state included in pre-briefing. Default false.",
-    "events": "Optional. HA triggers for event buffer. Run generate_buffer_events.py after editing.",
+    "monitor": "If true, pre-briefing reads state. Default false.",
+    "events": "HA triggers for event buffer. Run generate_buffer_events.py after editing.",
     "trigger_type": "state or numeric_state",
-    "id": "Unique trigger identifier logged in daily file"
+    "id": "Unique trigger ID logged in daily file"
   }
 }
