@@ -1,9 +1,12 @@
 # =============================================================================
-# PERMEAR v5.4 — Add these blocks to your configuration.yaml
+# PERMEAR v5.5 — Configuration
+#
+# Use ONE of these methods:
+#   A) HA Packages: Copy this file to /config/packages/permear.yaml
+#      (requires: homeassistant: packages: !include_dir_named packages)
+#   B) Manual: Copy contents into your configuration.yaml
+#   C) install.sh: Run with PACKAGE_DIR parameter
 # =============================================================================
-
-# Verify this exists (required for agent automations file):
-# automation: !include_dir_merge_list automations/
 
 input_text:
   permear_last_agent_message:
@@ -11,40 +14,26 @@ input_text:
     max: 255
 
 shell_command:
-  # Daily memory
   append_daily_event: 'python3 /config/scripts/append_daily.py event "{{ detail }}"'
   append_daily_interaction: 'python3 /config/scripts/append_daily.py interaction "{{ detail }}"'
   append_daily_memory: 'python3 /config/scripts/append_daily.py memory "{{ detail }}"'
   append_daily_flag: 'python3 /config/scripts/append_daily.py flag "{{ detail }}"'
-
-  # Briefing
   build_briefing_prompt: 'python3 /config/scripts/build_briefing.py --updates "{{ updates }}"'
   update_daily_memory: "python3 /config/scripts/update_daily_memory.py '{{ response }}'"
-
-  # Pre-briefing
   build_prebriefing_prompt: 'python3 /config/scripts/build_prebriefing.py "{{ health }}"'
   apply_quick_learning: "python3 /config/scripts/apply_quick_learning.py '{{ response }}'"
-
-  # Agent automations
   manage_agent_auto_create: "python3 /config/scripts/manage_agent_automations.py create '{{ spec }}'"
   manage_agent_auto_remove: "python3 /config/scripts/manage_agent_automations.py remove '{{ identifier }}'"
   manage_agent_auto_list: "python3 /config/scripts/manage_agent_automations.py list"
-
-  # HA monitoring
   ha_log_monitor: "python3 /config/scripts/ha_log_monitor.py"
   ha_updates_check: "python3 /config/scripts/ha_updates_check.py"
-
-  # Entity discovery + buffer generation
   discover_entities: "python3 /config/scripts/discover_entities.py"
   add_monitored_entity: "python3 /config/scripts/discover_entities.py --add '{{ entity_id }}' '{{ friendly_name }}'"
   remove_monitored_entity: "python3 /config/scripts/discover_entities.py --remove '{{ entity_id }}'"
   generate_buffer_events: "python3 /config/scripts/generate_buffer_events.py"
-
-  # Weekly compilation
   build_weekly_prompt: "python3 /config/scripts/build_weekly_prompt.py"
   weekly_compile: "python3 /config/scripts/weekly_compile.py '{{ response }}'"
 
-# Command-line sensors
 command_line:
   - sensor:
       name: "Current Day Memory"
@@ -55,7 +44,6 @@ command_line:
         - events
         - interactions
         - daily_memories
-
   - sensor:
       name: "Perennial Memory"
       command: "python3 /config/scripts/sensor_perennial.py"

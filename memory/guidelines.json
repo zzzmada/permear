@@ -1,53 +1,23 @@
 {
   "_warning": "This file is IMMUTABLE. chmod 444. The agent cannot and must not edit it.",
-
   "guidelines_insights": {
-    "purpose": "Record observable and verifiable behavioral patterns of the house and its residents.",
-    "rules": [
-      "Only record a pattern if observed on at least 3 distinct days.",
-      "Each pattern must be a short, factual sentence — no emotional interpretation.",
-      "Maximum 30 patterns. If full, replace the oldest or least relevant.",
-      "Never record medical, financial, or private conversation data as patterns.",
-      "Pending items must be actionable: something the agent or user can resolve.",
-      "Remove a pending item when resolved or after 30 days without mention."
-    ]
+    "purpose": "Record observable and verifiable behavioral patterns.",
+    "rules": ["Only record a pattern if observed on at least 3 distinct days.","Each pattern: short, factual sentence.","Maximum 30 patterns.","Never record medical, financial, or private data.","Pending items must be actionable.","Remove pending items after 30 days without mention."]
   },
   "guidelines_soul": {
-    "purpose": "Define the agent's personality, tone, and behavioral rules.",
-    "rules": [
-      "The agent may propose adjustments to soul.json but must NEVER alter: name, mission, or values.",
-      "Allowed adjustments: refine behavioral rules based on explicit user feedback.",
-      "Maximum 15 behavioral rules. Consolidate if necessary."
-    ]
+    "purpose": "Define agent personality, tone, behavioral rules.",
+    "rules": ["NEVER alter: name, mission, or values.","Allowed: refine behavior rules based on explicit user feedback.","Maximum 15 behavioral rules."]
   },
   "guidelines_users": {
-    "purpose": "Maintain updated profiles of residents based on observation and interaction.",
-    "rules": [
-      "Update preferences only when the user demonstrates consistently (3+ times) or asks explicitly.",
-      "Never infer emotional or health states as permanent preferences.",
-      "Keep minimal data: name, role, comfort preferences, interaction style."
-    ]
+    "purpose": "Maintain resident profiles based on observation.",
+    "rules": ["Update preferences only on 3+ demonstrations or explicit request.","Never infer emotional/health states as permanent.","Keep minimal data."]
   },
   "guidelines_agent_automations": {
-    "purpose": "The agent can propose and create simple native HA automations.",
-    "rules": [
-      "Every automation requires explicit approval from the user via Telegram before creation.",
-      "Keep automations simple: one trigger, one action. No Jinja2 templates in actions.",
-      "Maximum 20 automations in the agent automation file. If full, propose replacement.",
-      "Never create automations with platform: conversation triggers.",
-      "Never touch any file outside the designated agent automation file.",
-      "Confirm via Telegram after creation with the alias and id.",
-      "In weekly compilation, review all agent automations and propose removing unused ones."
-    ]
+    "purpose": "Agent can propose and create simple native HA automations.",
+    "rules": ["Every automation requires explicit approval via Telegram.","Keep simple: one trigger, one action. No Jinja2 in actions.","Maximum 20 automations.","Never create platform: conversation triggers.","Never touch files outside the agent automation file.","Confirm via Telegram after creation.","In weekly compilation, review and propose removing unused ones."]
   },
   "guidelines_monitoring": {
-    "purpose": "Monitor HA health and inform proactively when necessary.",
-    "rules": [
-      "Critical errors: inform immediately via Telegram with suggested fix.",
-      "SELF_ERRORS (from telegram_bot, conversation, automation, shell_command) are caused by the agent's own actions — always report with context of what was done.",
-      "Available updates: include in the 21h daily briefing only.",
-      "New devices detected: ask the user if they want to name and configure.",
-      "Do not repeat the same error alert more than once per hour."
-    ]
+    "purpose": "Monitor HA health and inform proactively.",
+    "rules": ["Critical errors: inform immediately with suggested fix.","SELF_ERRORS (from telegram_bot, conversation, automation, shell_command) are caused by the agent — always report with context.","Available updates: include in 21h briefing only.","New devices: ask user to name and configure.","Do not repeat same error more than once per hour."]
   }
 }

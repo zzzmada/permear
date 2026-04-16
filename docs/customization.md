@@ -1,40 +1,86 @@
 # Customization Guide
 
+## Installation Methods
+
+### Method A: install.sh (recommended)
+
+```bash
+# Default paths
+./install.sh
+
+# With HA packages support
+./install.sh /config automations scripts packages
+
+# Custom directory names
+./install.sh /config automation.d script.d packages
+```
+
+The installer creates directories, prompts for token and secrets, copies files, and locks guidelines.
+
+### Method B: Manual
+
+Follow the step-by-step in README.md.
+
+## secrets.yaml
+
+PERMEAR uses HA's native `!secret` mechanism. Add to your `/config/secrets.yaml`:
+
+```yaml
+permear_chat_id: 123456789
+permear_agent_id: conversation.google_ai_conversation
+permear_person_entity: person.your_name
+```
+
+**Finding your values:**
+- `chat_id`: Send a message to [@userinfobot](https://t.me/userinfobot) on Telegram
+- `agent_id`: Developer Tools → Services → `conversation.process` → agent dropdown shows the entity_id
+- `person_entity`: Developer Tools → States → search "person."
+
+**Do NOT quote `chat_id`** — it must be an integer, not a string.
+
+This eliminates all `YOUR_*` placeholders from automations. Updates via `git pull` won't overwrite your secrets.
+
+## HA Packages
+
+If you prefer not to edit `configuration.yaml`, use [HA packages](https://www.home-assistant.io/docs/configuration/packages/):
+
+1. Add to `configuration.yaml` (one-time):
+```yaml
+homeassistant:
+  packages: !include_dir_named packages
+```
+
+2. Copy `configuration_additions.yaml` to `/config/packages/permear.yaml`
+
+All shell_commands, input_texts, and sensors load automatically.
+
 ## Directory Structure (permear_config.py)
 
-All paths and constants are centralized in `/config/scripts/permear_config.py`. If your HA uses a non-standard directory structure (e.g., `automation.d/` instead of `automations/`), edit **only this file** — all scripts import from it.
-
-Key settings:
+All paths and constants are centralized in `permear_config.py`. Edit **only this file** if your HA uses different directories.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMORY_DIR` | `/config/memory` | Where JSON memory files live |
+| `MEMORY_DIR` | `/config/memory` | JSON memory files |
 | `DAILY_DIR` | `/config/memory/daily` | Daily rotation files |
 | `AGENT_YAML` | `/config/automations/agent_automations.yaml` | Agent-created automations |
-| `AUTOMATIONS_YAML` | `/config/automations/permear.yaml` | Main automations (for buffer event generation) |
+| `AUTOMATIONS_YAML` | `/config/automations/permear.yaml` | Main automations (buffer markers) |
 | `TOKEN_PATH` | `/config/.permear_token` | Long-lived access token |
-| `HA_URL` | `http://localhost:8123` | HA REST API base URL |
-| `DAYS` | `['monday', ...]` | Daily file names — change for your language |
-| `SELF_COMPONENTS` | `['telegram_bot', ...]` | Components whose errors are flagged as SELF_ERRORS |
+| `DAYS` | `['monday', ...]` | Daily file names |
+| `SELF_COMPONENTS` | `['telegram_bot', ...]` | Components flagged as SELF_ERRORS |
 
 ### Non-English day names
-
-Change the `DAYS` array in `permear_config.py`:
 
 ```python
 # Portuguese
 DAYS = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
+
+# Spanish
+DAYS = ['lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo']
 ```
-
-All scripts read from this single source.
-
-## Agent Language
-
-To have the agent respond in another language, adjust the prompt strings in `build_briefing.py`, `build_prebriefing.py`, and `build_weekly_prompt.py`. You can add "Respond in [your language]." to each prompt.
 
 ## Localizing Rejection Keywords (Quick Learning)
 
-**Critical for non-English users.** The `permear_quick_learning` automation matches rejection keywords in the user's Telegram message. These must match the language the user types in.
+**Critical for non-English users.** The quick learning automation matches rejection keywords. These must match the language the user types in.
 
 ### Default (English)
 
@@ -42,8 +88,7 @@ To have the agent respond in another language, adjust the prompt strings in `bui
 {{ 'irrelevant' in text or 'unnecessary' in text or
    'already know' in text or 'stop alerting' in text or
    "don't alert" in text or 'not important' in text or
-   "don't care" in text or 'stop telling' in text or
-   'i know' in text }}
+   "don't care" in text or 'i know' in text }}
 ```
 
 ### Portuguese (pt-BR)
@@ -61,23 +106,22 @@ To have the agent respond in another language, adjust the prompt strings in `bui
 ```yaml
 {{ 'irrelevante' in text or 'innecesario' in text or
    'ya lo sé' in text or 'ya lo se' in text or
-   'no me avises' in text or 'deja de avisar' in text or
-   'no importa' in text }}
+   'no me avises' in text or 'no importa' in text }}
 ```
 
-Include accented and non-accented versions for mobile keyboards. `| lower` is already applied.
+Include accented and non-accented versions. `| lower` is already applied.
 
 ## Entity Monitoring vs. Event Logging
 
-Two separate systems in `monitored_entities.json`:
+`monitored_entities.json` has two roles:
 
-**`monitor: true`** — Pre-briefing reads current state every 30 min via REST API.
+**`monitor: true`** — Pre-briefing reads current state via REST API every 30 min.
 
-**`events: [...]`** — State changes logged as events in daily file via HA automation triggers.
+**`events: [...]`** — State changes logged in daily file via HA automation triggers.
 
-In short: `monitor` = "what is the state now?", `events` = "what changed today?"
+`monitor` = "what is the state now?" / `events` = "what changed today?"
 
-### Customizing the Event Buffer
+### Adding events
 
 Add `events` to any entity in `monitored_entities.json`:
 
@@ -93,7 +137,7 @@ Add `events` to any entity in `monitored_entities.json`:
 }
 ```
 
-Then regenerate: Developer Tools → Services → `shell_command.generate_buffer_events`
+Then regenerate: `Developer Tools → Services → shell_command.generate_buffer_events`
 
 | Field | Values | Trigger type |
 |---|---|---|
@@ -102,17 +146,15 @@ Then regenerate: Developer Tools → Services → `shell_command.generate_buffer
 | `above`, `below` | Numeric | `numeric_state` |
 | `id` | Unique identifier | Both |
 
-### Entity Discovery
+### Discovery frequency
 
-Daily at 06:00 — syncs with entities exposed to the conversation agent. Preserves `monitor` and `events` fields. Proposals for new entities happen in the **weekly compilation** (7 days of context).
+Daily at 06:00 — syncs with exposed entities, preserves `monitor` and `events` fields. Proposals for new entities happen in the **weekly compilation** (7 days of context).
 
-## SELF_ERRORS — Agent Self-Awareness
+## SELF_ERRORS
 
-The `ha_log_monitor.py` classifies errors from PERMEAR-related components (telegram_bot, conversation, automation, shell_command) as `SELF_ERRORS`. These are errors the agent likely caused itself.
+The log monitor classifies errors from PERMEAR components as `SELF_ERRORS`. The pre-briefing instructs the agent to report what went wrong and suggest a fix.
 
-The pre-briefing prompt has a special instruction: when SELF_ERRORS are present, the agent must report what it thinks went wrong and what its last action was.
-
-To customize which components are flagged, edit `SELF_COMPONENTS` in `permear_config.py`:
+Customize in `permear_config.py`:
 
 ```python
 SELF_COMPONENTS = [
@@ -124,34 +166,14 @@ SELF_COMPONENTS = [
 
 ## Pre-briefing Frequency
 
-Default: every 30 minutes.
-
 | Frequency | Calls/day (08h-20h) |
 |---|---|
 | Every 15 min | 48 |
-| Every 30 min | 24 |
+| Every 30 min (default) | 24 |
 | Every 60 min | 12 |
-
-## Adding Voice Output
-
-Add after any `telegram_bot.send_message`:
-
-```yaml
-- condition: state
-  entity_id: binary_sensor.YOUR_OCCUPANCY_SENSOR
-  state: "on"
-- service: YOUR_TTS_SERVICE
-  data:
-    entity_id: YOUR_SPEAKER_ENTITY
-    message: "{{ answer }}"
-```
 
 ## Multi-User Setup
 
-1. Add each user to `users.json`
-2. Expand `chat_id` condition in `permear_telegram_handler`
-3. Identify speaker in prompt via `chat_id` comparison
-
-## Guidelines
-
-Edit `guidelines.json` before locking with `chmod 444`. The `guidelines_monitoring` section now includes a rule about SELF_ERRORS — customize the expected behavior when the agent detects its own failures.
+1. Add users to `users.json`
+2. Each user needs their own Telegram `chat_id` in `secrets.yaml`
+3. Expand event_data filter or add separate automations per user

@@ -6,7 +6,7 @@ A persistent memory and self-improvement system that transforms Home Assistant's
 
 ## What This Is
 
-Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture that gives your agent a persistent soul, user profiles, learned insights, and the ability to create automations and monitor system health — all through local JSON files, Python scripts, and HA automations.
+Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture that gives your agent a persistent soul, user profiles, learned insights, and the ability to create automations and monitor system health.
 
 **The agent evolves from household assistant to system caretaker** — it monitors HA health, detects errors (including its own), checks for updates, autodiscovers entities, and can create native HA automations with user approval.
 
@@ -49,31 +49,26 @@ CYCLES
 └── On demand ────────────── Telegram chat + voice commands
 ```
 
-## Key Concepts
+## Quick Start
 
-### Self-Calibrating Proactivity
+### Option A: Installer (recommended)
 
-The pre-briefing starts noisy and becomes precise over time. Reply "that's irrelevant" and the agent learns immediately.
+```bash
+git clone https://github.com/zzzmada/permear.git
+cd permear
+./install.sh
+```
 
-### 7-Day Rotation
+With HA packages support:
+```bash
+./install.sh /config automations scripts packages
+```
 
-Daily files named by weekday. Next Monday overwrites this Monday. No cleanup needed.
+The installer prompts for your token and secrets interactively.
 
-### Monitored Entities — Single Source of Truth
+### Option B: Manual
 
-`monitored_entities.json` serves two roles: `monitor: true` for pre-briefing state reading, `events` for buffer trigger generation. Edit one file, run `generate_buffer_events.py`, both systems update.
-
-### SELF_ERRORS — Agent Self-Awareness
-
-The log monitor classifies errors from PERMEAR components (telegram_bot, conversation, automation, shell_command) as `SELF_ERRORS`. When detected, the pre-briefing prompt instructs the agent to report what went wrong, what its last action was, and suggest a fix. External HA errors remain as regular `ERRORS`.
-
-### Agent-Created Automations
-
-The agent proposes automations via Telegram, you approve, they activate via `automation.reload`.
-
-### Guidelines: The Immutable Constitution
-
-`guidelines.json` (chmod 444) defines the agent's operating boundaries. It cannot change them.
+See detailed steps below.
 
 ## Requirements
 
@@ -84,7 +79,7 @@ The agent proposes automations via Telegram, you approve, they activate via `aut
 - Long-lived HA access token
 - `max_tokens` set to 8192+ in your LLM integration
 
-## Installation
+## Manual Installation
 
 ### 1. Create directories
 
@@ -109,11 +104,23 @@ echo "YOUR_TOKEN" > /config/.permear_token
 chmod 600 /config/.permear_token
 ```
 
-### 4. Set max_tokens to 8192+
+### 4. Configure secrets.yaml
+
+Add to your `/config/secrets.yaml`:
+
+```yaml
+permear_chat_id: 123456789
+permear_agent_id: conversation.google_ai_conversation
+permear_person_entity: person.your_name
+```
+
+See [`secrets.yaml.example`](secrets.yaml.example) for details on finding these values.
+
+### 5. Set max_tokens to 8192+
 
 Google Generative AI: Settings → Configure → uncheck "Recommended model settings" → Maximum tokens: `8192`
 
-### 5. Copy files
+### 6. Copy files
 
 ```
 scripts/*.py         → /config/scripts/
@@ -121,28 +128,26 @@ memory/*.json        → /config/memory/
 automations/*.yaml   → /config/automations/
 ```
 
-### 6. Lock guidelines
+### 7. Add configuration
+
+**Option A (packages):** Copy `configuration_additions.yaml` to `/config/packages/permear.yaml`
+
+**Option B (manual):** Copy contents of `configuration_additions.yaml` into your `configuration.yaml`
+
+### 8. Lock guidelines
 
 ```bash
 chmod 444 /config/memory/guidelines.json
 ```
 
-### 7. Customize
+### 9. Customize
 
 - **`permear_config.py`** — Paths, `DAYS` for language, `SELF_COMPONENTS`. See [Customization Guide](docs/customization.md).
 - **`soul.json`** — Agent personality.
 - **`users.json`** — Household profiles.
 - **`guidelines.json`** — Edit before locking.
 
-### 8. Add to configuration.yaml
-
-Copy contents of [`configuration_additions.yaml`](configuration_additions.yaml).
-
-### 9. Configure Telegram (polling mode)
-
-### 10. Add automations + replace placeholders
-
-`YOUR_CHAT_ID`, `YOUR_AGENT_ID` (verify in Developer Tools → Services → conversation.process), `person.YOUR_PERSON`.
+### 10. Configure Telegram (polling mode)
 
 ### 11. Update LLM system prompt
 
@@ -158,47 +163,56 @@ ENTITY MONITORING: "monitor [entity]" → add_monitored_entity.
 "stop monitoring [entity]" → remove_monitored_entity.
 ```
 
-### 12. Run initial discovery + restart HA
+### 12. Restart HA and run initial discovery
+
+Developer Tools → Services → `shell_command.discover_entities`
 
 ## Critical Technical Notes
 
 1. **Never use sentence triggers** (`platform: conversation`).
-2. **Verify your agent_id** — often `conversation.google_ai_conversation`, NOT `google_generative_ai`.
+2. **Verify your agent_id** — often `conversation.google_ai_conversation`, NOT `google_generative_ai`. Check Developer Tools.
 3. **`telegram_bot.send_message`**: `chat_id`, not `target`.
 4. **HA triggers are static.** Define events in JSON, run `generate_buffer_events.py`.
 5. **`max_tokens` must be 8192+** for weekly compilation.
 6. **`ha_updates_check.py` only works inside HAOS container** (`SUPERVISOR_TOKEN`).
 7. **Use `| truncate()` not `[:255]`** in HA templates.
-8. **All response_variable stdout must use** `| default('') | trim | default('fallback')` to prevent empty message errors.
-9. **Gemini ignores format with long conversation history.** Reset `conversation_id` or inject in message.
+8. **All response_variable stdout** must use `| default('') | trim | default('fallback')`.
+9. **Gemini ignores format with long conversation history.** Inject instructions in message text.
 10. **`discover_entities.py` filters by `should_expose`** in entity registry.
-11. **SELF_ERRORS** flag errors from components the agent uses directly. Customize in `permear_config.py`.
+11. **SELF_ERRORS** flag errors from agent components. Customize in `permear_config.py`.
+12. **Shell command JSON limited to 255 chars** via `input_text`. For larger payloads, use temporary files.
+13. **Python not available in SSH addon terminal.** Run scripts via Developer Tools → Services.
+14. **Clean phantom entities** after upgrades: Settings → Entities → filter "unavailable" → delete.
 
 ## Changelog
 
+### v5.5 (2026-04-16)
+- **`secrets.yaml` integration**: All user-specific values (`chat_id`, `agent_id`, `person_entity`) now use HA's native `!secret` mechanism. Zero placeholders to replace in automation files. Updates via `git pull` never overwrite user configuration.
+- **`install.sh` improved**: Interactive installer with secrets.yaml setup (Step 3), HA packages support, `chattr` protection for `permear_config.py`, soul.json preservation. Original script by [@clyra](https://github.com/clyra).
+- **`secrets.yaml.example`**: Reference file with all required secrets and instructions for finding values.
+- **HA packages support**: `configuration_additions.yaml` works as a drop-in HA package — copy to `/config/packages/permear.yaml`.
+- **Telegram event_data filter**: `chat_id` moved to `event_data` in triggers where possible, eliminating template conditions.
+
 ### v5.4 (2026-04-08)
-- **SELF_ERRORS awareness**: `ha_log_monitor.py` now classifies errors from PERMEAR components (telegram_bot, conversation, automation, shell_command) as `SELF_ERRORS` — separate from external HA `ERRORS`. The pre-briefing prompt instructs the agent to report what it thinks went wrong, what its last action was, and suggest a fix.
-- **`SELF_COMPONENTS` in `permear_config.py`**: Configurable list of components whose errors are flagged as self-caused.
-- **`guidelines.json` updated**: Monitoring guidelines now include SELF_ERRORS handling rule.
+- **SELF_ERRORS**: `ha_log_monitor.py` classifies errors from PERMEAR components separately. Pre-briefing instructs agent to report its own failures with context.
+- **`SELF_COMPONENTS`** configurable in `permear_config.py`.
 
 ### v5.3 (2026-04-07)
-- **Centralized configuration**: `permear_config.py` with all paths and constants. All scripts import from it. Users with non-standard directories edit one file.
+- **Centralized configuration**: `permear_config.py` — all scripts import from it.
 
 ### v5.2 (2026-04-07)
-- **`monitored_entities.json` as single source of truth**: `monitor` for pre-briefing, `events` for buffer triggers.
+- **`monitored_entities.json` as single source of truth**: `monitor` + `events` dual role.
 - **`generate_buffer_events.py`**: Regenerates YAML between markers.
-- **`discover_entities.py`** preserves `monitor` and `events` fields.
-- **Empty speech fix**: `| default('') | trim` with fallback message.
-- **`generate_buffer_events` shell_command** added.
+- **Empty speech fix**: `| default('') | trim` with fallback.
 
 ### v5.1 (2026-04-06)
-- Agent ID fix, `should_expose` filter, `apply_users` any-field diff, truncation detection, `| truncate()` fix, prompt compaction.
+- Agent ID fix, `should_expose` filter, `apply_users` any-field diff, truncation detection, prompt compaction.
 
 ### v5.0 (2026-04-06)
-- Agent as system caretaker. HA health monitoring, update checking, entity autodiscovery, native automation creation. Allowed actions removed.
+- Agent as system caretaker. HA monitoring, entity autodiscovery, native automations. Allowed actions removed.
 
 ### v3.2 (2026-03-31)
-- Telegram context injection, briefing memory timing, quick-learn localization.
+- Telegram context injection, quick-learn localization.
 
 ### v3.0 (2026-03-29)
 - Initial release.
@@ -209,4 +223,5 @@ MIT — Use it, fork it, improve it.
 
 ## Credits
 
-Architecture designed in collaboration with Claude (Anthropic).
+- Architecture designed in collaboration with Claude (Anthropic)
+- Installation script by [@clyra](https://github.com/clyra)
