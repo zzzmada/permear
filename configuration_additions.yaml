@@ -53,3 +53,41 @@ command_line:
         - soul
         - users
         - insights
+
+# HA Scripts — wrappers for shell_commands exposed to the LLM agent
+# After adding, expose these scripts to your agent in:
+# Settings → Voice Assistants → your agent → Exposed Entities
+script:
+  permear_list_automations:
+    alias: "PERMEAR - List automations"
+    sequence:
+      - service: shell_command.manage_agent_auto_list
+        response_variable: result
+      - stop: "{{ result.stdout | default('No automations') }}"
+        response_variable: output
+
+  permear_create_automation:
+    alias: "PERMEAR - Create automation"
+    fields:
+      spec:
+        description: "JSON spec with alias, trigger, action"
+    sequence:
+      - service: shell_command.manage_agent_auto_create
+        data:
+          spec: "{{ spec }}"
+        response_variable: result
+      - stop: "{{ result.stdout | default('Error creating automation') }}"
+        response_variable: output
+
+  permear_remove_automation:
+    alias: "PERMEAR - Remove automation"
+    fields:
+      identifier:
+        description: "Alias or ID of the automation to remove"
+    sequence:
+      - service: shell_command.manage_agent_auto_remove
+        data:
+          identifier: "{{ identifier }}"
+        response_variable: result
+      - stop: "{{ result.stdout | default('Error removing automation') }}"
+        response_variable: output
