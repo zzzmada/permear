@@ -156,14 +156,25 @@ SYSTEM MONITORING: You monitor HA health. Critical errors: notify immediately.
 SELF_ERRORS are from your own actions — always report what you think went wrong.
 Updates: mention in daily briefing only. New devices: ask user to name them.
 
-AUTOMATIONS: Create with manage_agent_auto_create, remove with manage_agent_auto_remove,
-list with manage_agent_auto_list. ALWAYS ask confirmation before creating.
+AUTOMATIONS: Create with permear_create_automation, remove with permear_remove_automation,
+list with permear_list_automations. ALWAYS ask confirmation before creating.
 
 ENTITY MONITORING: "monitor [entity]" → add_monitored_entity.
 "stop monitoring [entity]" → remove_monitored_entity.
 ```
 
-### 12. Restart HA and run initial discovery
+### 12. Expose scripts to your agent
+
+The LLM agent cannot call shell_commands directly — it can only use exposed HA scripts. After restarting:
+
+Settings → Voice Assistants → your agent → Exposed Entities → enable:
+- `script.permear_list_automations`
+- `script.permear_create_automation`
+- `script.permear_remove_automation`
+
+Without this step, the agent will return "function does not exist" when trying to manage automations.
+
+### 13. Restart HA and run initial discovery
 
 Developer Tools → Services → `shell_command.discover_entities`
 
@@ -180,22 +191,22 @@ Developer Tools → Services → `shell_command.discover_entities`
 9. **Gemini ignores format with long conversation history.** Inject instructions in message text.
 10. **`discover_entities.py` filters by `should_expose`** in entity registry.
 11. **SELF_ERRORS** flag errors from agent components. Customize in `permear_config.py`.
-12. **Shell command JSON limited to 255 chars** via `input_text`. For larger payloads, use temporary files.
+12. **Shell commands are invisible to the LLM agent.** The agent can only call exposed scripts. PERMEAR includes wrapper scripts (`permear_list_automations`, `permear_create_automation`, `permear_remove_automation`) that must be exposed in Voice Assistants settings.
 13. **Python not available in SSH addon terminal.** Run scripts via Developer Tools → Services.
 14. **Clean phantom entities** after upgrades: Settings → Entities → filter "unavailable" → delete.
 
 ## Changelog
 
+### v5.6 (2026-04-18)
+- **Script wrappers for LLM agent**: Shell commands are invisible to the conversation agent. Added 3 HA scripts (`permear_list_automations`, `permear_create_automation`, `permear_remove_automation`) that wrap the shell commands and can be exposed to the agent via Voice Assistants settings. Without these, the agent returns "function does not exist" when trying to manage automations.
+
 ### v5.5 (2026-04-16)
-- **`secrets.yaml` integration**: All user-specific values (`chat_id`, `agent_id`, `person_entity`) now use HA's native `!secret` mechanism. Zero placeholders to replace in automation files. Updates via `git pull` never overwrite user configuration.
-- **`install.sh` improved**: Interactive installer with secrets.yaml setup (Step 3), HA packages support, `chattr` protection for `permear_config.py`, soul.json preservation. Original script by [@clyra](https://github.com/clyra).
-- **`secrets.yaml.example`**: Reference file with all required secrets and instructions for finding values.
-- **HA packages support**: `configuration_additions.yaml` works as a drop-in HA package — copy to `/config/packages/permear.yaml`.
-- **Telegram event_data filter**: `chat_id` moved to `event_data` in triggers where possible, eliminating template conditions.
+- **`secrets.yaml` integration**: All user-specific values (`chat_id`, `agent_id`, `person_entity`) now use HA's native `!secret` mechanism. Zero placeholders to replace. Updates via `git pull` never overwrite user configuration.
+- **`install.sh` improved**: Interactive installer with secrets.yaml setup, HA packages support, `chattr` protection for `permear_config.py`, soul.json preservation. Original script by [@clyra](https://github.com/clyra).
+- **HA packages support**: `configuration_additions.yaml` works as a drop-in HA package.
 
 ### v5.4 (2026-04-08)
 - **SELF_ERRORS**: `ha_log_monitor.py` classifies errors from PERMEAR components separately. Pre-briefing instructs agent to report its own failures with context.
-- **`SELF_COMPONENTS`** configurable in `permear_config.py`.
 
 ### v5.3 (2026-04-07)
 - **Centralized configuration**: `permear_config.py` — all scripts import from it.
