@@ -194,8 +194,15 @@ Developer Tools → Services → `shell_command.discover_entities`
 12. **Shell commands are invisible to the LLM agent.** The agent can only call exposed scripts. PERMEAR includes wrapper scripts (`permear_list_automations`, `permear_create_automation`, `permear_remove_automation`) that must be exposed in Voice Assistants settings.
 13. **Python not available in SSH addon terminal.** Run scripts via Developer Tools → Services.
 14. **Clean phantom entities** after upgrades: Settings → Entities → filter "unavailable" → delete.
+15. **Telegram parse_mode: All telegram_bot.send_message calls that send shell_command stdout or agent responses must include parse_mode: plain_text. Underscores in strings like NO_AUTOMATIONS break Telegram's default Markdown parser. Messages with intentional formatting should use markdownv2 with proper escaping.
 
 ## Changelog
+
+### v5.7 (2026-04-27)
+
+- Telegram parse_mode fix: All telegram_bot.send_message calls that send shell_command stdout or LLM responses now include parse_mode: plain_text. Underscores in internal strings (like automation IDs) were breaking Telegram's default Markdown parser with "Can't parse entities" errors.
+- Human-readable script outputs: manage_agent_automations.py outputs rewritten from - JSON/internal tokens to readable text. "NO_AUTOMATIONS" → "No automations created yet." Create/remove outputs are now plain sentences without underscores.
+- Internal token filter: The Telegram handler default branch now filters internal protocol tokens (LIST_AUTOS, CREATE_AUTO:, REMOVE_AUTO:, NO_AUTOMATIONS) from reaching the user as raw messages.
 
 ### v5.6 (2026-04-18)
 - **Script wrappers for LLM agent**: Shell commands are invisible to the conversation agent. Added 3 HA scripts (`permear_list_automations`, `permear_create_automation`, `permear_remove_automation`) that wrap the shell commands and can be exposed to the agent via Voice Assistants settings. Without these, the agent returns "function does not exist" when trying to manage automations.
