@@ -1,5 +1,5 @@
 # =============================================================================
-# PERMEAR v5.5 — Persistent Memory + System Caretaker Automations
+# PERMEAR v5.7 — Persistent Memory + System Caretaker Automations
 #
 # No placeholders to replace. All user-specific values come from secrets.yaml.
 # See secrets.yaml.example for required entries.
@@ -53,24 +53,36 @@
       response_variable: response
     - variables:
         speech: "{{ response.response.speech.plain.speech | default('') | trim }}"
+    # Filter internal tokens — never send raw protocol to user
+    - variables:
+        is_internal: >
+          {{ 'LIST_AUTOS' in speech or
+             'NO_AUTOMATIONS' in speech or
+             'CREATE_AUTO:' in speech or
+             'REMOVE_AUTO:' in speech }}
     - if:
         - condition: template
-          value_template: "{{ speech | length > 0 }}"
+          value_template: "{{ speech | length > 0 and not is_internal }}"
       then:
         - service: telegram_bot.send_message
           data:
             chat_id: !secret permear_chat_id
             message: "{{ speech }}"
+            parse_mode: plain_text
         - service: input_text.set_value
           target:
             entity_id: input_text.permear_last_agent_message
           data:
             value: "{{ speech | truncate(255, False, '') }}"
       else:
-        - service: telegram_bot.send_message
-          data:
-            chat_id: !secret permear_chat_id
-            message: "Sorry, I got an empty response. Could you repeat?"
+        - if:
+            - condition: template
+              value_template: "{{ speech | length == 0 }}"
+          then:
+            - service: telegram_bot.send_message
+              data:
+                chat_id: !secret permear_chat_id
+                message: "Sorry, I got an empty response. Could you repeat?"
 
 # 3. DAILY BRIEFING (21h)
 - alias: "PERMEAR - Daily briefing"
@@ -100,6 +112,7 @@
           data:
             chat_id: !secret permear_chat_id
             message: "{{ speech }}"
+            parse_mode: plain_text
         - service: input_text.set_value
           target:
             entity_id: input_text.permear_last_agent_message
@@ -155,6 +168,7 @@
       data:
         chat_id: !secret permear_chat_id
         message: "{{ answer }}"
+        parse_mode: plain_text
     - service: input_text.set_value
       target:
         entity_id: input_text.permear_last_agent_message
@@ -228,6 +242,7 @@
       data:
         chat_id: !secret permear_chat_id
         message: "Weekly compilation complete. {{ compile_result.stdout | default('') | trim | default('No details available.') }}"
+        parse_mode: plain_text
 
 # 8. DAILY RESET
 - alias: "PERMEAR - Daily reset"
