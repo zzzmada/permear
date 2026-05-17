@@ -1,299 +1,245 @@
-# PERMEAR
+# PERMEAR — Persistent Memory Architecture for Home Assistant AI Agents
 
-**Persistent Memory Architecture for Home Assistant AI Agents**
+A persistent memory and self-improvement system that transforms Home Assistant's conversation agent from a stateless chatbot into an intelligent assistant that **remembers, learns, monitors, and maintains** your smart home over time.
 
-PERMEAR transforms Home Assistant + LLMs into a persistent household assistant that remembers, learns, monitors, and improves over time.
-
-Built and tested on Home Assistant OS running on a Raspberry Pi 4 (2 GB RAM).
-
----
+> Built and battle-tested on a Raspberry Pi 4 (2GB RAM) running HAOS. No external databases, no cloud storage, no paid services beyond what you already use.
 
 ## What This Is
 
-Home Assistant conversation agents (Gemini, OpenAI, etc.) are normally stateless. Every interaction starts from zero.
+Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture that gives your agent a persistent soul, user profiles, learned insights, and the ability to create automations and monitor system health.
 
-PERMEAR adds long-term memory, reflection cycles, health monitoring, automation management, and proactive behavior using a lightweight file-based architecture fully integrated with Home Assistant.
+**The agent evolves from household assistant to system caretaker** — it monitors HA health, detects errors (including its own), checks for updates, autodiscovers entities, and can create native HA automations with user approval.
 
-The assistant evolves from a simple chatbot into a system caretaker capable of:
+## Architecture
 
-- Remembering users, preferences, and patterns
-- Monitoring Home Assistant health and errors
-- Generating proactive Telegram briefings
-- Creating native HA automations with confirmation
-- Detecting updates and new devices
-- Learning restrictions from user feedback
-- Maintaining long-term contextual memory
-
-No external database. No vector store. No cloud memory backend.
-
-Everything is local, file-based, and HA-native.
-
----
-
-# Architecture
-
-## Persistent memory
-
-```text
-memory/
-├── guidelines.json
-│   Immutable constitution and behavioral rules
-│
-├── soul.json
-│   Agent personality and long-term traits
-│
-├── users.json
-│   Household profiles and learned preferences
-│
-├── insights.json
-│   Patterns, pending tasks, recurring observations
-│
-├── monitored_entities.json
-│   Single source of truth for monitored entities
-│
+```
+MEMORY (persistent JSON files)
+├── guidelines.json          ← IMMUTABLE constitution (chmod 444)
+├── soul.json                ← Agent personality (edited weekly by agent)
+├── users.json               ← Household profiles (edited weekly + quick-learn)
+├── insights.json            ← Detected patterns (edited weekly)
+├── monitored_entities.json  ← Single source of truth for entities
+│                              monitor:true → pre-briefing reads state
+│                              events:[] → buffer logs state changes
 └── daily/
-    └── monday..sunday.json
-        Rotating 7-day memory logs
-````
+    └── monday..sunday.json  ← 7-day rotating event logs
 
----
+SCRIPTS (all import from permear_config.py)
+├── permear_config.py           ← Centralized paths and constants
+├── append_daily.py             ← Log events/interactions/memories
+├── build_briefing.py           ← Daily briefing prompt (21h)
+├── build_prebriefing.py        ← Proactive evaluation (30min) + SELF_ERRORS
+├── build_weekly_prompt.py      ← Weekly compilation prompt (Sunday)
+├── update_daily_memory.py      ← Save extracted memories
+├── weekly_compile.py           ← Apply LLM edits to perennials
+├── apply_quick_learning.py     ← Instant restriction from rejections
+├── discover_entities.py        ← Autodiscover exposed entities
+├── generate_buffer_events.py   ← Regenerate triggers from JSON
+├── ha_log_monitor.py           ← Parse logs: SELF_ERRORS vs ERRORS
+├── ha_updates_check.py         ← Check HA/addon updates
+├── manage_agent_automations.py ← Create/remove HA automations
+├── sensor_current_day.py       ← HA sensor: current day memory
+└── sensor_perennial.py         ← HA sensor: perennial files
 
-## Core scripts
-
-```text
-scripts/
-├── permear_config.py
-│   Centralized constants and paths
-│
-├── append_daily.py
-│   Save events, memories, interactions
-│
-├── build_prebriefing.py
-│   Proactive house evaluation cycle
-│
-├── build_briefing.py
-│   Daily briefing generation
-│
-├── weekly_compile.py
-│   Long-term memory consolidation
-│
-├── apply_quick_learning.py
-│   Learns restrictions from feedback
-│
-├── discover_entities.py
-│   Auto-discovers exposed entities
-│
-├── ha_log_monitor.py
-│   HA log parsing and filtering
-│
-├── manage_agent_automations.py
-│   Create/remove/list automations
-│
-├── circuit_breaker.py
-│   LLM reliability and fallback handling
-│
-└── lib/
-    ├── memory.py
-    ├── logs.py
-    └── agent.py
+CYCLES
+├── Every 30 min (08-20h) ── Pre-briefing: health + house evaluation
+├── Daily 21h ────────────── Briefing: day summary + updates + memories
+├── Daily 06:00 ──────────── Entity autodiscovery
+├── Sunday 00:05 ─────────── Weekly compile: self-improvement
+└── On demand ────────────── Telegram chat + voice commands
 ```
 
----
+## Quick Start
 
-## Runtime cycles
+### Option A: Installer (recommended)
 
-```text
-Every 30 min (08:00–20:00)
-└── Pre-briefing
-    Evaluate house state and decide whether to notify
-
-Daily 21:00
-└── Daily briefing
-    Summary, pending items, updates, memories
-
-Daily 06:00
-└── Entity discovery
-    Sync exposed HA entities automatically
-
-Sunday 00:05
-└── Weekly compilation
-    Long-term reflection and memory updates
-
-Real-time
-└── Error monitor
-    Detect and filter HA / agent issues
+```bash
+git clone https://github.com/zzzmada/permear.git
+cd permear
+./install.sh
 ```
 
----
-
-# LLM Architecture
-
-PERMEAR intentionally separates interactive and non-interactive AI tasks.
-
-| Path                    | Purpose                                             |
-| ----------------------- | --------------------------------------------------- |
-| `conversation.process`  | Telegram chat and voice control                     |
-| `ai_task.generate_data` | Briefings, memory extraction, automation generation |
-
-This architecture allows:
-
-* Fast interactive responses
-* Cheap background processing
-* Structured outputs without parsing hacks
-* Automatic fallback between providers
-* Better long-term reliability
-
-Typical setup:
-
-| Provider                | Usage                 |
-| ----------------------- | --------------------- |
-| Gemini Flash            | Interactive assistant |
-| DeepSeek via OpenRouter | Background cycles     |
-
----
-
-# Features
-
-## Persistent memory
-
-The assistant maintains long-term memory across days and weeks using JSON-based files.
-
----
-
-## Proactive briefings
-
-PERMEAR generates:
-
-* House summaries
-* Device alerts
-* Update notifications
-* Pending reminders
-* Important contextual observations
-
-Only when relevant.
-
-Silence is considered valid behavior.
-
----
-
-## Automation creation
-
-Users can request automations naturally through Telegram.
-
-Example:
-
-```text
-Turn off all lights at 1 AM if nobody is home
+With HA packages support:
+```bash
+./install.sh /config automations scripts packages
 ```
 
-The assistant generates a native Home Assistant automation proposal and asks for confirmation before creation.
+The installer prompts for your token and secrets interactively.
 
----
+### Option B: Manual
 
-## Health monitoring
+See detailed steps below.
 
-PERMEAR monitors:
+## Requirements
 
-* Home Assistant errors
-* Integration failures
-* LLM failures
-* Rate limits
-* Internal agent errors
+- Home Assistant 2023.7+
+- A conversation agent (Gemini 2.5 Flash recommended — free tier sufficient)
+- Telegram bot in HA (polling mode)
+- Python 3 + PyYAML (included in HAOS)
+- Long-lived HA access token
+- `max_tokens` set to 8192+ in your LLM integration
 
-Critical issues are reported automatically.
+## Manual Installation
 
----
+### 1. Create directories
 
-## Active forgetting
-
-Old patterns and stale pending items are archived automatically after extended inactivity.
-
-This prevents memory pollution over time.
-
----
-
-# Requirements
-
-* Home Assistant OS or Supervised
-* Telegram Bot integration
-* Gemini or compatible conversation agent
-* AI Task integration
-* Python 3.11+
-* Long-lived HA token
-
-Recommended:
-
-* Gemini Flash for interaction
-* DeepSeek V4 Flash for background tasks
-
----
-
-# Quick Install
-
-```bash id="zk3b2p"
-cd /config
-wget https://raw.githubusercontent.com/zzzmada/permear/main/install.sh
-bash install.sh
+```bash
+mkdir -p /config/memory/daily /config/scripts /config/logs
+touch /config/automations/agent_automations.yaml
 ```
 
----
+### 2. Verify automation include mode
 
-# Repository Structure
-
-```text
-permear/
-├── automations/
-├── docs/
-├── memory/
-├── scripts/
-├── CHANGELOG.md
-├── MIGRATION.md
-├── README.md
-├── install.sh
-└── configuration_additions.yaml
+```yaml
+# configuration.yaml — must be directory-based:
+automation: !include_dir_merge_list automations/
 ```
 
----
+### 3. Create access token
 
-# Philosophy
+HA sidebar → username → Long-Lived Access Tokens → Create → "PERMEAR"
 
-PERMEAR prioritizes simplicity and Home Assistant native architecture.
+```bash
+echo "YOUR_TOKEN" > /config/.permear_token
+chmod 600 /config/.permear_token
+```
 
-Core principles:
+### 4. Configure secrets.yaml
 
-* No overengineering
-* No unnecessary abstractions
-* No external infrastructure
-* Single source of truth
-* File-based persistence
-* Human-readable state
-* HA-native workflows first
+Add to your `/config/secrets.yaml`:
 
----
+```yaml
+permear_chat_id: 123456789
+permear_agent_id: conversation.google_ai_conversation
+permear_person_entity: person.your_name
+```
 
-# Status
+See [`secrets.yaml.example`](secrets.yaml.example) for details on finding these values.
 
-Current public release: `v7.2.0`
+### 5. Set max_tokens to 8192+
 
-See:
+Google Generative AI: Settings → Configure → uncheck "Recommended model settings" → Maximum tokens: `8192`
 
-* `CHANGELOG.md`
-* `MIGRATION.md`
-* `docs/customization.md`
-
----
-
-# License
-
-MIT License
-
----
-
-# Credits
-
-* Author: @zzzmada
-* Installer improvements: @clyra
-* Built around Home Assistant ecosystem
+### 6. Copy files
 
 ```
+scripts/*.py         → /config/scripts/
+memory/*.json        → /config/memory/
+automations/*.yaml   → /config/automations/
 ```
+
+### 7. Add configuration
+
+**Option A (packages):** Copy `configuration_additions.yaml` to `/config/packages/permear.yaml`
+
+**Option B (manual):** Copy contents of `configuration_additions.yaml` into your `configuration.yaml`
+
+### 8. Lock guidelines
+
+```bash
+chmod 444 /config/memory/guidelines.json
+```
+
+### 9. Customize
+
+- **`permear_config.py`** — Paths, `DAYS` for language, `SELF_COMPONENTS`. See [Customization Guide](docs/customization.md).
+- **`soul.json`** — Agent personality.
+- **`users.json`** — Household profiles.
+- **`guidelines.json`** — Edit before locking.
+
+### 10. Configure Telegram (polling mode)
+
+### 11. Update LLM system prompt
+
+```
+SYSTEM MONITORING: You monitor HA health. Critical errors: notify immediately.
+SELF_ERRORS are from your own actions — always report what you think went wrong.
+Updates: mention in daily briefing only. New devices: ask user to name them.
+
+AUTOMATIONS: Create with permear_create_automation, remove with permear_remove_automation,
+list with permear_list_automations. ALWAYS ask confirmation before creating.
+
+ENTITY MONITORING: "monitor [entity]" → add_monitored_entity.
+"stop monitoring [entity]" → remove_monitored_entity.
+```
+
+### 12. Expose scripts to your agent
+
+The LLM agent cannot call shell_commands directly — it can only use exposed HA scripts. After restarting:
+
+Settings → Voice Assistants → your agent → Exposed Entities → enable:
+- `script.permear_list_automations`
+- `script.permear_create_automation`
+- `script.permear_remove_automation`
+
+Without this step, the agent will return "function does not exist" when trying to manage automations.
+
+### 13. Restart HA and run initial discovery
+
+Developer Tools → Services → `shell_command.discover_entities`
+
+## Critical Technical Notes
+
+1. **Never use sentence triggers** (`platform: conversation`).
+2. **Verify your agent_id** — often `conversation.google_ai_conversation`, NOT `google_generative_ai`. Check Developer Tools.
+3. **`telegram_bot.send_message`**: `chat_id`, not `target`.
+4. **HA triggers are static.** Define events in JSON, run `generate_buffer_events.py`.
+5. **`max_tokens` must be 8192+** for weekly compilation.
+6. **`ha_updates_check.py` only works inside HAOS container** (`SUPERVISOR_TOKEN`).
+7. **Use `| truncate()` not `[:255]`** in HA templates.
+8. **All response_variable stdout** must use `| default('') | trim | default('fallback')`.
+9. **Gemini ignores format with long conversation history.** Inject instructions in message text.
+10. **`discover_entities.py` filters by `should_expose`** in entity registry.
+11. **SELF_ERRORS** flag errors from agent components. Customize in `permear_config.py`.
+12. **Shell commands are invisible to the LLM agent.** The agent can only call exposed scripts. PERMEAR includes wrapper scripts (`permear_list_automations`, `permear_create_automation`, `permear_remove_automation`) that must be exposed in Voice Assistants settings.
+13. **Python not available in SSH addon terminal.** Run scripts via Developer Tools → Services.
+14. **Clean phantom entities** after upgrades: Settings → Entities → filter "unavailable" → delete.
+15. **Telegram parse_mode: All telegram_bot.send_message calls that send shell_command stdout or agent responses must include parse_mode: plain_text. Underscores in strings like NO_AUTOMATIONS break Telegram's default Markdown parser. Messages with intentional formatting should use markdownv2 with proper escaping.
+
+## Changelog
+
+### v5.7 (2026-04-27)
+
+- Telegram parse_mode fix: All telegram_bot.send_message calls that send shell_command stdout or LLM responses now include parse_mode: plain_text. Underscores in internal strings (like automation IDs) were breaking Telegram's default Markdown parser with "Can't parse entities" errors.
+- Human-readable script outputs: manage_agent_automations.py outputs rewritten from - JSON/internal tokens to readable text. "NO_AUTOMATIONS" → "No automations created yet." Create/remove outputs are now plain sentences without underscores.
+- Internal token filter: The Telegram handler default branch now filters internal protocol tokens (LIST_AUTOS, CREATE_AUTO:, REMOVE_AUTO:, NO_AUTOMATIONS) from reaching the user as raw messages.
+
+### v5.6 (2026-04-18)
+- **Script wrappers for LLM agent**: Shell commands are invisible to the conversation agent. Added 3 HA scripts (`permear_list_automations`, `permear_create_automation`, `permear_remove_automation`) that wrap the shell commands and can be exposed to the agent via Voice Assistants settings. Without these, the agent returns "function does not exist" when trying to manage automations.
+
+### v5.5 (2026-04-16)
+- **`secrets.yaml` integration**: All user-specific values (`chat_id`, `agent_id`, `person_entity`) now use HA's native `!secret` mechanism. Zero placeholders to replace. Updates via `git pull` never overwrite user configuration.
+- **`install.sh` improved**: Interactive installer with secrets.yaml setup, HA packages support, `chattr` protection for `permear_config.py`, soul.json preservation. Original script by [@clyra](https://github.com/clyra).
+- **HA packages support**: `configuration_additions.yaml` works as a drop-in HA package.
+
+### v5.4 (2026-04-08)
+- **SELF_ERRORS**: `ha_log_monitor.py` classifies errors from PERMEAR components separately. Pre-briefing instructs agent to report its own failures with context.
+
+### v5.3 (2026-04-07)
+- **Centralized configuration**: `permear_config.py` — all scripts import from it.
+
+### v5.2 (2026-04-07)
+- **`monitored_entities.json` as single source of truth**: `monitor` + `events` dual role.
+- **`generate_buffer_events.py`**: Regenerates YAML between markers.
+- **Empty speech fix**: `| default('') | trim` with fallback.
+
+### v5.1 (2026-04-06)
+- Agent ID fix, `should_expose` filter, `apply_users` any-field diff, truncation detection, prompt compaction.
+
+### v5.0 (2026-04-06)
+- Agent as system caretaker. HA monitoring, entity autodiscovery, native automations. Allowed actions removed.
+
+### v3.2 (2026-03-31)
+- Telegram context injection, quick-learn localization.
+
+### v3.0 (2026-03-29)
+- Initial release.
+
+## License
+
+MIT — Use it, fork it, improve it.
+
+## Credits
+
+- Architecture designed in collaboration with Claude (Anthropic)
+- Installation script by [@clyra](https://github.com/clyra)
