@@ -1,23 +1,32 @@
 {
-  "_warning": "This file is IMMUTABLE. chmod 444. The agent cannot and must not edit it.",
-  "guidelines_insights": {
-    "purpose": "Record observable and verifiable behavioral patterns.",
-    "rules": ["Only record a pattern if observed on at least 3 distinct days.","Each pattern: short, factual sentence.","Maximum 30 patterns.","Never record medical, financial, or private data.","Pending items must be actionable.","Remove pending items after 30 days without mention."]
-  },
-  "guidelines_soul": {
-    "purpose": "Define agent personality, tone, behavioral rules.",
-    "rules": ["NEVER alter: name, mission, or values.","Allowed: refine behavior rules based on explicit user feedback.","Maximum 15 behavioral rules."]
-  },
-  "guidelines_users": {
-    "purpose": "Maintain resident profiles based on observation.",
-    "rules": ["Update preferences only on 3+ demonstrations or explicit request.","Never infer emotional/health states as permanent.","Keep minimal data."]
-  },
-  "guidelines_agent_automations": {
-    "purpose": "Agent can propose and create simple native HA automations.",
-    "rules": ["Every automation requires explicit approval via Telegram.","Keep simple: one trigger, one action. No Jinja2 in actions.","Maximum 20 automations.","Never create platform: conversation triggers.","Never touch files outside the agent automation file.","Confirm via Telegram after creation.","In weekly compilation, review and propose removing unused ones."]
-  },
-  "guidelines_monitoring": {
-    "purpose": "Monitor HA health and inform proactively.",
-    "rules": ["Critical errors: inform immediately with suggested fix.","SELF_ERRORS (from telegram_bot, conversation, automation, shell_command) are caused by the agent — always report with context.","Available updates: include in 21h briefing only.","New devices: ask user to name and configure.","Do not repeat same error more than once per hour."]
-  }
+  "insights_guidelines": [
+    "detected_patterns: observations confirmed in 3+ days of the week.",
+    "pending: items the agent should keep in mind (NEVER framework bugs).",
+    "automation_suggestions: actionable proposals to be reviewed.",
+    "Limit: 30 patterns, 20 pending, 10 suggestions. Old items (30+ days without mention) auto-archived."
+  ],
+  "soul_guidelines": [
+    "name, mission, tone, values are stable — edit manually only.",
+    "behavior_rules: max 15 rules. Weekly compilation adds/removes 1 per week.",
+    "Rules describe HOW the agent acts, not WHO the residents are (that's in users.json)."
+  ],
+  "users_guidelines": [
+    "One key per resident. Use short, descriptive keys (alice, bob).",
+    "role: living situation (primary resident, partner, child, guest).",
+    "response_style: how to address this person.",
+    "restrictions: things this user does NOT want to be alerted about.",
+    "observed_patterns: behavior patterns learned from interactions (NOT preferences)."
+  ],
+  "agent_automations_guidelines": [
+    "Stored in /config/automations/agent_automations.yaml.",
+    "Max 20 active automations.",
+    "Validated against HA entity registry before being created.",
+    "User can disable/enable without removing via Telegram buttons."
+  ],
+  "monitoring_guidelines": [
+    "monitored_entities.json synced daily from HA entity registry.",
+    "Only entities exposed to voice assistants are monitored by default.",
+    "events: optional list of state changes to log to daily file.",
+    "After editing events, run generate_buffer_events.py and reload automations."
+  ]
 }

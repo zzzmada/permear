@@ -1,224 +1,189 @@
-# Migration Guide — PERMEAR v5.x → v7.2
+# Migration: PERMEAR 5.x → 7.2.0
 
-Upgrade from the old single-agent architecture to the new dual-path system with fallback, health monitoring, and active forgetting.
-
-Estimated time: ~10–15 minutes.
+This is a **breaking change release**. Estimated time: **15-20 minutes**.
 
 ---
 
-## Main changes in v7.2
-
-* Dual LLM architecture:
-
-  * `conversation` → interactive chat/voice
-  * `ai_task` → structured non-interactive tasks
-* Automatic provider fallback
-* Shared `lib/` modules
-* Active forgetting / archive system
-* Real-time error monitoring improvements
-* English-standardized public repository structure
-
----
-
-## 1. Backup your current installation
+## Before you start
 
 ```bash
+# Backup everything
 cd /config
+tar -czf permear_v5_backup_$(date +%Y%m%d).tar.gz \
+    scripts/ memory/ automations/permear.yaml secrets.yaml
+```
 
-tar -czf permear_backup_$(date +%Y%m%d).tar.gz \
-scripts/ memory/ automations/permear.yaml \
-configuration.yaml secrets.yaml
+If anything goes wrong:
+
+```bash
+tar -xzf permear_v5_backup_*.tar.gz
+# Restart HA
 ```
 
 ---
 
-## 2. Download the new version
+## Step 1: Set up AI Task entities
 
-```bash
-cd /tmp
-git clone https://github.com/zzzmada/permear.git permear_v72
+PERMEAR 7.2 uses native `ai_task.generate_data` for non-interactive cycles. You need **two AI Task entities**.
+
+### Primary: DeepSeek via OpenRouter
+
+1. Get OpenRouter API key at https://openrouter.ai/keys
+2. HA → Settings → Devices & Services → **OpenRouter** → configure with key
+3. Add a sub-entry **AI Task** with model `deepseek/deepseek-v4-flash`
+4. Note the entity ID (typically `ai_task.openrouter_deepseek_v3`)
+5. **Strongly recommended:** set up BYOK — see [docs/byok.md](docs/byok.md)
+
+### Secondary: Gemini (you likely already have it)
+
+1. HA → existing Google Generative AI integration
+2. Add a sub-entry **AI Task**
+3. Note the entity ID (`ai_task.google_ai_task`)
+
+### Verify both work
+
+Developer Tools → Actions:
+
+```yaml
+service: ai_task.generate_data
+data:
+  task_name: "Migration test"
+  entity_id: ai_task.openrouter_deepseek_v3
+  instructions: "Reply with OK."
+  structure:
+    r: { selector: { text: {} } }
 ```
+
+Should return `data.r: OK`. Repeat with `ai_task.google_ai_task`.
 
 ---
 
-## 3. Replace files
+## Step 2: Replace PERMEAR files
 
-### Scripts
+**Don't merge** — replace completely. This avoids git conflicts.
 
 ```bash
+# Delete old PERMEAR
 rm -rf /config/scripts
-cp -r /tmp/permear_v72/scripts /config/
+rm /config/automations/permear.yaml
+rm -f /config/memory/guidelines.json
+chmod u+w /config/memory/guidelines.json 2>/dev/null || true
+
+# Clone fresh
+cd /tmp
+git clone https://github.com/zzzmada/permear
+cd permear
+
+# Copy new files
+cp -r scripts /config/
+cp automations/permear.yaml /config/automations/
+cp memory/guidelines.json /config/memory/
+cp memory/lovelace_card.yaml /config/memory/
+chmod 444 /config/memory/guidelines.json
 chmod +x /config/scripts/*.py
 ```
 
-### Automations
-
-```bash
-cp /tmp/permear_v72/automations/permear.yaml \
-/config/automations/permear.yaml
-```
-
-### Memory templates and new files
-
-```bash
-cp /tmp/permear_v72/memory/guidelines.json /config/memory/
-chmod 444 /config/memory/guidelines.json
-
-cp /tmp/permear_v72/memory/*.example.json /config/memory/ 2>/dev/null || true
-```
-
-### Configuration additions
-
-Merge the contents of:
-
-```text
-configuration_additions.yaml
-```
-
-into your:
-
-```text
-/config/configuration.yaml
-```
-
 ---
 
-## 4. Configure AI Task entities
+## Step 3: Update permear_config.py
 
-v7.2 requires two AI Task entities:
-
-| Purpose  | Suggested provider    |
-| -------- | --------------------- |
-| Primary  | OpenRouter + DeepSeek |
-| Fallback | Gemini                |
-
-Edit:
-
-```text
-/config/scripts/permear_config.py
-```
-
-Example:
+Edit `/config/scripts/permear_config.py`:
 
 ```python
-AI_TASK_PRIMARY = "ai_task.openrouter_deepseek_v3"
-AI_TASK_SECONDARY = "ai_task.google_ai_task"
+AI_TASK_PRIMARY = "ai_task.openrouter_deepseek_v3"   # your primary entity ID
+AI_TASK_SECONDARY = "ai_task.google_ai_task"          # your secondary entity ID
 ```
+
+Also verify `DAYS` list matches your daily file names. Default is English (`monday.json` etc.). If you have Portuguese filenames, either:
+- Rename your files (`mv segunda.json monday.json` etc.), OR
+- Edit `DAYS` to match your filenames.
 
 ---
 
-## 5. Update secrets.yaml
+## Step 4: Translate memory files (if needed)
 
-Add:
+If your `soul.json`, `users.json`, `insights.json` were in another language (Portuguese), translate keys to English. The new code expects:
+
+| File | New keys (v7.2) |
+|---|---|
+| `soul.json` | `name`, `mission`, `tone`, `values`, `behavior_rules` |
+| `users.json` per user | `role`, `response_style`, `primary_channel`, `preferred_temperature`, `interests`, `restrictions`, `observed_patterns` |
+| `insights.json` | `last_compilation`, `detected_patterns`, `pending`, `automation_suggestions`, `_timestamps` |
+| daily files | `date`, `events`, `interactions`, `daily_memories`, `briefing_sent`, `bulletin_triggered` |
+
+For most users from English-based v5.x, no changes needed. Compare with `memory/*.example.json` if unsure.
+
+---
+
+## Step 5: Update secrets.yaml
+
+Add (if missing):
 
 ```yaml
-permear_chat_id: YOUR_CHAT_ID
-permear_agent_id: conversation.google_ai_conversation
+permear_chat_id: YOUR_TELEGRAM_CHAT_ID
+permear_agent_id: conversation.your_interactive_agent
 permear_person_entity: person.your_name
 ```
 
 ---
 
-## 6. Validate installation
+## Step 6: Update configuration.yaml
 
-### Validate Python
-
-```bash
-python3 -m compileall /config/scripts
-```
-
-### Validate YAML
-
-```bash
-python3 -c "import yaml; yaml.safe_load(open('/config/automations/permear.yaml'))"
-```
-
-### Validate JSON
-
-```bash
-for f in /config/memory/*.json; do
-python3 -c "import json; json.load(open('$f'))"
-done
-```
+Remove old PERMEAR `shell_command:` and `sensor:` blocks. Paste contents of `configuration_additions.yaml` from the new repo.
 
 ---
 
-## 7. Restart Home Assistant
+## Step 7: Validate and restart
 
-After restart:
+```bash
+# Validate Python imports
+python3 -c "
+import sys
+sys.path.insert(0, '/config/scripts')
+from permear_config import *
+from lib.memory import load_json
+from lib.agent import get_health_summary_for_prompt
+print('Python OK')
+"
 
-* Reload automations
-* Reload command-line sensors
+# Validate YAML
+python3 -c "
+import yaml
+class L(yaml.SafeLoader): pass
+L.add_constructor('!secret', lambda l, n: 'SEC')
+L.add_constructor('!include', lambda l, n: 'INC')
+L.add_constructor('!include_dir_named', lambda l, n: 'INC')
+yaml.load(open('/config/automations/permear.yaml'), Loader=L)
+print('YAML OK')
+"
+```
+
+Then HA → Settings → System → **Restart**.
 
 ---
 
-## 8. Quick test
+## Step 8: Smoke test
 
-### Telegram
-
-Send:
-
-```text
-hi
-```
-
-to your bot.
-
-### Health sensor
-
-Check:
-
-```text
-sensor.permear_health
-```
-
-Expected state:
-
-```text
-all_ok
-```
-
-### Pre-briefing
-
-Trigger manually:
-
-```yaml
-service: automation.trigger
-target:
-  entity_id: automation.permear_prebriefing
-data:
-  skip_condition: true
-```
+1. **Sensor exists:** Developer Tools → States → `sensor.permear_health` → state should be `all_ok` or `recovering`
+2. **AI Task works:** force pre-briefing manually:
+   ```yaml
+   service: automation.trigger
+   target: { entity_id: automation.permear_prebriefing }
+   data: { skip_condition: true }
+   ```
+3. **Telegram works:** send "hi" to your bot — should respond
+4. **List automations works:** send `/list_automations` — should respond
 
 ---
 
 ## Common issues
 
-### `fallback_active`
-
-Primary provider failed or hit rate limit.
-
-Usually solved automatically by the secondary provider.
-
----
-
-### Telegram not responding
-
-Check:
-
-* Telegram bot token
-* `permear_chat_id`
-* Home Assistant logs
-
----
-
-### `sensor.permear_health unavailable`
-
-Create empty circuit file:
-
-```bash
-echo '{"daily_stats": {}}' > /config/memory/agent_circuit.json
-```
+| Symptom | Fix |
+|---|---|
+| `sensor.permear_health` unavailable | Create empty state: `echo '{}' > /config/memory/agent_circuit.json`, reload sensors |
+| `429` errors in logs | Set up BYOK (see [docs/byok.md](docs/byok.md)) |
+| YAML parse error | Re-paste `configuration_additions.yaml` carefully, check indentation |
+| Callbacks not working | Reload Automations after restart |
 
 ---
 
@@ -226,11 +191,8 @@ echo '{"daily_stats": {}}' > /config/memory/agent_circuit.json
 
 ```bash
 cd /config
-tar -xzf permear_backup_YYYYMMDD.tar.gz
+tar -xzf /config/permear_v5_backup_*.tar.gz
+# Restart HA
 ```
 
-Restart Home Assistant afterward.
-
----
-
-For additional setup details, see the main README.
+Need help? Open an issue at https://github.com/zzzmada/permear/issues with HA log excerpt.

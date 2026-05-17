@@ -1,17 +1,31 @@
 # =============================================================================
-# PERMEAR v5.7 — Persistent Memory + System Caretaker Automations
+# PERMEAR v7.2 — Persistent Memory + System Caretaker Automations
 #
-# No placeholders to replace. All user-specific values come from secrets.yaml.
+# All user-specific values come from secrets.yaml.
 # See secrets.yaml.example for required entries.
+#
+# AI Provider Architecture:
+#   - Interactive (Telegram chat, voice): !secret permear_agent_id
+#     (conversation.process with Gemini or compatible — needs Tools)
+#   - Non-interactive (cycles): ai_task.generate_data
+#     Primary entity:   ai_task.openrouter_deepseek_v3 (customize in your HA)
+#     Secondary entity: ai_task.google_ai_task (fallback)
+#
+# To customize provider entity IDs, edit them in this file or use !secret refs.
 # =============================================================================
 
-# 1. EVENT BUFFER
+# -----------------------------------------------------------------------------
+# 1. BUFFER EVENTS
+# Logs state changes defined in monitored_entities.json.
+# Triggers are STATIC YAML — regenerate via generate_buffer_events.py after
+# editing the events: field of any entity in monitored_entities.json.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Buffer events"
   id: permear_buffer_events
   mode: queued
   max: 20
   trigger:
-    # [BEGIN buffer_events triggers — generated]
+    # [BEGIN buffer_events triggers - generated]
     - platform: state
       entity_id: !secret permear_person_entity
       to: "home"
@@ -20,13 +34,17 @@
       entity_id: !secret permear_person_entity
       from: "home"
       id: "user_left"
-    # [END buffer_events triggers — generated]
+    # [END buffer_events triggers - generated]
   action:
     - service: shell_command.append_daily_event
       data:
         detail: "{{ trigger.id }}"
 
-# 2. TELEGRAM HANDLER
+# -----------------------------------------------------------------------------
+# 2. TELEGRAM HANDLER (interactive)
+# Routes Telegram messages to the conversation agent (Gemini or similar).
+# Filters internal protocol tokens and handles empty responses.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Telegram handler"
   id: permear_telegram_handler
   mode: queued
@@ -40,6 +58,18 @@
     - service: shell_command.append_daily_interaction
       data:
         detail: "telegram:{{ trigger.event.data.text[:100] }}"
+    - service: shell_command.agent_circuit_check
+      response_variable: cb
+    - if:
+        - condition: template
+          value_template: "{{ cb.stdout | default('') | trim != 'OK' }}"
+      then:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: !secret permear_chat_id
+            message: "Agent in cooldown (circuit breaker open). Try again in a few minutes."
+            parse_mode: plain_text
+        - stop: "Circuit breaker open"
     - service: conversation.process
       data:
         agent_id: !secret permear_agent_id
@@ -49,12 +79,23 @@
           [Context: your last message to the user was: "{{ last_msg }}"]
           {% endif %}
           {{ trigger.event.data.text }}
-        conversation_id: "telegram_main"
+        conversation_id: "telegram_{{ now().strftime('%Y%m%d') }}"
       response_variable: response
+      continue_on_error: true
+    - if:
+        - condition: template
+          value_template: "{{ response is not defined or response.response.speech.plain.speech is not defined }}"
+      then:
+        - service: shell_command.agent_circuit_fail
+        - service: telegram_bot.send_message
+          data:
+            chat_id: !secret permear_chat_id
+            message: "I couldn't respond just now. Try again in a moment."
+            parse_mode: plain_text
+        - stop: "Agent error"
+    - service: shell_command.agent_circuit_success
     - variables:
         speech: "{{ response.response.speech.plain.speech | default('') | trim }}"
-    # Filter internal tokens — never send raw protocol to user
-    - variables:
         is_internal: >
           {{ 'LIST_AUTOS' in speech or
              'NO_AUTOMATIONS' in speech or
@@ -83,71 +124,34 @@
               data:
                 chat_id: !secret permear_chat_id
                 message: "Sorry, I got an empty response. Could you repeat?"
+                parse_mode: plain_text
 
-# 3. DAILY BRIEFING (21h)
-- alias: "PERMEAR - Daily briefing"
-  id: permear_daily_briefing
-  trigger:
-    - platform: time
-      at: "21:00:00"
-  action:
-    - service: shell_command.ha_updates_check
-      response_variable: updates_result
-    - service: shell_command.build_briefing_prompt
-      data:
-        updates: "{{ updates_result.stdout | default('') }}"
-      response_variable: prompt_result
-    - service: conversation.process
-      data:
-        agent_id: !secret permear_agent_id
-        text: "{{ prompt_result.stdout }}"
-      response_variable: briefing
-    - variables:
-        speech: "{{ briefing.response.speech.plain.speech | default('') | trim }}"
-    - if:
-        - condition: template
-          value_template: "{{ speech | length > 0 }}"
-      then:
-        - service: telegram_bot.send_message
-          data:
-            chat_id: !secret permear_chat_id
-            message: "{{ speech }}"
-            parse_mode: plain_text
-        - service: input_text.set_value
-          target:
-            entity_id: input_text.permear_last_agent_message
-          data:
-            value: "{{ speech | truncate(255, False, '') }}"
-    - delay:
-        seconds: 5
-    - service: conversation.process
-      data:
-        agent_id: !secret permear_agent_id
-        text: >
-          Analyze today's events and interactions and extract relevant memories.
-          Return ONLY JSON: {"daily_memories": ["memory 1", "memory 2"]}
-          If nothing relevant: {"daily_memories": []}
-          Events: {{ state_attr('sensor.current_day_memory', 'events') }}
-          Interactions: {{ state_attr('sensor.current_day_memory', 'interactions') }}
-      response_variable: memories
-    - service: shell_command.update_daily_memory
-      data:
-        response: "{{ memories.response.speech.plain.speech }}"
-    - service: shell_command.append_daily_flag
-      data:
-        detail: "briefing_sent"
-
-# 4. PRE-BRIEFING (every 30min) with HA health monitoring
+# -----------------------------------------------------------------------------
+# 3. PRE-BRIEFING (hourly during business hours)
+# Reads house state via REST API, injects health summary, decides if
+# proactive notification is warranted.
+# Runs hourly 08:30-20:00 with jitter to avoid exact-minute load.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Pre-briefing"
   id: permear_prebriefing
+  mode: single
   trigger:
     - platform: time_pattern
-      minutes: "/30"
+      minutes: 30
   condition:
     - condition: time
       after: "08:00:00"
       before: "20:00:00"
   action:
+    - delay:
+        seconds: "{{ range(60, 300) | random }}"
+    - service: shell_command.agent_circuit_check
+      response_variable: cb
+    - if:
+        - condition: template
+          value_template: "{{ cb.stdout | default('') | trim != 'OK' }}"
+      then:
+        - stop: "Circuit breaker open, skipping pre-briefing"
     - service: shell_command.ha_log_monitor
       response_variable: health_result
     - service: shell_command.build_prebriefing_prompt
@@ -158,7 +162,16 @@
       data:
         agent_id: !secret permear_agent_id
         text: "{{ prompt_result.stdout }}"
+        conversation_id: "prebriefing_{{ now().strftime('%Y%m%d%H') }}"
       response_variable: evaluation
+      continue_on_error: true
+    - if:
+        - condition: template
+          value_template: "{{ evaluation is not defined or evaluation.response.speech.plain.speech is not defined }}"
+      then:
+        - service: shell_command.agent_circuit_fail
+        - stop: "Agent failed, skip this cycle"
+    - service: shell_command.agent_circuit_success
     - variables:
         answer: "{{ evaluation.response.speech.plain.speech | default('') | trim }}"
     - condition: template
@@ -178,9 +191,207 @@
       data:
         detail: "prebriefing:{{ answer[:100] }}"
 
-# 5. QUICK LEARNING — keywords must match user's language
+# -----------------------------------------------------------------------------
+# 4. DAILY BRIEFING (off-peak 23:30)
+# Generates day summary with retry/circuit/Python fallback.
+# Then extracts memories via ai_task with primary + fallback provider.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - Daily briefing"
+  id: permear_daily_briefing
+  mode: single
+  trigger:
+    - platform: time
+      at: "23:30:00"
+  action:
+    # Build prompt
+    - service: shell_command.ha_updates_check
+      response_variable: updates_result
+    - service: shell_command.build_briefing_prompt
+      response_variable: prompt_result
+
+    # Attempt 1 via conversation.process
+    - service: conversation.process
+      data:
+        agent_id: !secret permear_agent_id
+        text: "{{ prompt_result.stdout }}"
+        conversation_id: "briefing_{{ now().strftime('%Y%m%d') }}"
+      response_variable: briefing
+      continue_on_error: true
+
+    - variables:
+        speech: "{{ briefing.response.speech.plain.speech | default('') | trim if briefing is defined else '' }}"
+
+    # Retry if empty
+    - if:
+        - condition: template
+          value_template: "{{ speech | length == 0 }}"
+      then:
+        - delay:
+            seconds: 30
+        - service: conversation.process
+          data:
+            agent_id: !secret permear_agent_id
+            text: "{{ prompt_result.stdout }}"
+            conversation_id: "briefing_retry_{{ now().strftime('%Y%m%d') }}"
+          response_variable: briefing
+          continue_on_error: true
+        - variables:
+            speech: "{{ briefing.response.speech.plain.speech | default('') | trim if briefing is defined else '' }}"
+        - if:
+            - condition: template
+              value_template: "{{ speech | length > 0 }}"
+          then:
+            - service: shell_command.agent_log_retry_success
+
+    # Fall back to Python briefing if still empty
+    - if:
+        - condition: template
+          value_template: "{{ speech | length == 0 }}"
+      then:
+        - service: shell_command.agent_log_3fail
+        - service: shell_command.briefing_simple
+          response_variable: simple_result
+        - variables:
+            speech: "{{ simple_result.stdout | default('Briefing unavailable today.') | trim }}"
+
+    # Send briefing
+    - service: telegram_bot.send_message
+      data:
+        chat_id: !secret permear_chat_id
+        message: "{{ speech }}"
+        parse_mode: plain_text
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.permear_last_agent_message
+      data:
+        value: "{{ speech | truncate(255, False, '') }}"
+    - service: shell_command.append_daily_flag
+      data:
+        detail: "briefing_sent"
+
+    # Daily health summary (logs only if non-zero activity)
+    - service: shell_command.agent_daily_summary
+      response_variable: health_summary
+    - if:
+        - condition: template
+          value_template: "{{ (health_summary.stdout | default('') | trim) | length > 0 }}"
+      then:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: !secret permear_chat_id
+            message: "{{ health_summary.stdout }}"
+            parse_mode: plain_text
+
+    # Extract memories via ai_task — pre-check + primary + fallback
+    - delay:
+        seconds: 5
+    - choose:
+        # If fallback used recently, skip primary
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'last_fallback_at') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Extract daily memories [skip-primary]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze today's events and interactions and extract up to 5
+                  relevant memories (no trivialities). Short, factual sentences
+                  worth re-reading days later.
+
+                  Events: {{ state_attr('sensor.current_day_memory', 'events') | default([]) | tojson }}
+                  Interactions: {{ state_attr('sensor.current_day_memory', 'interactions') | default([]) | tojson }}
+
+                  If nothing relevant, return an empty list.
+                structure:
+                  memories:
+                    description: "List of relevant memories (short English sentences)"
+                    required: true
+                    selector:
+                      text:
+                        multiple: true
+              response_variable: memories_response
+              continue_on_error: true
+      default:
+        - service: ai_task.generate_data
+          data:
+            task_name: "Extract daily memories"
+            entity_id: ai_task.openrouter_deepseek_v3
+            instructions: |
+              Analyze today's events and interactions and extract up to 5
+              relevant memories (no trivialities). Short, factual sentences
+              worth re-reading days later.
+
+              Events: {{ state_attr('sensor.current_day_memory', 'events') | default([]) | tojson }}
+              Interactions: {{ state_attr('sensor.current_day_memory', 'interactions') | default([]) | tojson }}
+
+              If nothing relevant, return an empty list.
+            structure:
+              memories:
+                description: "List of relevant memories (short English sentences)"
+                required: true
+                selector:
+                  text:
+                    multiple: true
+          response_variable: memories_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ memories_response is not defined
+                   or memories_response.data is none
+                   or memories_response.data | length == 0 }}
+          then:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Extract daily memories [fallback]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze today's events and interactions and extract up to 5
+                  relevant memories (no trivialities). Short, factual sentences
+                  worth re-reading days later.
+
+                  Events: {{ state_attr('sensor.current_day_memory', 'events') | default([]) | tojson }}
+                  Interactions: {{ state_attr('sensor.current_day_memory', 'interactions') | default([]) | tojson }}
+
+                  If nothing relevant, return an empty list.
+                structure:
+                  memories:
+                    description: "List of relevant memories (short English sentences)"
+                    required: true
+                    selector:
+                      text:
+                        multiple: true
+              response_variable: memories_response
+              continue_on_error: true
+    - if:
+        - condition: template
+          value_template: "{{ memories_response is defined and memories_response.data is not none }}"
+      then:
+        - service: shell_command.apply_daily_memory
+          data:
+            memories_json: "{{ memories_response.data.memories | default([]) | tojson }}"
+
+# -----------------------------------------------------------------------------
+# 5. QUICK LEARNING
+# When user rejects an alert ("don't alert about that anymore"),
+# extract restriction and apply to users.json via ai_task.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Quick learning"
   id: permear_quick_learning
+  mode: queued
+  max: 3
   trigger:
     - platform: event
       event_type: telegram_text
@@ -196,59 +407,918 @@
            "don't care" in text or 'stop telling' in text or
            'i know' in text }}
   action:
-    - service: conversation.process
-      data:
-        agent_id: !secret permear_agent_id
-        text: >
-          The user responded to an alert with: "{{ trigger.event.data.text }}"
-          Return ONLY JSON: {"new_restriction": "what NOT to alert about"}
-          If unclear: {"new_restriction": null}
-      response_variable: learning
-    - service: shell_command.apply_quick_learning
-      data:
-        response: "{{ learning.response.speech.plain.speech }}"
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'last_fallback_at') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Extract restriction [skip-primary]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  The user responded to an alert with: "{{ trigger.event.data.text }}"
+                  Their last message from the agent was: "{{ states('input_text.permear_last_agent_message') }}"
+                  Extract a clear restriction (what NOT to alert about).
+                  If unclear or no clear restriction, return empty.
+                structure:
+                  restriction:
+                    description: "Short text describing what not to alert about"
+                    required: false
+                    selector:
+                      text: {}
+              response_variable: learning_response
+              continue_on_error: true
+      default:
+        - service: ai_task.generate_data
+          data:
+            task_name: "Extract restriction"
+            entity_id: ai_task.openrouter_deepseek_v3
+            instructions: |
+              The user responded to an alert with: "{{ trigger.event.data.text }}"
+              Their last message from the agent was: "{{ states('input_text.permear_last_agent_message') }}"
+              Extract a clear restriction (what NOT to alert about).
+              If unclear or no clear restriction, return empty.
+            structure:
+              restriction:
+                description: "Short text describing what not to alert about"
+                required: false
+                selector:
+                  text: {}
+          response_variable: learning_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ learning_response is not defined
+                   or learning_response.data is none
+                   or learning_response.data | length == 0 }}
+          then:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Extract restriction [fallback]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  The user responded to an alert with: "{{ trigger.event.data.text }}"
+                  Their last message from the agent was: "{{ states('input_text.permear_last_agent_message') }}"
+                  Extract a clear restriction (what NOT to alert about).
+                  If unclear or no clear restriction, return empty.
+                structure:
+                  restriction:
+                    description: "Short text describing what not to alert about"
+                    required: false
+                    selector:
+                      text: {}
+              response_variable: learning_response
+              continue_on_error: true
+    - if:
+        - condition: template
+          value_template: "{{ learning_response is defined and learning_response.data is not none }}"
+      then:
+        - service: shell_command.apply_quick_learning
+          data:
+            restriction: "{{ learning_response.data.restriction | default('') }}"
+          response_variable: applied
+        - service: telegram_bot.send_message
+          data:
+            chat_id: !secret permear_chat_id
+            message: "{{ applied.stdout | default('Restriction processed.') | trim }}"
+            parse_mode: plain_text
 
+# -----------------------------------------------------------------------------
 # 6. ENTITY DISCOVERY (daily 06:00)
+# Syncs monitored_entities.json with HA entity registry.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Entity discovery"
   id: permear_entity_discovery
+  mode: single
   trigger:
     - platform: time
       at: "06:00:00"
   action:
     - service: shell_command.discover_entities
 
-# 7. WEEKLY COMPILATION (Sunday 00:05)
+# -----------------------------------------------------------------------------
+# 7. WEEKLY COMPILATION (Sunday 04:00 off-peak)
+# 3 focused ai_task calls (soul/users/insights) with pre-check + fallback.
+# Then weekly_compile.py consolidates results into perennial files.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Weekly compilation"
-  id: permear_weekly_compile
+  id: permear_weekly_compilation
+  mode: single
   trigger:
     - platform: time
-      at: "00:05:00"
+      at: "04:00:00"
   condition:
     - condition: time
       weekday: [sun]
   action:
-    - service: shell_command.build_weekly_prompt
-      response_variable: weekly_prompt
-    - service: conversation.process
-      data:
-        agent_id: !secret permear_agent_id
-        text: "{{ weekly_prompt.stdout }}"
-      response_variable: compilation
+    # Active forgetting before compilation
+    - service: shell_command.forget_old_items
+
+    # === Call 1: SOUL ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'last_fallback_at') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Weekly compile - soul [skip-primary]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze the 7 daily files of this week. Propose AT MOST 1 new
+                  behavior rule AND 1 rule to remove, based on patterns in
+                  interactions.
+
+                  Current rules: {{ state_attr('sensor.perennial_memory', 'soul') | default({}) | tojson }}
+
+                  Weekly interaction samples:
+                  {% for day in ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+                    {% set d = state_attr('sensor.' ~ day ~ '_memory', 'interactions') %}
+                    {% if d %}{{ day }}: {{ d | tojson }}{% endif %}
+                  {% endfor %}
+
+                  If nothing relevant, return empty lists.
+                structure:
+                  add:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  remove:
+                    required: false
+                    selector: { text: { multiple: true } }
+              response_variable: soul_response
+              continue_on_error: true
+      default:
+        - service: ai_task.generate_data
+          data:
+            task_name: "Weekly compile - soul"
+            entity_id: ai_task.openrouter_deepseek_v3
+            instructions: |
+              Analyze the 7 daily files of this week. Propose AT MOST 1 new
+              behavior rule AND 1 rule to remove, based on patterns in
+              interactions.
+
+              Current rules: {{ state_attr('sensor.perennial_memory', 'soul') | default({}) | tojson }}
+
+              Weekly interaction samples:
+              {% for day in ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+                {% set d = state_attr('sensor.' ~ day ~ '_memory', 'interactions') %}
+                {% if d %}{{ day }}: {{ d | tojson }}{% endif %}
+              {% endfor %}
+
+              If nothing relevant, return empty lists.
+            structure:
+              add:
+                required: false
+                selector: { text: { multiple: true } }
+              remove:
+                required: false
+                selector: { text: { multiple: true } }
+          response_variable: soul_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ soul_response is not defined
+                   or soul_response.data is none
+                   or soul_response.data | length == 0 }}
+          then:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Weekly compile - soul [fallback]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze the 7 daily files of this week. Propose AT MOST 1 new
+                  behavior rule AND 1 rule to remove, based on patterns in
+                  interactions.
+
+                  Current rules: {{ state_attr('sensor.perennial_memory', 'soul') | default({}) | tojson }}
+
+                  Weekly interaction samples:
+                  {% for day in ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+                    {% set d = state_attr('sensor.' ~ day ~ '_memory', 'interactions') %}
+                    {% if d %}{{ day }}: {{ d | tojson }}{% endif %}
+                  {% endfor %}
+
+                  If nothing relevant, return empty lists.
+                structure:
+                  add:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  remove:
+                    required: false
+                    selector: { text: { multiple: true } }
+              response_variable: soul_response
+              continue_on_error: true
+
+    # === Call 2: USERS ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'last_fallback_at') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Weekly compile - users [skip-primary]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze this week's interactions and propose observed patterns
+                  per user. MAX 2 new per user, only with 3+ occurrences.
+
+                  Current users: {{ state_attr('sensor.perennial_memory', 'users') | default({}) | tojson }}
+
+                  Return JSON object {user_key: {add: [], remove: []}}.
+                  Example: {"alice": {"add":["Works late hours"], "remove":[]}}
+                structure:
+                  users_changes:
+                    description: "JSON object with changes per user"
+                    required: true
+                    selector:
+                      text:
+                        multiline: true
+              response_variable: users_response
+              continue_on_error: true
+      default:
+        - service: ai_task.generate_data
+          data:
+            task_name: "Weekly compile - users"
+            entity_id: ai_task.openrouter_deepseek_v3
+            instructions: |
+              Analyze this week's interactions and propose observed patterns
+              per user. MAX 2 new per user, only with 3+ occurrences.
+
+              Current users: {{ state_attr('sensor.perennial_memory', 'users') | default({}) | tojson }}
+
+              Return JSON object {user_key: {add: [], remove: []}}.
+              Example: {"alice": {"add":["Works late hours"], "remove":[]}}
+            structure:
+              users_changes:
+                description: "JSON object with changes per user"
+                required: true
+                selector:
+                  text:
+                    multiline: true
+          response_variable: users_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ users_response is not defined
+                   or users_response.data is none
+                   or users_response.data | length == 0 }}
+          then:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Weekly compile - users [fallback]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze this week's interactions and propose observed patterns
+                  per user. MAX 2 new per user, only with 3+ occurrences.
+
+                  Current users: {{ state_attr('sensor.perennial_memory', 'users') | default({}) | tojson }}
+
+                  Return JSON object {user_key: {add: [], remove: []}}.
+                  Example: {"alice": {"add":["Works late hours"], "remove":[]}}
+                structure:
+                  users_changes:
+                    description: "JSON object with changes per user"
+                    required: true
+                    selector:
+                      text:
+                        multiline: true
+              response_variable: users_response
+              continue_on_error: true
+
+    # === Call 3: INSIGHTS ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'last_fallback_at') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Weekly compile - insights [skip-primary]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze this week's events and interactions. Propose:
+                  - MAX 3 new_patterns (observed on 3+ days)
+                  - MAX 3 new_suggestions (actionable automations)
+                  - MAX 3 new_pending (ONLY household items, NEVER framework bugs)
+                  - items to remove (no mention in 30+ days)
+
+                  Current state: {{ state_attr('sensor.perennial_memory', 'insights') | default({}) | tojson }}
+                structure:
+                  new_patterns:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  remove_patterns:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  new_pending:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  remove_pending:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  new_suggestions:
+                    required: false
+                    selector: { text: { multiple: true } }
+              response_variable: insights_response
+              continue_on_error: true
+      default:
+        - service: ai_task.generate_data
+          data:
+            task_name: "Weekly compile - insights"
+            entity_id: ai_task.openrouter_deepseek_v3
+            instructions: |
+              Analyze this week's events and interactions. Propose:
+              - MAX 3 new_patterns (observed on 3+ days)
+              - MAX 3 new_suggestions (actionable automations)
+              - MAX 3 new_pending (ONLY household items, NEVER framework bugs)
+              - items to remove (no mention in 30+ days)
+
+              Current state: {{ state_attr('sensor.perennial_memory', 'insights') | default({}) | tojson }}
+            structure:
+              new_patterns:
+                required: false
+                selector: { text: { multiple: true } }
+              remove_patterns:
+                required: false
+                selector: { text: { multiple: true } }
+              new_pending:
+                required: false
+                selector: { text: { multiple: true } }
+              remove_pending:
+                required: false
+                selector: { text: { multiple: true } }
+              new_suggestions:
+                required: false
+                selector: { text: { multiple: true } }
+          response_variable: insights_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ insights_response is not defined
+                   or insights_response.data is none
+                   or insights_response.data | length == 0 }}
+          then:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Weekly compile - insights [fallback]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Analyze this week's events and interactions. Propose:
+                  - MAX 3 new_patterns (observed on 3+ days)
+                  - MAX 3 new_suggestions (actionable automations)
+                  - MAX 3 new_pending (ONLY household items, NEVER framework bugs)
+                  - items to remove (no mention in 30+ days)
+
+                  Current state: {{ state_attr('sensor.perennial_memory', 'insights') | default({}) | tojson }}
+                structure:
+                  new_patterns:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  remove_patterns:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  new_pending:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  remove_pending:
+                    required: false
+                    selector: { text: { multiple: true } }
+                  new_suggestions:
+                    required: false
+                    selector: { text: { multiple: true } }
+              response_variable: insights_response
+              continue_on_error: true
+
+    # === Consolidate ===
     - service: shell_command.weekly_compile
       data:
-        response: "{{ compilation.response.speech.plain.speech }}"
+        soul: >
+          {{ soul_response.data | default({}) | tojson
+             if soul_response is defined else '{}' }}
+        users: >
+          {{ users_response.data.users_changes | default('{}')
+             if users_response is defined else '{}' }}
+        insights: >
+          {{ insights_response.data | default({}) | tojson
+             if insights_response is defined else '{}' }}
       response_variable: compile_result
     - service: telegram_bot.send_message
       data:
         chat_id: !secret permear_chat_id
-        message: "Weekly compilation complete. {{ compile_result.stdout | default('') | trim | default('No details available.') }}"
+        message: "{{ compile_result.stdout | default('Weekly compilation completed.') | trim }}"
         parse_mode: plain_text
 
-# 8. DAILY RESET
+# -----------------------------------------------------------------------------
+# 8. DAILY RESET (midnight)
+# Emits an event other automations can hook into.
+# -----------------------------------------------------------------------------
 - alias: "PERMEAR - Daily reset"
   id: permear_daily_reset
+  mode: single
   trigger:
     - platform: time
       at: "00:00:00"
   action:
     - event: permear_day_reset
+
+# -----------------------------------------------------------------------------
+# 9. REAL-TIME ERROR MONITOR
+# Listens to HA system_log events, filters noise, classifies SELF/HA errors.
+# Sends Telegram alert with "Silence 24h" button for genuine errors.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - Realtime error monitor"
+  id: permear_realtime_error_monitor
+  mode: queued
+  max: 10
+  trigger:
+    - platform: event
+      event_type: system_log_event
+      event_data:
+        level: ERROR
+  action:
+    - service: shell_command.process_log_event
+      data:
+        component: "{{ trigger.event.data.name | default('unknown') }}"
+        message: "{{ trigger.event.data.message[0] | default('') | string }}"
+      response_variable: result
+    - variables:
+        parsed: "{{ result.stdout | default('{}') | from_json | default({}, true) }}"
+    - condition: template
+      value_template: "{{ not parsed.silenced | default(true) }}"
+    - service: telegram_bot.send_message
+      data:
+        chat_id: !secret permear_chat_id
+        message: "{{ parsed.message | default('Error detected') }}"
+        parse_mode: plain_text
+        inline_keyboard:
+          - "Silence 24h:perr_archive_{{ parsed.hash }}"
+
+# -----------------------------------------------------------------------------
+# 10. CLEANUP ARCHIVED ERRORS (every 6h)
+# Removes expired silenced-24h entries.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - Cleanup archived errors"
+  id: permear_cleanup_archived
+  mode: single
+  trigger:
+    - platform: time_pattern
+      hours: "/6"
+  action:
+    - service: shell_command.cleanup_archived_errors
+
+# -----------------------------------------------------------------------------
+# 11. NEW AUTOMATION TRIGGER
+# Detects /new_automation or keywords in Telegram, sets state to "awaiting_new".
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - New automation trigger"
+  id: permear_new_automation_trigger
+  mode: single
+  trigger:
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret permear_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {% set text = trigger.event.data.text | lower %}
+        {{ text.startswith('/new_automation')
+           or text.startswith('/nova_automacao')
+           or 'create an automation' in text
+           or 'create automation' in text }}
+  action:
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.permear_pending_auto_spec
+      data:
+        value: "awaiting_new"
+    - service: telegram_bot.send_message
+      data:
+        chat_id: !secret permear_chat_id
+        message: "Describe the automation you want. Example: 'turn on the kitchen light at 7pm every day'."
+        parse_mode: plain_text
+
+# -----------------------------------------------------------------------------
+# 12. AUTOMATION CREATION FLOW (via ai_task structured output)
+# When user describes an automation (after /new_automation), parse via ai_task
+# and present preview card with [Create] [Adjust] [Discard] buttons.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - Automation creation flow"
+  id: permear_automation_creation_flow
+  mode: queued
+  max: 3
+  trigger:
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret permear_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {{ states('input_text.permear_pending_auto_spec') in ['awaiting_new', 'awaiting_edit']
+           and not trigger.event.data.text.startswith('/') }}
+  action:
+    - service: shell_command.monitored_entities_text
+      response_variable: entities_result
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'last_fallback_at') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Parse automation request [skip-primary]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Parse the user's automation request into structured fields.
+
+                  User request: "{{ trigger.event.data.text }}"
+
+                  Available entities (use these exact IDs):
+                  {{ entities_result.stdout | default('No entities available') }}
+
+                  Return:
+                  - alias: short descriptive name
+                  - trigger_type: "time" or "state" or "numeric_state"
+                  - trigger_config: JSON config (e.g. {"at": "19:00:00"} or {"entity_id": "binary_sensor.x", "to": "on"})
+                  - action_service: HA service to call (e.g. light.turn_on)
+                  - action_entity: target entity_id
+                structure:
+                  alias:
+                    required: true
+                    selector: { text: {} }
+                  trigger_type:
+                    required: true
+                    selector: { text: {} }
+                  trigger_config:
+                    required: true
+                    selector: { text: { multiline: true } }
+                  action_service:
+                    required: true
+                    selector: { text: {} }
+                  action_entity:
+                    required: true
+                    selector: { text: {} }
+              response_variable: auto_response
+              continue_on_error: true
+      default:
+        - service: ai_task.generate_data
+          data:
+            task_name: "Parse automation request"
+            entity_id: ai_task.openrouter_deepseek_v3
+            instructions: |
+              Parse the user's automation request into structured fields.
+
+              User request: "{{ trigger.event.data.text }}"
+
+              Available entities (use these exact IDs):
+              {{ entities_result.stdout | default('No entities available') }}
+
+              Return:
+              - alias: short descriptive name
+              - trigger_type: "time" or "state" or "numeric_state"
+              - trigger_config: JSON config (e.g. {"at": "19:00:00"} or {"entity_id": "binary_sensor.x", "to": "on"})
+              - action_service: HA service to call (e.g. light.turn_on)
+              - action_entity: target entity_id
+            structure:
+              alias:
+                required: true
+                selector: { text: {} }
+              trigger_type:
+                required: true
+                selector: { text: {} }
+              trigger_config:
+                required: true
+                selector: { text: { multiline: true } }
+              action_service:
+                required: true
+                selector: { text: {} }
+              action_entity:
+                required: true
+                selector: { text: {} }
+          response_variable: auto_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ auto_response is not defined
+                   or auto_response.data is none
+                   or auto_response.data | length == 0 }}
+          then:
+            - service: shell_command.agent_log_fallback
+              continue_on_error: true
+            - service: ai_task.generate_data
+              data:
+                task_name: "Parse automation request [fallback]"
+                entity_id: ai_task.google_ai_task
+                instructions: |
+                  Parse the user's automation request into structured fields.
+
+                  User request: "{{ trigger.event.data.text }}"
+
+                  Available entities (use these exact IDs):
+                  {{ entities_result.stdout | default('No entities available') }}
+
+                  Return:
+                  - alias: short descriptive name
+                  - trigger_type: "time" or "state" or "numeric_state"
+                  - trigger_config: JSON config (e.g. {"at": "19:00:00"} or {"entity_id": "binary_sensor.x", "to": "on"})
+                  - action_service: HA service to call (e.g. light.turn_on)
+                  - action_entity: target entity_id
+                structure:
+                  alias:
+                    required: true
+                    selector: { text: {} }
+                  trigger_type:
+                    required: true
+                    selector: { text: {} }
+                  trigger_config:
+                    required: true
+                    selector: { text: { multiline: true } }
+                  action_service:
+                    required: true
+                    selector: { text: {} }
+                  action_entity:
+                    required: true
+                    selector: { text: {} }
+              response_variable: auto_response
+              continue_on_error: true
+    - if:
+        - condition: template
+          value_template: "{{ auto_response is not defined or auto_response.data is none }}"
+      then:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: !secret permear_chat_id
+            message: "Sorry, couldn't parse your request. Try again."
+            parse_mode: plain_text
+        - stop: "Parse failed"
+
+    # Write raw spec to file (avoids 255-char input_text limit)
+    - service: shell_command.write_pending_auto_spec
+      data:
+        spec: "{{ auto_response.data | tojson }}"
+    - service: shell_command.build_automation_spec
+      response_variable: spec_result
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.permear_pending_auto_spec
+      data:
+        value: "pending"
+
+    # Show preview card
+    - service: telegram_bot.send_message
+      data:
+        chat_id: !secret permear_chat_id
+        message: |
+          Preview:
+          Name: {{ auto_response.data.alias }}
+          Trigger: {{ auto_response.data.trigger_type }} - {{ auto_response.data.trigger_config }}
+          Action: {{ auto_response.data.action_service }} on {{ auto_response.data.action_entity }}
+
+          Confirm?
+        parse_mode: plain_text
+        inline_keyboard:
+          - ". Create:auto_create"
+          - ". Adjust:auto_edit"
+          - ". Discard:auto_discard"
+
+# -----------------------------------------------------------------------------
+# 13. LIST AUTOMATIONS COMMAND
+# /list_automations or /listar_automacoes — show list with remove button per row.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - List automations command"
+  id: permear_list_automations_cmd
+  mode: single
+  trigger:
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret permear_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {% set text = trigger.event.data.text | lower %}
+        {{ text.startswith('/list_automations')
+           or text.startswith('/listar_automacoes') }}
+  action:
+    - service: shell_command.agent_auto_list_json
+      response_variable: list_result
+    - variables:
+        list_data: "{{ list_result.stdout | default('{}') | from_json | default({}, true) }}"
+        autos: "{{ list_data.automations | default([]) }}"
+        total: "{{ list_data.count | default(0) }}"
+    - if:
+        - condition: template
+          value_template: "{{ total == 0 }}"
+      then:
+        - service: telegram_bot.send_message
+          data:
+            chat_id: !secret permear_chat_id
+            parse_mode: plain_text
+            message: "No automations created yet."
+        - stop: "Empty list"
+    - variables:
+        list_text: >
+          {% set lines = ['Automations created by agent (' ~ total ~ ')', ''] %}
+          {% for a in autos[:10] %}
+            {% set _ = lines.append((loop.index | string) ~ '. ' ~ a.alias) %}
+          {% endfor %}
+          {{ lines | join('\n') }}
+        kb_rows: >
+          {% set rows = [] %}
+          {% for a in autos[:10] %}
+            {% set _ = rows.append('Remove ' ~ (loop.index | string) ~ ':auto_remove_' ~ a.id) %}
+          {% endfor %}
+          {{ rows | tojson }}
+    - service: telegram_bot.send_message
+      data:
+        chat_id: !secret permear_chat_id
+        parse_mode: plain_text
+        message: "{{ list_text }}"
+        inline_keyboard: "{{ kb_rows | from_json }}"
+
+# -----------------------------------------------------------------------------
+# 14. CALLBACK HANDLER (Telegram button presses)
+# Routes button presses to actions: create/adjust/discard, remove, silence, etc.
+# -----------------------------------------------------------------------------
+- alias: "PERMEAR - Callback handler"
+  id: permear_callback_handler
+  mode: queued
+  max: 5
+  trigger:
+    - platform: event
+      event_type: telegram_callback
+      event_data:
+        chat_id: !secret permear_chat_id
+  action:
+    - variables:
+        cb_data: "{{ trigger.event.data.data | default('') }}"
+        cb_id: "{{ trigger.event.data.id | default('') }}"
+        msg_id: "{{ trigger.event.data.message.message_id | default(0) }}"
+    - choose:
+        # CREATE — confirm new automation
+        - conditions:
+            - condition: template
+              value_template: "{{ cb_data == 'auto_create' }}"
+          sequence:
+            - service: shell_command.manage_agent_auto_create_from_file
+              response_variable: create_result
+            - service: shell_command.clear_pending_auto_spec
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: ""
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Creating"
+            - service: telegram_bot.edit_message
+              data:
+                chat_id: !secret permear_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "{{ create_result.stdout | default('Done.') | trim }}"
+
+        # ADJUST — ask for changes
+        - conditions:
+            - condition: template
+              value_template: "{{ cb_data == 'auto_edit' }}"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: "awaiting_edit"
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "OK"
+            - service: telegram_bot.edit_message
+              data:
+                chat_id: !secret permear_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "Describe what to change."
+
+        # DISCARD — clear pending
+        - conditions:
+            - condition: template
+              value_template: "{{ cb_data == 'auto_discard' }}"
+          sequence:
+            - service: shell_command.clear_pending_auto_spec
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: ""
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Discarded"
+            - service: telegram_bot.edit_message
+              data:
+                chat_id: !secret permear_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "Discarded."
+
+        # REMOVE automation
+        - conditions:
+            - condition: template
+              value_template: "{{ 'auto_remove_' in cb_data }}"
+          sequence:
+            - variables:
+                auto_id: "{{ cb_data.split('auto_remove_')[1] }}"
+            - service: shell_command.manage_agent_auto_remove
+              data:
+                identifier: "{{ auto_id }}"
+              response_variable: remove_result
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Removed"
+            - service: telegram_bot.edit_message
+              data:
+                chat_id: !secret permear_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "{{ remove_result.stdout | default('Automation removed.') | trim }}"
+
+        # SILENCE ERROR 24h
+        - conditions:
+            - condition: template
+              value_template: "{{ 'perr_archive_' in cb_data }}"
+          sequence:
+            - variables:
+                err_hash: "{{ cb_data.split('perr_archive_')[1] }}"
+            - service: shell_command.archive_error
+              data:
+                error_hash: "{{ err_hash }}"
+                component: "unknown"
+                message: "silenced via button"
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Silenced 24h"
+            - service: telegram_bot.edit_message
+              data:
+                chat_id: !secret permear_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "Error silenced for 24h."
