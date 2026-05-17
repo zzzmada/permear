@@ -1,18 +1,39 @@
-# PERMEAR — Persistent Memory Architecture for Home Assistant AI Agents
+# PERMEAR
 
-A persistent memory and self-improvement system that transforms Home Assistant's conversation agent from a stateless chatbot into an intelligent assistant that **remembers, learns, monitors, and maintains** your smart home over time.
+**Persistent Memory Architecture for Home Assistant AI Agents.**
 
-> Built and battle-tested on a Raspberry Pi 4 (2GB RAM) running HAOS. No external databases, no cloud storage, no paid services beyond what you already use.
+PERMEAR turns Home Assistant + an LLM into a household agent that remembers, learns, and proposes — without you babysitting it.
 
-## What This Is
+> *Latest release: **v7.2.0**. See [CHANGELOG.md](CHANGELOG.md) for what's new. Upgrading from v5.x? See [MIGRATION.md](MIGRATION.md).*
 
+<<<<<<< HEAD
 Home Assistant's conversation agents (Gemini, OpenAI, etc.) have no memory between interactions. Every conversation starts from zero. PERMEAR fixes that with a file-based memory architecture that gives your agent a persistent soul, user profiles, learned insights, and the ability to create automations and monitor system health.
 
 **The agent evolves from household assistant to system caretaker** — it monitors HA health, detects errors (including its own), checks for updates, autodiscovers entities, and can create native HA automations with user approval.
+=======
+---
 
-## Architecture
+## What PERMEAR does
+>>>>>>> 3ee64b2 (v7.2.0: dual LLM path architecture, automatic fallback and active forgetting)
+
+PERMEAR is a Home Assistant configuration that gives your LLM-based voice/chat assistant:
+
+- **Persistent memory** across days, weeks, and indefinitely (file-based, no database required)
+- **Proactive contact** via Telegram when something relevant happens (and silence when nothing does)
+- **Daily and weekly self-reflection** that distills events into reusable patterns
+- **Automation creation by chat** — describe what you want, agent proposes, you confirm
+- **Active forgetting** — items not seen in 30 days get archived automatically
+- **Health monitoring** — circuit breaker, retry, and automatic fallback between LLM providers
+- **Real-time error filtering** — HA errors come to Telegram, noise stays out
+
+It runs on **Home Assistant OS or Supervised**, including a **Raspberry Pi 4 with 2 GB RAM**.
+
+---
+
+## Architecture at a glance
 
 ```
+<<<<<<< HEAD
 MEMORY (persistent JSON files)
 ├── guidelines.json          ← IMMUTABLE constitution (chmod 444)
 ├── soul.json                ← Agent personality (edited weekly by agent)
@@ -86,10 +107,130 @@ See detailed steps below.
 ```bash
 mkdir -p /config/memory/daily /config/scripts /config/logs
 touch /config/automations/agent_automations.yaml
+=======
+┌─────────────────────────────────────────────────────────────┐
+│                Home Assistant + PERMEAR                     │
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐   ┌────────────────┐  │
+│  │ Telegram bot │◄──►│ Conversation │   │  AI Task entity│  │
+│  │   (chat,     │    │   agent      │   │  (structured   │  │
+│  │   buttons)   │    │  (Gemini)    │   │   output)      │  │
+│  └──────────────┘    └──────────────┘   └────────────────┘  │
+│         │                  │ Tools             │            │
+│         ▼                  ▼                   ▼            │
+│  Interactive cycles    Voice control     Non-interactive    │
+│  (chat, voice)         (lights, fans)    (briefings,        │
+│                                           weekly compile,   │
+│                                           automation create)│
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │     /config/memory/   (persistent state)            │    │
+│  │     soul.json · users.json · insights.json          │    │
+│  │     guidelines.json · monitored_entities.json       │    │
+│  │     daily/{monday..sunday}.json                     │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Verify automation include mode
+PERMEAR keeps **two LLM paths** intentionally separated:
 
+| Path | Used for | Why |
+|---|---|---|
+| `conversation.process` (interactive) | Telegram chat replies, voice commands | Needs HA Tools support for device control |
+| `ai_task.generate_data` (non-interactive) | Briefings, weekly compile, automation creation, memory extraction, restriction learning | Native structured output, no fence-stripping, schema-guaranteed |
+
+Why this split matters: the interactive path needs Gemini (or another Tools-capable provider). The non-interactive path can use cheaper models like DeepSeek V4-Flash, which is ~5× cheaper per token than Gemini for structured tasks. **You pay almost nothing per month while keeping the smart parts smart.**
+
+---
+
+## Cycles
+
+| Cycle | Time | What it does |
+|---|---|---|
+| Pre-briefing | Hourly, 08:30–20:00 | Reads house state, decides if proactive Telegram message is warranted (mostly silent) |
+| Daily briefing | 23:30 | 120-word summary of the day, with pending items and update suggestions |
+| Memory extraction | After briefing | LLM picks the 5 most useful sentences worth re-reading; saved to today's daily file |
+| Entity discovery | 06:00 | Syncs `monitored_entities.json` with HA entity registry (entities exposed to voice) |
+| Weekly compilation | Sunday 04:00 | 3 focused LLM calls update `soul.json`, `users.json`, `insights.json` |
+| Forget old items | Before weekly | Patterns/pending not mentioned in 30+ days move to archive |
+| Daily reset | 00:00 | Emits `permear_day_reset` event |
+| Real-time error monitor | Continuous | Filters noisy components, alerts on genuine errors with [Silence 24h] button |
+
+---
+
+## AI Provider Architecture
+
+Configure **two** AI Task entities in your Home Assistant (Settings → Devices & Services), one of each:
+
+1. **Primary** (cheap, non-interactive): OpenRouter integration with DeepSeek V4-Flash
+   *Entity ID expected by config:* `ai_task.openrouter_deepseek_v3`
+2. **Secondary** (fallback): Google AI Task integration with Gemini Flash
+   *Entity ID expected by config:* `ai_task.google_ai_task`
+
+You can customize entity IDs in `scripts/permear_config.py`. Both entities must exist for the fallback mechanism to work.
+
+**Recommended setup for DeepSeek:** add **BYOK (Bring Your Own Key)** in OpenRouter pointing to your `platform.deepseek.com` API key. This routes billing through DeepSeek directly (cheaper, no OpenRouter fee, larger rate limits). See [docs/byok.md](docs/byok.md) for setup.
+
+**Estimated monthly cost (typical household):** $0.06 – $0.15 USD. Gemini interactive runs in free tier (~5 chats/day fits easily).
+
+---
+
+## Fallback model
+
+Every `ai_task.generate_data` call follows this pattern:
+
+```yaml
+# 1. Pre-check: skip primary if a recent fallback happened (< 1h ago)
+- choose:
+    - conditions: [primary degraded recently?]
+      sequence: [call secondary directly]
+  default:
+    # 2. Try primary
+    - ai_task.generate_data: { entity_id: primary }
+      continue_on_error: true
+    # 3. Try secondary if primary returned empty/failed
+    - if: [result empty or undefined]
+      then: [call secondary]
+```
+
+The fallback is **automatic and silent**. The `sensor.permear_health` will show `fallback_active` if it kicks in. Your weekly briefings keep happening even when one provider has a bad day.
+
+---
+
+## Requirements
+
+- **Home Assistant OS or Supervised** version 2025.7+ (for `ai_task.generate_data`)
+- **Telegram bot** integration configured (chat ID required)
+- **Two LLM integrations:**
+  - Google Generative AI (free tier OK) for interactive Telegram/voice
+  - OpenRouter or DeepSeek direct for non-interactive cycles
+- **Python 3.11+** (comes with HAOS)
+- Disk space: ~50 MB
+- RAM: works on RPi4 2GB
+
+---
+
+## Installation
+
+### Quick install (recommended)
+
+Use the install script contributed by [@clyra](https://github.com/clyra):
+
+```bash
+# SSH or Terminal addon on your HA instance
+cd /config
+wget https://raw.githubusercontent.com/zzzmada/permear/main/install.sh
+bash install.sh
+>>>>>>> 3ee64b2 (v7.2.0: dual LLM path architecture, automatic fallback and active forgetting)
+```
+
+The script:
+1. Creates `/config/scripts/`, `/config/memory/`, `/config/automations/` if missing
+2. Downloads all PERMEAR files
+3. Generates a long-lived token at `/config/.permear_token`
+4. Prints next-step instructions
+
+<<<<<<< HEAD
 ```yaml
 # configuration.yaml — must be directory-based:
 automation: !include_dir_merge_list automations/
@@ -135,11 +276,209 @@ automations/*.yaml   → /config/automations/
 **Option B (manual):** Copy contents of `configuration_additions.yaml` into your `configuration.yaml`
 
 ### 8. Lock guidelines
+=======
+### Manual install
+
+1. **Clone the repo:**
+   ```bash
+   git clone https://github.com/zzzmada/permear /tmp/permear
+   ```
+2. **Copy files into your HA config:**
+   ```bash
+   cp -r /tmp/permear/scripts /config/
+   cp -r /tmp/permear/memory /config/
+   cp /tmp/permear/automations/permear.yaml /config/automations/
+   touch /config/automations/agent_automations.yaml
+   echo "[]" > /config/automations/agent_automations.yaml
+   ```
+3. **Convert example memory files to live ones:**
+   ```bash
+   cd /config/memory
+   cp soul.example.json soul.json
+   cp users.example.json users.json
+   cp insights.example.json insights.json
+   cp monitored_entities.example.json monitored_entities.json
+   chmod 444 guidelines.json   # immutable
+   for day in monday tuesday wednesday thursday friday saturday sunday; do
+     cp daily/monday.example.json daily/$day.json
+   done
+   ```
+4. **Generate the HA long-lived token:**
+   *HA UI → your profile → Long-lived access tokens → Create*. Save it:
+   ```bash
+   echo "PASTE_YOUR_TOKEN_HERE" > /config/.permear_token
+   chmod 600 /config/.permear_token
+   ```
+5. **Edit `/config/secrets.yaml`** — add entries from `secrets.yaml.example`.
+6. **Edit `/config/configuration.yaml`** — paste contents of `configuration_additions.yaml`.
+7. **Set up your LLM integrations** (see [Configure LLMs](#configure-llms) below).
+8. **Restart Home Assistant.**
+9. **Run initial entity discovery** (Developer Tools → Services):
+   ```yaml
+   service: shell_command.discover_entities
+   ```
+10. **Test by saying "hi" to your Telegram bot.**
+
+---
+
+## Configure LLMs
+
+### 1. Interactive agent (Telegram chat, voice)
+
+You need a **conversation entity** that supports Tools.
+
+- Install **Google Generative AI** integration
+- Configure with your Google AI Studio key
+- In the integration options, set:
+  - Model: `gemini-2.5-flash` or newer
+  - Max tokens: 8192
+  - Enable "Control Home Assistant" (Tools)
+- This gives you `conversation.google_generative_ai_conversation` (rename as needed)
+- Set `permear_agent_id` in `secrets.yaml` to this entity ID
+
+### 2. AI Task entities (non-interactive cycles)
+
+#### Primary: OpenRouter + DeepSeek V4-Flash
+
+- Install **OpenRouter** integration
+- Configure with your OpenRouter API key (`openrouter.ai/keys`)
+- Add a sub-entry **AI Task** with model `deepseek/deepseek-v4-flash`
+- This creates `ai_task.openrouter_deepseek_v3` (or similar — rename in `permear_config.py` if different)
+
+**For best cost/reliability, set up BYOK:**
+1. Create a key at `platform.deepseek.com/api_keys`
+2. Top up $5 (lasts ~4 years at typical PERMEAR usage)
+3. In OpenRouter → Settings → Integrations → DeepSeek → paste the key in **Prioritized**
+4. Toggle **"Always use for this provider"**
+
+#### Secondary: Google AI Task
+
+- Same Google Generative AI integration (already set up in step 1)
+- Add a sub-entry **AI Task**
+- This creates `ai_task.google_ai_task`
+
+---
+
+## Customize for your household
+
+After installation, edit:
+
+| File | What to edit |
+|---|---|
+| `/config/memory/soul.json` | Agent name, tone, values, behavior rules |
+| `/config/memory/users.json` | One key per resident — role, style, restrictions |
+| `/config/memory/monitored_entities.json` | Add `events:` to entities you want logged to daily file |
+
+After editing `monitored_entities.json` `events`, regenerate buffer triggers:
 
 ```bash
-chmod 444 /config/memory/guidelines.json
+python3 /config/scripts/generate_buffer_events.py
 ```
 
+Then reload automations in HA. See [docs/customization.md](docs/customization.md) for the full guide.
+
+---
+
+## Lovelace card
+
+Want to see PERMEAR health at a glance? Paste [memory/lovelace_card.yaml](memory/lovelace_card.yaml) into:
+*HA → Settings → Dashboards → your dashboard → ⋮ → Edit Dashboard → ⋮ → Raw configuration editor*.
+
+It shows:
+- 🟢 / 🟡 / 🟠 / 🔴 state of the agent today
+- Fallback usage counter
+- Last failure / success timestamps
+- Circuit breaker state
+
+---
+
+## Telegram commands
+
+| Command | What it does |
+|---|---|
+| Just type to chat | Talks to the interactive agent, can control devices via Tools |
+| `/new_automation` (or `/nova_automacao`) | Starts the automation creation flow |
+| `/list_automations` (or `/listar_automacoes`) | Shows agent-created automations with [Remove N] button per row |
+| Reply with "I know", "irrelevant", etc. | Triggers quick-learning — agent extracts a restriction and saves it |
+| `[Silence 24h]` button on an error alert | Silences that exact error signature for 24h |
+
+---
+
+## File structure
+
+```
+/config/
+├── scripts/
+│   ├── lib/                          # Shared library (v7.0)
+│   │   ├── memory.py                 # JSON/YAML I/O
+│   │   ├── agent.py                  # Circuit breaker + health helpers
+│   │   └── logs.py                   # Error classification
+│   ├── permear_config.py             # Paths, constants, AI_TASK_PRIMARY/SECONDARY
+│   ├── build_briefing.py             # Daily briefing prompt builder
+│   ├── build_prebriefing.py          # Hourly pre-briefing prompt builder
+│   ├── briefing_simple.py            # Python fallback if LLM fails 3x
+│   ├── weekly_compile.py             # Weekly compilation (3 JSON inputs from ai_task)
+│   ├── apply_daily_memory.py         # Save extracted memories to today's daily
+│   ├── apply_quick_learning.py       # Save restriction from chat to users.json
+│   ├── append_daily.py               # Add event/interaction/memory to daily file
+│   ├── discover_entities.py          # Sync with entity registry (--add / --remove)
+│   ├── manage_agent_automations.py   # CRUD with --json output (v7.1)
+│   ├── manage_archived.py            # Silenced 24h errors
+│   ├── ha_log_monitor.py             # Parse home-assistant.log
+│   ├── ha_updates_check.py           # Supervisor API for updates
+│   ├── ha_update_manager.py          # Install/skip updates
+│   ├── circuit_breaker.py            # Thin entry point → lib/agent.py
+│   ├── process_log_event.py          # Thin entry point → lib/logs.py
+│   ├── sensor_permear_health.py      # Health sensor (4 states)
+│   ├── sensor_current_day.py         # Today's daily as sensor attrs
+│   ├── sensor_perennial.py           # soul/users/insights as sensor attrs
+│   ├── log_fallback.py               # Increment fallback counter (v7.1-I)
+│   ├── forget_old_items.py           # 30-day retention (v7.0)
+│   ├── get_monitored_entities_text.py  # Format entities for ai_task prompts
+│   ├── build_automation_spec.py      # Transform raw spec → HA automation spec
+│   ├── write_pending_spec.py         # Avoid 255-char input_text limit
+│   └── generate_buffer_events.py     # Regenerate triggers between markers
+│
+├── memory/
+│   ├── soul.json                     # Agent personality
+│   ├── users.json                    # Household profiles
+│   ├── insights.json                 # Patterns, pending, suggestions
+│   ├── guidelines.json               # IMMUTABLE (chmod 444)
+│   ├── monitored_entities.json       # Single source of truth: monitor + events
+│   ├── agent_circuit.json            # Circuit breaker state (auto-generated)
+│   ├── archived_errors.json          # Silenced 24h errors (auto-generated)
+│   ├── insights_archived.json        # Items archived after 30 days
+│   ├── pending_auto_spec.json        # Temp file for automation creation flow
+│   └── daily/
+│       └── {monday..sunday}.json
+│
+└── automations/
+    ├── permear.yaml                  # Main PERMEAR automations
+    └── agent_automations.yaml        # User automations created by agent (initially [])
+```
+
+---
+>>>>>>> 3ee64b2 (v7.2.0: dual LLM path architecture, automatic fallback and active forgetting)
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Telegram bot doesn't respond | Token wrong or HA can't reach Telegram | Check `secrets.yaml`, `tail -f /config/home-assistant.log` |
+| `circuit breaker open` Telegram message | LLM had 3 consecutive failures | Wait 10 min cooldown, check provider status |
+| `sensor.permear_health` shows `fallback_active` | Primary provider hit rate limit | Check OpenRouter / DeepSeek dashboards for usage |
+| Briefing didn't arrive at 23:30 | Probably circuit breaker, or Telegram chat ID wrong | Check `sensor.permear_health.summary` |
+| Pre-briefing always silent | This is by design — the agent reports SILENCE when nothing relevant happens | Check daily file is being populated to confirm cycles are running |
+| `Error code 429` in logs | DeepSeek rate-limited | Set up BYOK (see above) |
+| Automation creation says "couldn't parse" | Provider returned empty or non-JSON | Ask agent to be more specific (entity name, time) |
+
+For detailed diagnostics, check:
+```bash
+python3 /config/scripts/circuit_breaker.py status
+python3 /config/scripts/sensor_permear_health.py
+```
+
+<<<<<<< HEAD
 ### 9. Customize
 
 - **`permear_config.py`** — Paths, `DAYS` for language, `SELF_COMPONENTS`. See [Customization Guide](docs/customization.md).
@@ -234,12 +573,34 @@ Developer Tools → Services → `shell_command.discover_entities`
 
 ### v3.0 (2026-03-29)
 - Initial release.
+=======
+---
+
+## Contributing
+
+PRs welcome. Key principles when proposing changes:
+
+1. **Simple, HA-native, no overengineering.** If HA does it, use HA.
+2. **Single source of truth** — don't duplicate state across files.
+3. **English everywhere** in this public repo. (Your private fork can be in any language.)
+4. **Backward compatibility** for existing users where reasonable.
+
+Open issues at https://github.com/zzzmada/permear/issues
+
+---
+>>>>>>> 3ee64b2 (v7.2.0: dual LLM path architecture, automatic fallback and active forgetting)
 
 ## License
 
-MIT — Use it, fork it, improve it.
+MIT — see [LICENSE](LICENSE)
 
 ## Credits
 
+<<<<<<< HEAD
 - Architecture designed in collaboration with Claude (Anthropic)
 - Installation script by [@clyra](https://github.com/clyra)
+=======
+- Author: [@zzzmada](https://github.com/zzzmada)
+- Installer: [@clyra](https://github.com/clyra)
+- Tested on: Raspberry Pi 4 (2GB), Home Assistant OS
+>>>>>>> 3ee64b2 (v7.2.0: dual LLM path architecture, automatic fallback and active forgetting)

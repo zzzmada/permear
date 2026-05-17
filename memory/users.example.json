@@ -1,0 +1,14 @@
+{
+  "alice": {
+    "role": "primary resident",
+    "response_style": "direct and technical",
+    "primary_channel": "telegram",
+    "preferred_temperature": 23,
+    "interests": [
+      "technology",
+      "home automation"
+    ],
+    "restrictions": [],
+    "observed_patterns": []
+  }
+}
