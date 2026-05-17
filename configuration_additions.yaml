@@ -1,93 +1,197 @@
 # =============================================================================
-# PERMEAR v5.5 — Configuration
+# PERMEAR v7.2 — configuration.yaml additions
 #
-# Use ONE of these methods:
-#   A) HA Packages: Copy this file to /config/packages/permear.yaml
-#      (requires: homeassistant: packages: !include_dir_named packages)
-#   B) Manual: Copy contents into your configuration.yaml
-#   C) install.sh: Run with PACKAGE_DIR parameter
+# Paste these snippets into your existing /config/configuration.yaml.
+# Adjust paths if your scripts are not in /config/scripts/.
 # =============================================================================
 
-input_text:
-  permear_last_agent_message:
-    name: "PERMEAR Last Agent Message"
-    max: 255
+# -----------------------------------------------------------------------------
+# Automation include (loads PERMEAR automations from separate file)
+# -----------------------------------------------------------------------------
+automation permear: !include automations/permear.yaml
+automation agent_created: !include automations/agent_automations.yaml
 
+# -----------------------------------------------------------------------------
+# Real-time error events (required for permear_realtime_error_monitor)
+# -----------------------------------------------------------------------------
+system_log:
+  fire_event: true
+
+# -----------------------------------------------------------------------------
+# Shell commands — bridge HA to Python scripts
+# -----------------------------------------------------------------------------
 shell_command:
+  # === Daily file I/O ===
   append_daily_event: 'python3 /config/scripts/append_daily.py event "{{ detail }}"'
   append_daily_interaction: 'python3 /config/scripts/append_daily.py interaction "{{ detail }}"'
   append_daily_memory: 'python3 /config/scripts/append_daily.py memory "{{ detail }}"'
   append_daily_flag: 'python3 /config/scripts/append_daily.py flag "{{ detail }}"'
-  build_briefing_prompt: 'python3 /config/scripts/build_briefing.py --updates "{{ updates }}"'
-  update_daily_memory: "python3 /config/scripts/update_daily_memory.py '{{ response }}'"
+  apply_daily_memory: 'python3 /config/scripts/apply_daily_memory.py ''{{ memories_json }}'''
+
+  # === Prompt builders ===
+  build_briefing_prompt: 'python3 /config/scripts/build_briefing.py'
   build_prebriefing_prompt: 'python3 /config/scripts/build_prebriefing.py "{{ health }}"'
-  apply_quick_learning: "python3 /config/scripts/apply_quick_learning.py '{{ response }}'"
-  manage_agent_auto_create: "python3 /config/scripts/manage_agent_automations.py create '{{ spec }}'"
-  manage_agent_auto_remove: "python3 /config/scripts/manage_agent_automations.py remove '{{ identifier }}'"
-  manage_agent_auto_list: "python3 /config/scripts/manage_agent_automations.py list"
-  ha_log_monitor: "python3 /config/scripts/ha_log_monitor.py"
-  ha_updates_check: "python3 /config/scripts/ha_updates_check.py"
-  discover_entities: "python3 /config/scripts/discover_entities.py"
-  add_monitored_entity: "python3 /config/scripts/discover_entities.py --add '{{ entity_id }}' '{{ friendly_name }}'"
-  remove_monitored_entity: "python3 /config/scripts/discover_entities.py --remove '{{ entity_id }}'"
-  generate_buffer_events: "python3 /config/scripts/generate_buffer_events.py"
-  build_weekly_prompt: "python3 /config/scripts/build_weekly_prompt.py"
-  weekly_compile: "python3 /config/scripts/weekly_compile.py '{{ response }}'"
+  briefing_simple: 'python3 /config/scripts/briefing_simple.py'
 
-command_line:
-  - sensor:
-      name: "Current Day Memory"
-      command: "python3 /config/scripts/sensor_current_day.py"
-      scan_interval: 300
-      value_template: "ok"
-      json_attributes:
-        - events
-        - interactions
-        - daily_memories
-  - sensor:
-      name: "Perennial Memory"
-      command: "python3 /config/scripts/sensor_perennial.py"
-      scan_interval: 3600
-      value_template: "ok"
-      json_attributes:
-        - soul
-        - users
-        - insights
+  # === Weekly compilation ===
+  weekly_compile: >
+    python3 /config/scripts/weekly_compile.py
+    '{{ soul }}' '{{ users }}' '{{ insights }}'
+  forget_old_items: 'python3 /config/scripts/forget_old_items.py'
 
-# HA Scripts — wrappers for shell_commands exposed to the LLM agent
-# After adding, expose these scripts to your agent in:
-# Settings → Voice Assistants → your agent → Exposed Entities
-script:
-  permear_list_automations:
-    alias: "PERMEAR - List automations"
-    sequence:
-      - service: shell_command.manage_agent_auto_list
-        response_variable: result
-      - stop: "{{ result.stdout | default('No automations') }}"
-        response_variable: output
+  # === Quick learning ===
+  apply_quick_learning: 'python3 /config/scripts/apply_quick_learning.py "{{ restriction }}"'
 
-  permear_create_automation:
-    alias: "PERMEAR - Create automation"
-    fields:
-      spec:
-        description: "JSON spec with alias, trigger, action"
-    sequence:
-      - service: shell_command.manage_agent_auto_create
-        data:
-          spec: "{{ spec }}"
-        response_variable: result
-      - stop: "{{ result.stdout | default('Error creating automation') }}"
-        response_variable: output
+  # === Log monitoring ===
+  ha_log_monitor: 'python3 /config/scripts/ha_log_monitor.py'
+  ha_updates_check: 'python3 /config/scripts/ha_updates_check.py'
+  process_log_event: 'python3 /config/scripts/process_log_event.py "{{ component }}" "{{ message }}"'
 
-  permear_remove_automation:
-    alias: "PERMEAR - Remove automation"
-    fields:
-      identifier:
-        description: "Alias or ID of the automation to remove"
-    sequence:
-      - service: shell_command.manage_agent_auto_remove
-        data:
-          identifier: "{{ identifier }}"
-        response_variable: result
-      - stop: "{{ result.stdout | default('Error removing automation') }}"
-        response_variable: output
+  # === Agent circuit breaker ===
+  agent_circuit_check: 'python3 /config/scripts/circuit_breaker.py check'
+  agent_circuit_fail: 'python3 /config/scripts/circuit_breaker.py fail'
+  agent_circuit_success: 'python3 /config/scripts/circuit_breaker.py success'
+  agent_circuit_status: 'python3 /config/scripts/circuit_breaker.py status'
+  agent_log_retry_success: 'python3 /config/scripts/circuit_breaker.py log_retry_success'
+  agent_log_3fail: 'python3 /config/scripts/circuit_breaker.py log_3fail'
+  agent_daily_summary: 'python3 /config/scripts/circuit_breaker.py daily_summary'
+  agent_log_fallback: 'python3 /config/scripts/log_fallback.py'
+
+  # === Archived errors (silenced 24h via Telegram button) ===
+  archive_error: >
+    python3 /config/scripts/manage_archived.py archive
+    "{{ error_hash }}" "{{ component }}" "{{ message }}"
+  cleanup_archived_errors: 'python3 /config/scripts/manage_archived.py cleanup'
+
+  # === Agent automations CRUD ===
+  agent_auto_list_json: 'python3 /config/scripts/manage_agent_automations.py list --json'
+  manage_agent_auto_create_from_file: 'python3 /config/scripts/manage_agent_automations.py create_from_file --json'
+  manage_agent_auto_remove: 'python3 /config/scripts/manage_agent_automations.py remove "{{ identifier }}" --json'
+
+  # === Pending automation spec ===
+  write_pending_auto_spec: 'python3 /config/scripts/write_pending_spec.py ''{{ spec }}'''
+  clear_pending_auto_spec: 'rm -f /config/memory/pending_auto_spec.json'
+  build_automation_spec: 'python3 /config/scripts/build_automation_spec.py'
+
+  # === Entity discovery ===
+  discover_entities: 'python3 /config/scripts/discover_entities.py'
+  monitored_entities_text: >
+    python3 /config/scripts/get_monitored_entities_text.py
+    light switch climate sensor binary_sensor
+
+  # === HA updates manager ===
+  ha_update_list: 'python3 /config/scripts/ha_update_manager.py list'
+  ha_update_pending_json: 'python3 /config/scripts/ha_update_manager.py list_pending_json'
+  ha_update_check_backup: 'python3 /config/scripts/ha_update_manager.py check_backup'
+  ha_update_execute: 'python3 /config/scripts/ha_update_manager.py execute "{{ entity_id }}"'
+  ha_update_skip: 'python3 /config/scripts/ha_update_manager.py skip "{{ entity_id }}"'
+  ha_update_create_backup: 'python3 /config/scripts/ha_update_manager.py create_backup'
+
+# -----------------------------------------------------------------------------
+# Input helpers (UI state for automation flows)
+# -----------------------------------------------------------------------------
+input_text:
+  permear_last_agent_message:
+    name: PERMEAR last agent message
+    max: 255
+    initial: ""
+  permear_pending_auto_spec:
+    name: PERMEAR pending automation flag
+    max: 30
+    initial: ""
+
+# -----------------------------------------------------------------------------
+# Sensors — expose memory and health via state attributes
+# -----------------------------------------------------------------------------
+sensor:
+  # Health sensor (4 states: all_ok, recovering, fallback_active, degraded)
+  - platform: command_line
+    name: PERMEAR Health
+    command: 'python3 /config/scripts/sensor_permear_health.py'
+    value_template: "{{ value_json.state }}"
+    scan_interval: 60
+    json_attributes:
+      - summary
+      - retries_recovered_today
+      - final_failures_today
+      - circuit_status
+      - active_silenced_errors
+      - last_failure_at
+      - last_success_at
+      - fallbacks_secondary_today
+      - last_fallback_at
+
+  # Current day memory
+  - platform: command_line
+    name: current_day_memory
+    command: 'python3 /config/scripts/sensor_current_day.py'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 300
+    json_attributes:
+      - events
+      - interactions
+      - daily_memories
+      - briefing_sent
+      - bulletin_triggered
+
+  # Perennial memory (soul, users, insights)
+  - platform: command_line
+    name: perennial_memory
+    command: 'python3 /config/scripts/sensor_perennial.py'
+    value_template: "loaded"
+    scan_interval: 600
+    json_attributes:
+      - soul
+      - users
+      - insights
+
+  # Per-day historic memories — generate one per weekday (Mon-Sun)
+  # for use in weekly compilation templates.
+  - platform: command_line
+    name: monday_memory
+    command: 'cat /config/memory/daily/monday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
+
+  - platform: command_line
+    name: tuesday_memory
+    command: 'cat /config/memory/daily/tuesday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
+
+  - platform: command_line
+    name: wednesday_memory
+    command: 'cat /config/memory/daily/wednesday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
+
+  - platform: command_line
+    name: thursday_memory
+    command: 'cat /config/memory/daily/thursday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
+
+  - platform: command_line
+    name: friday_memory
+    command: 'cat /config/memory/daily/friday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
+
+  - platform: command_line
+    name: saturday_memory
+    command: 'cat /config/memory/daily/saturday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
+
+  - platform: command_line
+    name: sunday_memory
+    command: 'cat /config/memory/daily/sunday.json 2>/dev/null || echo "{}"'
+    value_template: "{{ value_json.date | default('') }}"
+    scan_interval: 3600
+    json_attributes: [events, interactions, daily_memories]
