@@ -50,17 +50,6 @@ Every non-interactive call has automatic fallback: **DeepSeek → Gemini** if pr
 
 ---
 
-## Looking ahead — the v10 vision
-
-PERMEAR is evolving toward something more ambitious than "another HA automation pack":
-
-> *A memory and salience layer for the household, inspired by neurological filtering. Only events that pass the **ARAS Filter** (Ascending Reticular Activating System analog) reach the user. Memory decays through three biological tiers — ephemeral, active, stable — reinforced by repeated mentions.*
->
-
-The full plan is in [ROADMAP.md](ROADMAP.md). v7.3 is the stable foundation; v7.5+ introduces ARAS Filter and memory tiers; v10.0 will be the first HACS release.
-
----
-
 ## Quick install
 
 ```bash
