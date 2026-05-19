@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """
 v7.1-G — Weekly compilation with 3 structured inputs from ai_task.
-Receives soul_json, users_json, insights_json already parsed (no fence-strip needed).
+v7.3-B.2 — migrated to locked_update (atomic per-file updates).
+
+Receives soul_json, users_json, insights_json already parsed.
 
 Usage:
   weekly_compile.py '<soul_json>' '<users_json>' '<insights_json>'
-
-soul_json     = {"add": [...], "remove": [...]}  # for behavior_rules
-users_json    = {"user1": {"add": [...], "remove": [...]}, ...}  # observed_patterns
-insights_json = {"new_patterns": [...], "remove_patterns": [...],
-                 "new_pending": [...], "remove_pending": [...],
-                 "new_suggestions": [...]}
 """
 import json, sys, os, re, shutil, unicodedata, yaml
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from permear_config import MEMORY_DIR, AGENT_YAML, LOG_DIR, DAYS
-from lib.memory import load_json, save_json
+from lib.memory import locked_update
 
 # ---------------------------------------------------------------------------
-# Semantic helpers (deduplication via Jaccard, meta-pendency filter)
+# Semantic helpers (Jaccard dedup, meta-pendency filter)
 # ---------------------------------------------------------------------------
 
-# Common English stopwords for normalization. Add words for your language if needed.
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "of", "in", "on", "at", "to",
     "for", "with", "without", "by", "from", "as", "is", "are", "was", "were",
@@ -83,7 +78,7 @@ def backup_file(path):
 
 
 # ---------------------------------------------------------------------------
-# Apply functions
+# Apply functions (mutate state dict in-place)
 # ---------------------------------------------------------------------------
 
 def apply_soul(current, changes):
@@ -101,7 +96,7 @@ def apply_soul(current, changes):
             rules.remove(r)
             removed += 1
     current["behavior_rules"] = rules[:15]
-    return current, added, removed
+    return added, removed
 
 
 def apply_users(current, changes):
@@ -123,7 +118,7 @@ def apply_users(current, changes):
         current[user_key][field] = lst[-15:]
         if added or removed:
             user_changes.append(f"{user_key}: +{len(added)} -{len(removed)}")
-    return current, "; ".join(user_changes)
+    return "; ".join(user_changes)
 
 
 def apply_insights(current, changes):
@@ -167,7 +162,7 @@ def apply_insights(current, changes):
     current["automation_suggestions"] = existing_sug[:10]
     current["last_compilation"] = datetime.now().isoformat()
 
-    return current, counts
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +206,6 @@ def format_summary(applied, agent_autos_count):
 # ---------------------------------------------------------------------------
 
 def parse_arg(arg, name):
-    """Parse JSON arg, returns None if empty/invalid (graceful failure)."""
     if not arg or arg.strip() in ("", "{}", "[]", "null"):
         return None
     try:
@@ -226,13 +220,9 @@ def main():
         print("Usage: weekly_compile.py '<soul_json>' '<users_json>' '<insights_json>'")
         sys.exit(1)
 
-    soul_arg = sys.argv[1]
-    users_arg = sys.argv[2]
-    insights_arg = sys.argv[3]
-
-    soul_changes = parse_arg(soul_arg, "soul_json")
-    users_changes_raw = parse_arg(users_arg, "users_json")
-    insights_changes = parse_arg(insights_arg, "insights_json")
+    soul_changes = parse_arg(sys.argv[1], "soul_json")
+    users_changes_raw = parse_arg(sys.argv[2], "users_json")
+    insights_changes = parse_arg(sys.argv[3], "insights_json")
 
     insights_path = os.path.join(MEMORY_DIR, "insights.json")
     soul_path = os.path.join(MEMORY_DIR, "soul.json")
@@ -242,10 +232,6 @@ def main():
     backup_file(soul_path)
     backup_file(users_path)
 
-    insights = load_json(insights_path, {"detected_patterns": [], "pending": [], "automation_suggestions": []})
-    soul = load_json(soul_path)
-    users = load_json(users_path)
-
     applied = {
         "new_patterns": 0, "removed_patterns": 0,
         "new_suggestions_list": [],
@@ -254,31 +240,31 @@ def main():
         "users_summary": "",
     }
 
-    # Soul
+    # v7.3-B.2 — each file mutated with locked_update (separate locks)
     if soul_changes and isinstance(soul_changes, dict):
-        soul, added, removed = apply_soul(soul, soul_changes)
-        save_json(soul_path, soul)
-        applied["soul_rules_added"] = added
-        applied["soul_rules_removed"] = removed
+        with locked_update(soul_path) as soul:
+            added, removed = apply_soul(soul, soul_changes)
+            applied["soul_rules_added"] = added
+            applied["soul_rules_removed"] = removed
 
-    # Users — users_arg may come as nested JSON string (text multiline from ai_task)
     if users_changes_raw:
         if isinstance(users_changes_raw, str):
             users_changes_raw = parse_arg(users_changes_raw, "users_json_inner")
         if isinstance(users_changes_raw, dict):
-            users, users_summary = apply_users(users, users_changes_raw)
-            save_json(users_path, users)
-            applied["users_summary"] = users_summary
+            with locked_update(users_path) as users:
+                applied["users_summary"] = apply_users(users, users_changes_raw)
 
-    # Insights
     if insights_changes and isinstance(insights_changes, dict):
-        insights, ins_counts = apply_insights(insights, insights_changes)
-        save_json(insights_path, insights)
-        applied["new_patterns"] = ins_counts["new_patterns"]
-        applied["removed_patterns"] = ins_counts["removed_patterns"]
-        applied["pending_added"] = ins_counts["pending_added"]
-        applied["pending_removed"] = ins_counts["pending_removed"]
-        applied["new_suggestions_list"] = ins_counts["new_suggestions_list"]
+        with locked_update(
+            insights_path,
+            default={"detected_patterns": [], "pending": [], "automation_suggestions": []}
+        ) as insights:
+            ins_counts = apply_insights(insights, insights_changes)
+            applied["new_patterns"] = ins_counts["new_patterns"]
+            applied["removed_patterns"] = ins_counts["removed_patterns"]
+            applied["pending_added"] = ins_counts["pending_added"]
+            applied["pending_removed"] = ins_counts["pending_removed"]
+            applied["new_suggestions_list"] = ins_counts["new_suggestions_list"]
 
     print(format_summary(applied, count_agent_automations()))
 

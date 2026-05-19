@@ -302,7 +302,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Extract daily memories [skip-primary]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze today's events and interactions and extract up to 5
                   relevant memories (no trivialities). Short, factual sentences
@@ -325,7 +325,7 @@
         - service: ai_task.generate_data
           data:
             task_name: "Extract daily memories"
-            entity_id: ai_task.openrouter_deepseek_v3
+            entity_id: !secret permear_ai_task_primary
             instructions: |
               Analyze today's events and interactions and extract up to 5
               relevant memories (no trivialities). Short, factual sentences
@@ -356,7 +356,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Extract daily memories [fallback]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze today's events and interactions and extract up to 5
                   relevant memories (no trivialities). Short, factual sentences
@@ -423,7 +423,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Extract restriction [skip-primary]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   The user responded to an alert with: "{{ trigger.event.data.text }}"
                   Their last message from the agent was: "{{ states('input_text.permear_last_agent_message') }}"
@@ -441,7 +441,7 @@
         - service: ai_task.generate_data
           data:
             task_name: "Extract restriction"
-            entity_id: ai_task.openrouter_deepseek_v3
+            entity_id: !secret permear_ai_task_primary
             instructions: |
               The user responded to an alert with: "{{ trigger.event.data.text }}"
               Their last message from the agent was: "{{ states('input_text.permear_last_agent_message') }}"
@@ -467,7 +467,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Extract restriction [fallback]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   The user responded to an alert with: "{{ trigger.event.data.text }}"
                   Their last message from the agent was: "{{ states('input_text.permear_last_agent_message') }}"
@@ -543,7 +543,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Weekly compile - soul [skip-primary]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze the 7 daily files of this week. Propose AT MOST 1 new
                   behavior rule AND 1 rule to remove, based on patterns in
@@ -571,7 +571,7 @@
         - service: ai_task.generate_data
           data:
             task_name: "Weekly compile - soul"
-            entity_id: ai_task.openrouter_deepseek_v3
+            entity_id: !secret permear_ai_task_primary
             instructions: |
               Analyze the 7 daily files of this week. Propose AT MOST 1 new
               behavior rule AND 1 rule to remove, based on patterns in
@@ -607,7 +607,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Weekly compile - soul [fallback]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze the 7 daily files of this week. Propose AT MOST 1 new
                   behavior rule AND 1 rule to remove, based on patterns in
@@ -649,7 +649,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Weekly compile - users [skip-primary]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze this week's interactions and propose observed patterns
                   per user. MAX 2 new per user, only with 3+ occurrences.
@@ -671,7 +671,7 @@
         - service: ai_task.generate_data
           data:
             task_name: "Weekly compile - users"
-            entity_id: ai_task.openrouter_deepseek_v3
+            entity_id: !secret permear_ai_task_primary
             instructions: |
               Analyze this week's interactions and propose observed patterns
               per user. MAX 2 new per user, only with 3+ occurrences.
@@ -701,7 +701,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Weekly compile - users [fallback]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze this week's interactions and propose observed patterns
                   per user. MAX 2 new per user, only with 3+ occurrences.
@@ -737,7 +737,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Weekly compile - insights [skip-primary]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze this week's events and interactions. Propose:
                   - MAX 3 new_patterns (observed on 3+ days)
@@ -768,7 +768,7 @@
         - service: ai_task.generate_data
           data:
             task_name: "Weekly compile - insights"
-            entity_id: ai_task.openrouter_deepseek_v3
+            entity_id: !secret permear_ai_task_primary
             instructions: |
               Analyze this week's events and interactions. Propose:
               - MAX 3 new_patterns (observed on 3+ days)
@@ -807,7 +807,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Weekly compile - insights [fallback]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Analyze this week's events and interactions. Propose:
                   - MAX 3 new_patterns (observed on 3+ days)
@@ -982,7 +982,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Parse automation request [skip-primary]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Parse the user's automation request into structured fields.
 
@@ -1019,7 +1019,7 @@
         - service: ai_task.generate_data
           data:
             task_name: "Parse automation request"
-            entity_id: ai_task.openrouter_deepseek_v3
+            entity_id: !secret permear_ai_task_primary
             instructions: |
               Parse the user's automation request into structured fields.
 
@@ -1064,7 +1064,7 @@
             - service: ai_task.generate_data
               data:
                 task_name: "Parse automation request [fallback]"
-                entity_id: ai_task.google_ai_task
+                entity_id: !secret permear_ai_task_secondary
                 instructions: |
                   Parse the user's automation request into structured fields.
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Append event or interaction to the daily file."""
+"""Append event or interaction to the daily file.
+v7.3-B.2 — migrated to locked_update for atomic read-modify-write."""
 import sys, os
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from permear_config import *
-from lib.memory import load_json, save_json
+from lib.memory import locked_update
 
 
 def get_daily_path():
@@ -23,19 +24,6 @@ def new_daily(date_str):
     }
 
 
-def load_daily():
-    path = get_daily_path()
-    today = datetime.now().strftime("%Y-%m-%d")
-    data = load_json(path, new_daily(today))
-    if data.get("date") != today:
-        return new_daily(today)
-    return data
-
-
-def save_daily(data):
-    save_json(get_daily_path(), data)
-
-
 def main():
     if len(sys.argv) < 3:
         print("Usage: append_daily.py <type> <detail>")
@@ -46,29 +34,35 @@ def main():
     kind = sys.argv[1]
     detail = " ".join(sys.argv[2:])
     time_str = datetime.now().strftime("%H:%M")
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = get_daily_path()
 
-    daily = load_daily()
+    # v7.3-B.2 — atomic read-modify-write via locked_update
+    with locked_update(path, default=new_daily(today)) as daily:
+        # Reset if loaded file is from another day (weekly recycle)
+        if daily.get("date") != today:
+            daily.clear()
+            daily.update(new_daily(today))
 
-    if kind == "event":
-        existing = [e for e in daily["events"] if e["time"] == time_str and e["detail"] == detail]
-        if not existing:
-            daily["events"].append({"time": time_str, "type": "auto", "detail": detail})
+        if kind == "event":
+            existing = [e for e in daily["events"] if e["time"] == time_str and e["detail"] == detail]
+            if not existing:
+                daily["events"].append({"time": time_str, "type": "auto", "detail": detail})
 
-    elif kind == "interaction":
-        parts = detail.split(":", 1)
-        channel = parts[0] if len(parts) > 1 else "unknown"
-        summary = parts[1] if len(parts) > 1 else detail
-        daily["interactions"].append({"time": time_str, "channel": channel, "summary": summary.strip()})
+        elif kind == "interaction":
+            parts = detail.split(":", 1)
+            channel = parts[0] if len(parts) > 1 else "unknown"
+            summary = parts[1] if len(parts) > 1 else detail
+            daily["interactions"].append({"time": time_str, "channel": channel, "summary": summary.strip()})
 
-    elif kind == "memory":
-        if detail not in daily["daily_memories"]:
-            daily["daily_memories"].append(detail)
+        elif kind == "memory":
+            if detail not in daily["daily_memories"]:
+                daily["daily_memories"].append(detail)
 
-    elif kind == "flag":
-        if detail in daily:
-            daily[detail] = True
+        elif kind == "flag":
+            if detail in daily:
+                daily[detail] = True
 
-    save_daily(daily)
     print(f"OK: {kind} recorded at {time_str}")
 
 

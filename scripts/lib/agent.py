@@ -1,5 +1,6 @@
 """
 v7.1-H — Circuit breaker + health helpers for LLM agent calls.
+v7.3-B.2 — Mutating functions migrated to locked_update (atomic read-modify-write).
 
 conversation.process (interactive Telegram + voice) managed by YAML retry.
 ai_task.generate_data (non-interactive cycles) managed natively by HA.
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from permear_config import AGENT_CIRCUIT_PATH, ARCHIVED_ERRORS_PATH
-from lib.memory import load_json, save_json, parse_iso
+from lib.memory import load_json, locked_update, parse_iso
 
 STATE_PATH = AGENT_CIRCUIT_PATH
 FAILURE_THRESHOLD = 3
@@ -27,15 +28,12 @@ _DEFAULT_STATE = {
 
 
 def load_state():
+    """Read-only access to circuit state."""
     return load_json(STATE_PATH, default=dict(_DEFAULT_STATE))
 
 
-def save_state(state):
-    save_json(STATE_PATH, state)
-
-
-def reset_daily_if_needed(state):
-    """Reset daily counters if date changed."""
+def _reset_daily_inplace(state):
+    """Reset daily counters if date changed. Mutates state dict in place."""
     today = datetime.now().strftime("%Y-%m-%d")
     stats = state.get("daily_stats", {})
     if stats.get("date") != today:
@@ -45,9 +43,8 @@ def reset_daily_if_needed(state):
             "retries_recovered": 0,
             "failures_3x": 0,
             "circuit_opens": 0,
-            "fallbacks_secondary": 0,  # v7.1-I
+            "fallbacks_secondary": 0,
         }
-    return state
 
 
 def cmd_check():
@@ -61,37 +58,32 @@ def cmd_check():
 
 
 def cmd_fail():
-    state = load_state()
     now = datetime.now()
-    last_fail = parse_iso(state.get("last_failure_at"))
+    with locked_update(STATE_PATH, default=dict(_DEFAULT_STATE)) as state:
+        last_fail = parse_iso(state.get("last_failure_at"))
+        if last_fail and (now - last_fail) > timedelta(minutes=WINDOW_MINUTES):
+            state["consecutive_failures"] = 0
 
-    if last_fail and (now - last_fail) > timedelta(minutes=WINDOW_MINUTES):
-        state["consecutive_failures"] = 0
+        state["consecutive_failures"] += 1
+        state["last_failure_at"] = now.isoformat()
 
-    state["consecutive_failures"] += 1
-    state["last_failure_at"] = now.isoformat()
-
-    if state["consecutive_failures"] >= FAILURE_THRESHOLD:
-        open_until = now + timedelta(minutes=COOLDOWN_MINUTES)
-        state["circuit_open_until"] = open_until.isoformat()
-        state["total_opens"] = state.get("total_opens", 0) + 1
-        state["consecutive_failures"] = 0
-        state = reset_daily_if_needed(state)
-        state["daily_stats"]["circuit_opens"] += 1
-        save_state(state)
-        print(f"CIRCUIT_OPEN: until {open_until.strftime('%H:%M')} ({COOLDOWN_MINUTES} min)")
-        return
-
-    save_state(state)
-    print(f"FAIL_COUNT: {state['consecutive_failures']}/{FAILURE_THRESHOLD}")
+        if state["consecutive_failures"] >= FAILURE_THRESHOLD:
+            open_until = now + timedelta(minutes=COOLDOWN_MINUTES)
+            state["circuit_open_until"] = open_until.isoformat()
+            state["total_opens"] = state.get("total_opens", 0) + 1
+            state["consecutive_failures"] = 0
+            _reset_daily_inplace(state)
+            state["daily_stats"]["circuit_opens"] += 1
+            print(f"CIRCUIT_OPEN: until {open_until.strftime('%H:%M')} ({COOLDOWN_MINUTES} min)")
+            return
+    print(f"FAIL_COUNT recorded")
 
 
 def cmd_success():
-    state = load_state()
-    state["consecutive_failures"] = 0
-    state["last_success_at"] = datetime.now().isoformat()
-    state["circuit_open_until"] = None
-    save_state(state)
+    with locked_update(STATE_PATH, default=dict(_DEFAULT_STATE)) as state:
+        state["consecutive_failures"] = 0
+        state["last_success_at"] = datetime.now().isoformat()
+        state["circuit_open_until"] = None
     print("OK")
 
 
@@ -102,34 +94,33 @@ def cmd_status():
 
 
 def cmd_log_503():
-    state = load_state()
-    state = reset_daily_if_needed(state)
-    state["daily_stats"]["errors_503_seen"] += 1
-    save_state(state)
+    with locked_update(STATE_PATH, default=dict(_DEFAULT_STATE)) as state:
+        _reset_daily_inplace(state)
+        state["daily_stats"]["errors_503_seen"] += 1
     print("OK")
 
 
 def cmd_log_retry_success():
-    state = load_state()
-    state = reset_daily_if_needed(state)
-    state["daily_stats"]["retries_recovered"] += 1
-    save_state(state)
+    with locked_update(STATE_PATH, default=dict(_DEFAULT_STATE)) as state:
+        _reset_daily_inplace(state)
+        state["daily_stats"]["retries_recovered"] += 1
     print("OK")
 
 
 def cmd_log_3fail():
-    state = load_state()
-    state = reset_daily_if_needed(state)
-    state["daily_stats"]["failures_3x"] += 1
-    save_state(state)
+    with locked_update(STATE_PATH, default=dict(_DEFAULT_STATE)) as state:
+        _reset_daily_inplace(state)
+        state["daily_stats"]["failures_3x"] += 1
     print("OK")
 
 
 def cmd_daily_summary():
-    """Summary for briefing. Prints empty if zero activity."""
     state = load_state()
-    state = reset_daily_if_needed(state)
-    stats = state["daily_stats"]
+    # Compute summary from snapshot
+    today = datetime.now().strftime("%Y-%m-%d")
+    raw_stats = state.get("daily_stats", {})
+    stats = raw_stats if raw_stats.get("date") == today else {}
+
     total = (stats.get("errors_503_seen", 0)
              + stats.get("failures_3x", 0)
              + stats.get("circuit_opens", 0))
@@ -149,23 +140,22 @@ def cmd_daily_summary():
 
 
 def increment_fallback_count():
-    """Increment fallback counter for secondary provider. v7.1-I"""
-    state = load_state()
-    state = reset_daily_if_needed(state)
-    state["daily_stats"]["fallbacks_secondary"] = state["daily_stats"].get("fallbacks_secondary", 0) + 1
-    state["last_fallback_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_state(state)
-    return state["daily_stats"]["fallbacks_secondary"]
+    """v7.1-I — Increment fallback counter for secondary provider."""
+    count = 0
+    with locked_update(STATE_PATH, default=dict(_DEFAULT_STATE)) as state:
+        _reset_daily_inplace(state)
+        state["daily_stats"]["fallbacks_secondary"] = state["daily_stats"].get("fallbacks_secondary", 0) + 1
+        state["last_fallback_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        count = state["daily_stats"]["fallbacks_secondary"]
+    return count
 
 
 def get_health_summary_for_prompt():
-    """
-    Returns 1-line English description of system health to include
-    in briefing/pre-briefing prompts. Returns empty string if all OK.
-    """
+    """Returns 1-line description of system health for briefing prompts."""
     state = load_state()
-    state = reset_daily_if_needed(state)
-    stats = state.get("daily_stats", {})
+    today = datetime.now().strftime("%Y-%m-%d")
+    raw_stats = state.get("daily_stats", {})
+    stats = raw_stats if raw_stats.get("date") == today else {}
 
     archived = load_json(ARCHIVED_ERRORS_PATH, default={"errors": {}})
     archived_count = len(archived.get("errors", {}))

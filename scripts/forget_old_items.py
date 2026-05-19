@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
 v7.0 — Active forgetting: archives patterns and pending items without mention for 30+ days.
-
-State in insights.json (new field):
-  "_timestamps": {
-    "detected_patterns": {"<text>": "<iso datetime last_seen>"},
-    "pending":           {"<text>": "<iso datetime last_seen>"}
-  }
-
-Output file: insights_archived.json
-  {"items": [{"type": ..., "text": ..., "last_seen": ..., "archived_at": ...}]}
+v7.3-B.2 — migrated to locked_update for atomic read-modify-write.
 """
 import sys
 import os
 from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib.memory import load_json, save_json, parse_iso
+from lib.memory import locked_update, parse_iso
 from permear_config import MEMORY_DIR, INSIGHTS_ARCHIVED_PATH
 
 INSIGHTS_PATH = os.path.join(MEMORY_DIR, "insights.json")
@@ -73,26 +65,27 @@ def archive_old_items(insights):
     return insights, archived_items
 
 
-def append_to_archive(items):
-    archive = load_json(INSIGHTS_ARCHIVED_PATH, default={"items": []})
-    archive["items"].extend(items)
-    archive["last_run"] = datetime.now().isoformat()
-    save_json(INSIGHTS_ARCHIVED_PATH, archive)
-
-
 def main():
-    insights = load_json(INSIGHTS_PATH)
-    if not insights:
+    # v7.3-B.2 — atomic read-modify-write
+    archived = []
+    found_data = False
+    with locked_update(INSIGHTS_PATH) as insights:
+        if not insights:
+            return
+        found_data = True
+        insights = ensure_timestamps(insights)
+        insights, archived = archive_old_items(insights)
+
+    if not found_data:
         print("insights.json empty or not found.")
         return
 
-    insights = ensure_timestamps(insights)
-    insights, archived = archive_old_items(insights)
-
-    save_json(INSIGHTS_PATH, insights)
-
     if archived:
-        append_to_archive(archived)
+        # Append to archive (separate file, separate lock)
+        with locked_update(INSIGHTS_ARCHIVED_PATH, default={"items": []}) as archive:
+            archive["items"].extend(archived)
+            archive["last_run"] = datetime.now().isoformat()
+
         print(f"Archived {len(archived)} old item(s):")
         for a in archived:
             print(f"  [{a['type']}] {a['text'][:80]}")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 v6.x — Manages errors archived ("silenced 24h") via Telegram button.
-State in /config/memory/archived_errors.json.
-Auto-expires after 24h (cleanup on query).
+State in /config/memory/archived_errors.json. Auto-expires after 24h.
+v7.3-B.2 — migrated to locked_update for atomic read-modify-write.
 
 Commands:
   archive <hash> <component> <message_preview>
@@ -14,21 +14,14 @@ import sys
 import os
 from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib.memory import load_json, save_json
+from lib.memory import load_json, locked_update
 from permear_config import ARCHIVED_ERRORS_PATH
 
 EXPIRATION_HOURS = 24
 
 
-def load_state():
-    return load_json(ARCHIVED_ERRORS_PATH, default={"errors": {}})
-
-
-def save_state(state):
-    save_json(ARCHIVED_ERRORS_PATH, state)
-
-
-def cleanup_expired(state):
+def _cleanup_inplace(state):
+    """Cleanup expired entries from state dict in place. Returns count removed."""
     now = datetime.now()
     removed = 0
     keep = {}
@@ -42,44 +35,53 @@ def cleanup_expired(state):
         except (ValueError, KeyError):
             removed += 1
     state["errors"] = keep
-    return state, removed
+    return removed
 
 
 def cmd_archive(hash_val, component, message_preview):
-    state = load_state()
-    state, _ = cleanup_expired(state)
     now = datetime.now()
     expires = now + timedelta(hours=EXPIRATION_HOURS)
-    state["errors"][hash_val] = {
-        "component": component,
-        "message_preview": message_preview[:100],
-        "archived_at": now.isoformat(),
-        "expires_at": expires.isoformat(),
-    }
-    save_state(state)
+
+    with locked_update(ARCHIVED_ERRORS_PATH, default={"errors": {}}) as state:
+        _cleanup_inplace(state)
+        state["errors"][hash_val] = {
+            "component": component,
+            "message_preview": message_preview[:100],
+            "archived_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+        }
     print(f"OK: archived until {expires.strftime('%m/%d %H:%M')}")
 
 
 def cmd_is_archived(hash_val):
-    state = load_state()
-    state, removed = cleanup_expired(state)
-    if removed > 0:
-        save_state(state)
-    print("YES" if hash_val in state.get("errors", {}) else "NO")
+    # Read-only path doesn't need locked_update — just load
+    state = load_json(ARCHIVED_ERRORS_PATH, default={"errors": {}})
+    # Filter expired in-memory without writing
+    now = datetime.now()
+    is_present = False
+    for h, info in state.get("errors", {}).items():
+        if h != hash_val:
+            continue
+        try:
+            if now < datetime.fromisoformat(info["expires_at"]):
+                is_present = True
+        except (ValueError, KeyError):
+            pass
+        break
+    print("YES" if is_present else "NO")
 
 
 def cmd_cleanup():
-    state = load_state()
-    state, removed = cleanup_expired(state)
-    save_state(state)
+    with locked_update(ARCHIVED_ERRORS_PATH, default={"errors": {}}) as state:
+        removed = _cleanup_inplace(state)
     print(f"REMOVED: {removed}")
 
 
 def cmd_list():
-    state = load_state()
-    state, _ = cleanup_expired(state)
-    save_state(state)
-    errors = state.get("errors", {})
+    with locked_update(ARCHIVED_ERRORS_PATH, default={"errors": {}}) as state:
+        _cleanup_inplace(state)
+        errors = dict(state.get("errors", {}))  # snapshot for printing outside lock
+
     if not errors:
         print("No active archived errors.")
         return
