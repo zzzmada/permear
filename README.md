@@ -1,11 +1,11 @@
 # PERMEAR
 
-**Persistent Memory Architecture for Home Assistant AI agents.**
+**Persistent Memory and Salience Filter for Home Assistant.**
 
-Turn your HA + LLM into a household agent that remembers, learns, and proposes — without you babysitting it.
+An AI memory layer that learns what matters in your home — and stays silent about what doesn't.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-7.2.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-7.3.0-blue.svg)](CHANGELOG.md)
 [![HAOS](https://img.shields.io/badge/Home%20Assistant-2025.7+-blue.svg)](https://www.home-assistant.io/)
 [![RPi4 2GB](https://img.shields.io/badge/RPi4%202GB-supported-green.svg)](https://www.raspberrypi.com/)
 
@@ -13,7 +13,7 @@ Turn your HA + LLM into a household agent that remembers, learns, and proposes �
 
 ## What you get
 
-📔 **Persistent memory** — daily, weekly, indefinite (JSON files, no database needed)
+📔 **Persistent memory** — daily, weekly, indefinite (JSON files, no database)
 🔔 **Proactive Telegram contact** — alerts when something matters, silence when it doesn't
 🧠 **Daily and weekly self-reflection** — distills events into reusable patterns
 ✨ **Automation by chat** — describe what you want, agent proposes, you confirm
@@ -50,6 +50,18 @@ Every non-interactive call has automatic fallback: **DeepSeek → Gemini** if pr
 
 ---
 
+## Looking ahead — the v10 vision
+
+PERMEAR is evolving toward something more ambitious than "another HA automation pack":
+
+> *A memory and salience layer for the household, inspired by neurological filtering. Only events that pass the **ARAS Filter** (Ascending Reticular Activating System analog) reach the user. Memory decays through three biological tiers — ephemeral, active, stable — reinforced by repeated mentions.*
+>
+> *Built by a pathologist applying neurological principles to home automation.*
+
+The full plan is in [ROADMAP.md](ROADMAP.md). v7.3 is the stable foundation; v7.5+ introduces ARAS Filter and memory tiers; v10.0 will be the first HACS release.
+
+---
+
 ## Quick install
 
 ```bash
@@ -62,13 +74,13 @@ bash install.sh
 
 Follow the prompts. **Full guide:** [docs/install.md](docs/install.md).
 
-**Upgrading from v5.x?** Read [MIGRATION.md](MIGRATION.md) first.
+**Upgrading?** See [MIGRATION.md](MIGRATION.md).
 
 ---
 
 ## Requirements
 
-- Home Assistant OS or Supervised, **2025.7+** (native `ai_task.generate_data` support)
+- Home Assistant OS or Supervised, **2025.7+** (native `ai_task.generate_data`)
 - **Telegram bot** integration (polling mode)
 - **Two LLM integrations:**
   - Google Generative AI (free tier OK) — for interactive paths
@@ -107,12 +119,6 @@ See [docs/customization.md](docs/customization.md) for the full guide.
 Show PERMEAR health on your dashboard. Paste [memory/lovelace_card.yaml](memory/lovelace_card.yaml) into your dashboard's **Raw configuration editor**.
 
 Displays 🟢 / 🟡 / 🟠 / 🔴 state + fallback usage + circuit breaker status.
-
----
-
-## What's coming
-
-See [ROADMAP.md](ROADMAP.md) for v7.3 (concurrency safety, performance) and v8 plans (SQLite migration).
 
 ---
 

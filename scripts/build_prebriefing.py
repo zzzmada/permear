@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Builds the proactive pre-briefing prompt.
-v5.0: reads monitored_entities.json via REST API, includes health summary and agent automations.
+v5.0: reads monitored_entities.json, includes health summary and agent automations.
 v7.0: injects agent health line.
+v7.3-A: bulk fetch /api/states (1 call) instead of N sequential calls per entity.
 """
 import json
 import os
@@ -25,19 +26,32 @@ def load_token():
         return None
 
 
-def get_entity_state(entity_id, token):
-    url = f"{HA_URL}/api/states/{entity_id}"
+def fetch_all_states(token):
+    """
+    v7.3-A — Single bulk fetch instead of N sequential calls per entity.
+    Returns dict keyed by entity_id for O(1) lookup.
+    """
+    url = f"{HA_URL}/api/states"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     req = Request(url, headers=headers)
     try:
-        with urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            state = data.get("state", "unavailable")
-            attrs = data.get("attributes", {})
-            unit = attrs.get("unit_of_measurement", "")
-            return f"{state}{' ' + unit if unit else ''}"
-    except URLError:
+        with urlopen(req, timeout=10) as resp:
+            states = json.loads(resp.read().decode())
+        return {s["entity_id"]: s for s in states if isinstance(s, dict)}
+    except (URLError, json.JSONDecodeError) as e:
+        print(f"WARNING: bulk fetch failed ({e})", file=sys.stderr)
+        return {}
+
+
+def format_entity_state(entity_id, states_dict):
+    """Format single entity from pre-fetched dict."""
+    s = states_dict.get(entity_id)
+    if not s:
         return "unavailable"
+    state = s.get("state", "unavailable")
+    attrs = s.get("attributes", {})
+    unit = attrs.get("unit_of_measurement", "")
+    return f"{state}{' ' + unit if unit else ''}"
 
 
 def build_house_state(token):
@@ -47,11 +61,16 @@ def build_house_state(token):
     if not entities:
         return "State unavailable (monitored_entities.json empty or missing)."
 
+    # v7.3-A — Single bulk fetch + in-memory lookup
+    states_dict = fetch_all_states(token)
+    if not states_dict:
+        return "State unavailable (HA REST API not responding)."
+
     lines = []
-    for e in entities[:30]:  # limit for RPi4 performance
+    for e in entities[:30]:  # limit for RPi4 prompt size
         entity_id = e.get("entity_id", "")
         friendly = e.get("friendly_name", entity_id)
-        state = get_entity_state(entity_id, token)
+        state = format_entity_state(entity_id, states_dict)
         lines.append(f"  {friendly}: {state}")
 
     return "\n".join(lines)

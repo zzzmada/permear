@@ -2,6 +2,8 @@
 """
 CRUD for agent-managed automations in agent_automations.yaml.
 v7.1-B: JSON output mode, new commands (details, disable, enable, stats).
+v7.3-C: validate_ha_config before reload (rollback if invalid).
+v7.3-C: fix_json returns tuple (parsed, needed_repair) for circuit breaker tracking.
 
 Usage:
   manage_agent_automations.py list [--json]
@@ -18,6 +20,7 @@ import re
 import sys
 import os
 import time
+import subprocess
 import yaml
 from urllib.request import Request, urlopen
 from urllib.error import URLError
@@ -31,44 +34,64 @@ from lib.memory import load_yaml, save_yaml
 # ==============================================================================
 
 def parse_json_flag(args):
-    """Detect and remove --json from args. Returns (json_mode, clean_args)."""
     json_mode = "--json" in args
     clean_args = [a for a in args if a != "--json"]
     return json_mode, clean_args
 
 
 def emit_json(data):
-    """Print valid UTF-8 JSON without ASCII escape."""
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def fix_json(raw):
-    """Try to recover malformed JSON before giving up."""
+    """
+    v7.3-C — Returns tuple (parsed, needed_repair: bool).
+    needed_repair=True signals provider degradation (inferential).
+    """
     if not raw or not raw.strip():
-        return None
+        return None, False
+
+    # Try pure parse first
+    try:
+        return json.loads(raw), False
+    except json.JSONDecodeError:
+        pass
+
+    needed_repair = True
     text = re.sub(r'```(?:json)?\s*', '', raw).strip().rstrip('`').strip()
     try:
-        return json.loads(text)
+        return json.loads(text), needed_repair
     except json.JSONDecodeError:
         pass
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if m:
         candidate = m.group(0)
         try:
-            return json.loads(candidate)
+            return json.loads(candidate), needed_repair
         except json.JSONDecodeError:
             pass
         candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
         try:
-            return json.loads(candidate)
+            return json.loads(candidate), needed_repair
         except json.JSONDecodeError:
             pass
         candidate = candidate.replace("'", '"')
         try:
-            return json.loads(candidate)
+            return json.loads(candidate), needed_repair
         except json.JSONDecodeError:
             pass
-    return None
+    return None, needed_repair
+
+
+def log_inferential_degradation():
+    """v7.3-C — fire-and-forget log to circuit breaker when fix_json had to repair."""
+    try:
+        subprocess.run(
+            ["python3", "/config/scripts/circuit_breaker.py", "log_503"],
+            capture_output=True, timeout=3
+        )
+    except Exception:
+        pass
 
 
 # ==============================================================================
@@ -106,12 +129,40 @@ def reload_automations(token):
     return result is not None
 
 
+def validate_ha_config(token):
+    """
+    v7.3-C — Call Supervisor API to validate HA config before reload.
+    Returns (ok: bool, error_message: str).
+    Outside HAOS container (no SUPERVISOR_TOKEN): returns (True, "") for backward compat.
+    """
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not supervisor_token:
+        return True, ""
+
+    url = "http://supervisor/core/api/config/core/check_config"
+    headers = {"Authorization": f"Bearer {supervisor_token}", "Content-Type": "application/json"}
+    req = Request(url, method="POST", headers=headers)
+
+    try:
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        result = data.get("result", "unknown")
+        if result == "valid":
+            return True, ""
+        else:
+            errors = data.get("errors") or "config check failed"
+            return False, str(errors)[:500]
+    except (URLError, json.JSONDecodeError) as e:
+        print(f"WARNING: validate_ha_config failed ({e}), skipping check", file=sys.stderr)
+        return True, ""
+
+
 # ==============================================================================
-# Automation I/O (wraps lib.memory.save_yaml with post-write validation)
+# Automation I/O
 # ==============================================================================
 
 def save_automations(automations):
-    """Save and validate YAML. Returns True if OK, False if invalid."""
+    """Save and validate YAML syntax. Returns True if OK."""
     save_yaml(AGENT_YAML, automations)
     try:
         with open(AGENT_YAML, 'r') as f:
@@ -123,11 +174,10 @@ def save_automations(automations):
 
 
 # ==============================================================================
-# Summary helpers (used by list, details, stats in --json mode)
+# Summary helpers
 # ==============================================================================
 
 def _find_automation(automations, identifier):
-    """Find automation by id or alias (case-insensitive)."""
     identifier_lower = identifier.strip().lower()
     for a in automations:
         if a.get("id", "").lower() == identifier_lower or \
@@ -137,7 +187,6 @@ def _find_automation(automations, identifier):
 
 
 def _summarize_trigger(triggers):
-    """Short English summary of trigger for card display."""
     if not triggers:
         return "no trigger"
     if not isinstance(triggers, list):
@@ -167,7 +216,6 @@ def _summarize_trigger(triggers):
 
 
 def _summarize_action(actions):
-    """Short English summary of action for cards."""
     if not actions:
         return "no action"
     if not isinstance(actions, list):
@@ -183,7 +231,6 @@ def _summarize_action(actions):
 # ==============================================================================
 
 def cmd_list(json_mode=False):
-    """List agent-created automations."""
     automations = load_yaml(AGENT_YAML, default=[])
     if json_mode:
         items = []
@@ -209,7 +256,6 @@ def cmd_list(json_mode=False):
 
 
 def cmd_details(identifier, json_mode=False):
-    """Return details of a specific automation."""
     automations = load_yaml(AGENT_YAML, default=[])
     auto = _find_automation(automations, identifier)
     if not auto:
@@ -240,7 +286,6 @@ def cmd_details(identifier, json_mode=False):
 
 
 def cmd_stats(json_mode=False):
-    """General statistics of agent automations."""
     automations = load_yaml(AGENT_YAML, default=[])
     total = len(automations)
     active = sum(1 for a in automations if a.get("initial_state", "on") == "on")
@@ -271,28 +316,28 @@ def cmd_stats(json_mode=False):
 
 
 # ==============================================================================
-# Commands - create / remove
+# Commands - create / remove (with validate-before-reload)
 # ==============================================================================
 
 def cmd_create(json_str, token, json_mode=False):
-    """Create automation from JSON spec."""
     if not json_str or not json_str.strip():
         if json_mode:
             emit_json({"success": False, "error": "empty JSON spec"})
         else:
-            print("ERROR: Empty spec. Pass JSON as: manage_agent_auto_create spec='{{...}}'")
+            print("ERROR: Empty spec.")
         return
 
-    try:
-        spec = json.loads(json_str)
-    except json.JSONDecodeError:
-        spec = fix_json(json_str)
-        if spec is None:
-            if json_mode:
-                emit_json({"success": False, "error": "invalid JSON and could not auto-correct"})
-            else:
-                print("ERROR: Invalid JSON and could not auto-correct.")
-            return
+    # v7.3-C — fix_json returns tuple
+    spec, needed_repair = fix_json(json_str)
+    if needed_repair:
+        log_inferential_degradation()
+
+    if spec is None:
+        if json_mode:
+            emit_json({"success": False, "error": "invalid JSON and could not auto-correct"})
+        else:
+            print("ERROR: Invalid JSON and could not auto-correct.")
+        return
 
     alias = spec.get("alias", "").strip()
     if not alias:
@@ -386,7 +431,7 @@ def cmd_create(json_str, token, json_mode=False):
         if json_mode:
             emit_json({"success": False, "error": f"max {MAX_AUTOMATIONS} automations reached"})
         else:
-            print(f"ERROR: Maximum {MAX_AUTOMATIONS} automations reached. Remove one first.")
+            print(f"ERROR: Maximum {MAX_AUTOMATIONS} automations reached.")
         return
 
     for a in automations:
@@ -416,6 +461,18 @@ def cmd_create(json_str, token, json_mode=False):
             print("ERROR: YAML validation failed. Automation not created.")
         return
 
+    # v7.3-C — Pre-reload validation via Supervisor API
+    config_ok, config_err = validate_ha_config(token)
+    if not config_ok:
+        # Automatic rollback
+        automations.pop()
+        save_automations(automations)
+        if json_mode:
+            emit_json({"success": False, "error": f"HA config invalid after add: {config_err}"})
+        else:
+            print(f"ERROR: HA config check failed: {config_err}. Automation rolled back.")
+        return
+
     reloaded = reload_automations(token)
     if json_mode:
         emit_json({"success": True, "alias": alias, "id": auto_id, "reloaded": reloaded})
@@ -427,7 +484,6 @@ def cmd_create(json_str, token, json_mode=False):
 
 
 def cmd_create_from_file(token, json_mode=False):
-    """Create automation from pending_auto_spec.json."""
     try:
         with open(PENDING_SPEC_PATH, 'r') as f:
             json_str = f.read().strip()
@@ -441,23 +497,34 @@ def cmd_create_from_file(token, json_mode=False):
 
 
 def cmd_remove(identifier, token, json_mode=False):
-    """Remove automation by alias or id."""
     automations = load_yaml(AGENT_YAML, default=[])
     identifier_lower = identifier.strip().lower()
-    found = None
+    found_idx = None
     for i, a in enumerate(automations):
         if a.get("id", "").lower() == identifier_lower or \
            a.get("alias", "").lower() == identifier_lower:
-            found = i
+            found_idx = i
             break
-    if found is None:
+    if found_idx is None:
         if json_mode:
             emit_json({"success": False, "error": f"automation '{identifier}' not found"})
         else:
             print(f"ERROR: No automation found matching '{identifier}'.")
         return
-    removed = automations.pop(found)
+    removed = automations.pop(found_idx)
     save_automations(automations)
+
+    # v7.3-C — Pre-reload validation; if invalid, reinsert the removed automation
+    config_ok, config_err = validate_ha_config(token)
+    if not config_ok:
+        automations.insert(found_idx, removed)
+        save_automations(automations)
+        if json_mode:
+            emit_json({"success": False, "error": f"HA config invalid after remove: {config_err}"})
+        else:
+            print(f"ERROR: HA config check failed: {config_err}. Automation restored.")
+        return
+
     reload_automations(token)
     if json_mode:
         emit_json({"success": True, "alias": removed.get("alias", "")})
@@ -470,7 +537,6 @@ def cmd_remove(identifier, token, json_mode=False):
 # ==============================================================================
 
 def cmd_disable(identifier, json_mode=False):
-    """Disable automation without removing."""
     automations = load_yaml(AGENT_YAML, default=[])
     auto = _find_automation(automations, identifier)
     if not auto:
@@ -488,7 +554,6 @@ def cmd_disable(identifier, json_mode=False):
 
 
 def cmd_enable(identifier, json_mode=False):
-    """Re-enable previously disabled automation."""
     automations = load_yaml(AGENT_YAML, default=[])
     auto = _find_automation(automations, identifier)
     if not auto:
@@ -521,28 +586,24 @@ def main():
 
     if command == "list":
         cmd_list(json_mode=json_mode)
-
     elif command == "create":
         if not args:
             if json_mode:
-                emit_json({"success": False, "error": "create requires JSON spec as argument"})
+                emit_json({"success": False, "error": "create requires JSON spec"})
             else:
                 print("ERROR: JSON spec required.")
             sys.exit(1)
         cmd_create(" ".join(args), token, json_mode=json_mode)
-
     elif command == "create_from_file":
         cmd_create_from_file(token, json_mode=json_mode)
-
     elif command == "remove":
         if not args:
             if json_mode:
                 emit_json({"success": False, "error": "remove requires alias or id"})
             else:
-                print("ERROR: Automation id or alias required.")
+                print("ERROR: alias or id required.")
             sys.exit(1)
         cmd_remove(args[0], token, json_mode=json_mode)
-
     elif command == "details":
         if not args:
             if json_mode:
@@ -551,7 +612,6 @@ def main():
                 print("ERROR: alias or id required")
             sys.exit(1)
         cmd_details(args[0], json_mode=json_mode)
-
     elif command == "disable":
         if not args:
             if json_mode:
@@ -560,7 +620,6 @@ def main():
                 print("ERROR: alias or id required")
             sys.exit(1)
         cmd_disable(args[0], json_mode=json_mode)
-
     elif command == "enable":
         if not args:
             if json_mode:
@@ -569,12 +628,10 @@ def main():
                 print("ERROR: alias or id required")
             sys.exit(1)
         cmd_enable(args[0], json_mode=json_mode)
-
     elif command == "stats":
         cmd_stats(json_mode=json_mode)
-
     else:
-        print(f"ERROR: Unknown command '{command}'. Use: list, create, create_from_file, remove, details, disable, enable, stats.")
+        print(f"ERROR: Unknown command '{command}'.")
         sys.exit(1)
 
 

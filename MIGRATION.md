@@ -1,13 +1,70 @@
-# Migration: PERMEAR 5.x → 7.2.0
+# Migration Guide
 
-This is a **breaking change release**. Estimated time: **15-20 minutes**.
+## From v7.2.0 → v7.3.0 (5 minutes)
+
+v7.3 is a stability release. Almost transparent for v7.2 users.
+
+### Step 1: Backup
+
+```bash
+cd /config
+tar -czf permear_v72_backup_$(date +%Y%m%d).tar.gz \
+    scripts/ memory/ automations/permear.yaml secrets.yaml
+```
+
+### Step 2: Update files
+
+```bash
+cd /tmp
+git clone https://github.com/zzzmada/permear permear_v73
+cd permear_v73
+
+# Replace scripts (keep your permear_config.py customizations)
+cp -r scripts /config/scripts.new
+cp /config/scripts/permear_config.py /config/scripts.new/   # preserve your config
+rm -rf /config/scripts
+mv /config/scripts.new /config/scripts
+chmod +x /config/scripts/*.py
+
+# Replace automation
+cp automations/permear.yaml /config/automations/permear.yaml
+```
+
+### Step 3: Add the new AI Task secrets
+
+Edit `/config/secrets.yaml` and add:
+
+```yaml
+# New in v7.3 — AI Task entities (used by !secret in permear.yaml)
+permear_ai_task_primary: ai_task.openrouter_deepseek_v3
+permear_ai_task_secondary: ai_task.google_ai_task
+```
+
+Adjust the entity IDs to match your actual HA AI Task entities (Settings → Devices & Services → look at the entity IDs of your AI Task entries).
+
+### Step 4: Restart HA
+
+That's it. No memory file changes. No configuration.yaml changes.
+
+### Verify
+
+```bash
+# Should show no errors
+tail -50 /config/home-assistant.log | grep -i "permear\|secret\|nabu"
+
+# Sensor still alive
+# Developer Tools → States → sensor.permear_health
+```
 
 ---
 
-## Before you start
+## From v5.x → v7.3.0
+
+This is a **breaking change release**. Estimated time: **20-30 minutes**.
+
+### Before you start
 
 ```bash
-# Backup everything
 cd /config
 tar -czf permear_v5_backup_$(date +%Y%m%d).tar.gz \
     scripts/ memory/ automations/permear.yaml secrets.yaml
@@ -20,13 +77,11 @@ tar -xzf permear_v5_backup_*.tar.gz
 # Restart HA
 ```
 
----
+### Step 1: Set up AI Task entities
 
-## Step 1: Set up AI Task entities
+PERMEAR 7.3 uses native `ai_task.generate_data` for non-interactive cycles.
 
-PERMEAR 7.2 uses native `ai_task.generate_data` for non-interactive cycles. You need **two AI Task entities**.
-
-### Primary: DeepSeek via OpenRouter
+**Primary: DeepSeek via OpenRouter**
 
 1. Get OpenRouter API key at https://openrouter.ai/keys
 2. HA → Settings → Devices & Services → **OpenRouter** → configure with key
@@ -34,15 +89,13 @@ PERMEAR 7.2 uses native `ai_task.generate_data` for non-interactive cycles. You 
 4. Note the entity ID (typically `ai_task.openrouter_deepseek_v3`)
 5. **Strongly recommended:** set up BYOK — see [docs/byok.md](docs/byok.md)
 
-### Secondary: Gemini (you likely already have it)
+**Secondary: Gemini (you likely already have it)**
 
 1. HA → existing Google Generative AI integration
 2. Add a sub-entry **AI Task**
 3. Note the entity ID (`ai_task.google_ai_task`)
 
-### Verify both work
-
-Developer Tools → Actions:
+**Verify both work** — Developer Tools → Actions:
 
 ```yaml
 service: ai_task.generate_data
@@ -54,11 +107,9 @@ data:
     r: { selector: { text: {} } }
 ```
 
-Should return `data.r: OK`. Repeat with `ai_task.google_ai_task`.
+Should return `data.r: OK`. Repeat with secondary.
 
----
-
-## Step 2: Replace PERMEAR files
+### Step 2: Replace PERMEAR files
 
 **Don't merge** — replace completely. This avoids git conflicts.
 
@@ -83,60 +134,48 @@ chmod 444 /config/memory/guidelines.json
 chmod +x /config/scripts/*.py
 ```
 
----
+### Step 3: Update permear_config.py
 
-## Step 3: Update permear_config.py
-
-Edit `/config/scripts/permear_config.py`:
+Edit `/config/scripts/permear_config.py` — verify:
 
 ```python
-AI_TASK_PRIMARY = "ai_task.openrouter_deepseek_v3"   # your primary entity ID
-AI_TASK_SECONDARY = "ai_task.google_ai_task"          # your secondary entity ID
+AI_TASK_PRIMARY = "ai_task.openrouter_deepseek_v3"
+AI_TASK_SECONDARY = "ai_task.google_ai_task"
 ```
 
-Also verify `DAYS` list matches your daily file names. Default is English (`monday.json` etc.). If you have Portuguese filenames, either:
-- Rename your files (`mv segunda.json monday.json` etc.), OR
-- Edit `DAYS` to match your filenames.
+### Step 4: Translate memory files (if needed)
 
----
+If your `soul.json`, `users.json`, `insights.json` were in another language, translate keys to English. New code expects:
 
-## Step 4: Translate memory files (if needed)
-
-If your `soul.json`, `users.json`, `insights.json` were in another language (Portuguese), translate keys to English. The new code expects:
-
-| File | New keys (v7.2) |
+| File | New keys |
 |---|---|
 | `soul.json` | `name`, `mission`, `tone`, `values`, `behavior_rules` |
 | `users.json` per user | `role`, `response_style`, `primary_channel`, `preferred_temperature`, `interests`, `restrictions`, `observed_patterns` |
 | `insights.json` | `last_compilation`, `detected_patterns`, `pending`, `automation_suggestions`, `_timestamps` |
 | daily files | `date`, `events`, `interactions`, `daily_memories`, `briefing_sent`, `bulletin_triggered` |
 
-For most users from English-based v5.x, no changes needed. Compare with `memory/*.example.json` if unsure.
+For most users on English-based v5.x, no changes needed. Compare with `memory/*.example.json` if unsure.
 
----
+### Step 5: Update secrets.yaml
 
-## Step 5: Update secrets.yaml
-
-Add (if missing):
+Add to `/config/secrets.yaml`:
 
 ```yaml
 permear_chat_id: YOUR_TELEGRAM_CHAT_ID
 permear_agent_id: conversation.your_interactive_agent
 permear_person_entity: person.your_name
+permear_ai_task_primary: ai_task.openrouter_deepseek_v3
+permear_ai_task_secondary: ai_task.google_ai_task
 ```
 
----
-
-## Step 6: Update configuration.yaml
+### Step 6: Update configuration.yaml
 
 Remove old PERMEAR `shell_command:` and `sensor:` blocks. Paste contents of `configuration_additions.yaml` from the new repo.
 
----
-
-## Step 7: Validate and restart
+### Step 7: Validate and restart
 
 ```bash
-# Validate Python imports
+# Validate Python
 python3 -c "
 import sys
 sys.path.insert(0, '/config/scripts')
@@ -160,19 +199,20 @@ print('YAML OK')
 
 Then HA → Settings → System → **Restart**.
 
----
+### Step 8: Smoke test
 
-## Step 8: Smoke test
+1. **Sensor exists:** Developer Tools → States → `sensor.permear_health` → state should be `all_ok`
+2. **AI Task works:** force pre-briefing — `service: automation.trigger`, target: `automation.permear_prebriefing`, data: `skip_condition: true`
+3. **Telegram works:** send "hi" to your bot
+4. **List automations works:** send `/list_automations`
 
-1. **Sensor exists:** Developer Tools → States → `sensor.permear_health` → state should be `all_ok` or `recovering`
-2. **AI Task works:** force pre-briefing manually:
-   ```yaml
-   service: automation.trigger
-   target: { entity_id: automation.permear_prebriefing }
-   data: { skip_condition: true }
-   ```
-3. **Telegram works:** send "hi" to your bot — should respond
-4. **List automations works:** send `/list_automations` — should respond
+### Rollback if needed
+
+```bash
+cd /config
+tar -xzf permear_v5_backup_*.tar.gz
+# Restart HA
+```
 
 ---
 
@@ -180,19 +220,9 @@ Then HA → Settings → System → **Restart**.
 
 | Symptom | Fix |
 |---|---|
-| `sensor.permear_health` unavailable | Create empty state: `echo '{}' > /config/memory/agent_circuit.json`, reload sensors |
-| `429` errors in logs | Set up BYOK (see [docs/byok.md](docs/byok.md)) |
-| YAML parse error | Re-paste `configuration_additions.yaml` carefully, check indentation |
+| `sensor.permear_health` unavailable | `echo '{}' > /config/memory/agent_circuit.json`, reload sensors |
+| `429` errors in logs | Set up BYOK ([docs/byok.md](docs/byok.md)) |
+| YAML parse error | Check indentation in `configuration_additions.yaml` |
 | Callbacks not working | Reload Automations after restart |
 
----
-
-## Rollback
-
-```bash
-cd /config
-tar -xzf /config/permear_v5_backup_*.tar.gz
-# Restart HA
-```
-
-Need help? Open an issue at https://github.com/zzzmada/permear/issues with HA log excerpt.
+Need help? Open an issue at https://github.com/zzzmada/permear/issues.

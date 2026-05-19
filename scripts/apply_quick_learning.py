@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
 v7.1-E — Simplified apply_quick_learning.
+v7.3-B.2 — migrated to locked_update for atomic read-modify-write.
 
-Receives the restriction as a direct string (ai_task guarantees schema).
-No json.loads, no markdown fence strip, no try/except parsing.
+Optional feature: extracts a restriction from natural-language chat reply
+('I know', 'not relevant', 'don't alert') and saves to users.json.
+
+If you don't use it, you can safely remove the permear_quick_learning
+automation from permear.yaml and this script.
 
 Usage: apply_quick_learning.py "restriction string"
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib.memory import load_json, save_json
+from lib.memory import locked_update
 from permear_config import MEMORY_DIR
 
 
@@ -31,29 +35,27 @@ def main():
         return
 
     users_path = os.path.join(MEMORY_DIR, "users.json")
-    users = load_json(users_path)
 
-    # Detect primary user (first key in dict)
-    if not users:
-        print("No user configured in users.json.")
-        return
+    # v7.3-B.2 — atomic read-modify-write
+    with locked_update(users_path) as users:
+        if not users:
+            print("No user configured in users.json.")
+            return
 
-    user_key = list(users.keys())[0]
-    restrictions = users[user_key].get("restrictions", [])
+        user_key = list(users.keys())[0]
+        restrictions = users[user_key].get("restrictions", [])
 
-    # Case-insensitive dedup
-    existing_lower = [r.lower() for r in restrictions]
-    if restriction.lower() in existing_lower:
-        print(f"Restriction already registered: '{restriction[:60]}'")
-        return
+        existing_lower = [r.lower() for r in restrictions]
+        if restriction.lower() in existing_lower:
+            print(f"Restriction already registered: '{restriction[:60]}'")
+            return
 
-    if len(restrictions) >= 15:
-        print(f"15-restriction limit reached for {user_key}. Not added.")
-        return
+        if len(restrictions) >= 15:
+            print(f"15-restriction limit reached for {user_key}. Not added.")
+            return
 
-    restrictions.append(restriction)
-    users[user_key]["restrictions"] = restrictions
-    save_json(users_path, users)
+        restrictions.append(restriction)
+        users[user_key]["restrictions"] = restrictions
 
     print(f"Restriction added for {user_key}: '{restriction[:60]}'")
 
