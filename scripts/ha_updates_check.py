@@ -19,7 +19,7 @@ def supervisor_api(endpoint):
     token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not token:
         try:
-            with open(TOKEN_PATH, 'r') as f:
+            with open("/config/.permear_token", 'r') as f:
                 token = f.read().strip()
         except FileNotFoundError:
             return None
@@ -47,7 +47,7 @@ def main():
         current = data.get("version", "?")
         latest = data.get("version_latest", "?")
         if current != latest:
-            parts.append(f"HA_CORE: {current} -> {latest} available")
+            parts.append(f"HA_CORE: {current} -> {latest} disponivel")
 
     # Addon updates
     addons = supervisor_api("addons")
@@ -74,9 +74,9 @@ def main():
             free_gb = round(disk_free / 1024, 1) if disk_free > 1024 else disk_free
             unit = "GB" if disk_free > 1024 else "MB"
             if pct >= 80:
-                parts.append(f"DISK: {pct}% used ({free_gb}{unit} free) - ATTENTION")
+                parts.append(f"DISCO: {pct}% usado ({free_gb}{unit} livre) - ATENCAO")
             else:
-                parts.append(f"DISK: {pct}% used ({free_gb}{unit} free)")
+                parts.append(f"DISCO: {pct}% usado ({free_gb}{unit} livre)")
 
     if parts:
         print("\n".join(parts))

@@ -1,9 +1,7 @@
 """
-v7.0 — JSON/YAML I/O for memory files.
-v7.3-B.2 — File locking (fcntl.flock) + atomic write (temp+rename) for save_json.
-v7.3-B.2 — Added locked_update context manager for atomic read-modify-write.
-
-Replaces duplicated load_json/save_json/parse_iso functions across scripts.
+v7.0 — JSON file I/O for memory.
+v7.3-B.2 — save_json with atomic write (temp+rename + LOCK_EX);
+            locked_update() context manager for atomic read-modify-write.
 """
 import json
 import os
@@ -13,7 +11,7 @@ from datetime import datetime
 
 
 def load_json(path, default=None):
-    """Load JSON with safe fallback. Default {} if not specified."""
+    """Load JSON with a safe fallback. Default {} if not specified."""
     if default is None:
         default = {}
     try:
@@ -26,8 +24,8 @@ def load_json(path, default=None):
 def save_json(path, data, indent=2):
     """
     v7.3-B.2 — Save JSON with atomic write via temp+rename.
-    Acquires LOCK_EX on lock file to prevent concurrent writes.
-    Creates parent directory if needed. UTF-8 forced.
+    Acquires LOCK_EX on a .lock file to prevent concurrent writes.
+    Creates the parent directory if needed. UTF-8 encoding enforced.
     """
     parent = os.path.dirname(path)
     if parent:
@@ -53,15 +51,17 @@ def locked_update(path, default=None):
     """
     v7.3-B.2 — Context manager for atomic read-modify-write.
 
-    Acquires LOCK_EX before reading, holds during modification,
+    Acquires LOCK_EX before reading, holds it during mutation,
     saves atomically, releases on exit.
 
     Usage:
         with locked_update('/config/memory/foo.json', default={}) as data:
             data['key'] = 'value'
-            # auto-save on exit
+            # auto-saved on exit (if no exception)
 
-    If exception during block, file NOT saved (lock released).
+    If an exception occurs inside the block, the file is NOT saved (lock
+    released). Mutations must be made in-place on the yielded object — do not
+    reassign the local variable to a new object.
     """
     if default is None:
         default = {}
@@ -71,22 +71,23 @@ def locked_update(path, default=None):
         os.makedirs(parent, exist_ok=True)
 
     lock_path = path + ".lock"
+    tmp_path = path + ".tmp"
 
     with open(lock_path, "w") as lock_f:
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
         try:
-            # Read inside lock
+            # Read inside the lock
             try:
                 with open(path) as f:
                     data = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
-                data = default if isinstance(default, (dict, list)) else dict(default)
+                # Deep copy via JSON so we don't share the default object
+                data = json.loads(json.dumps(default))
 
-            # Yield to user for mutation
+            # Yield control for mutations
             yield data
 
-            # Save inside lock (atomic via temp+rename)
-            tmp_path = path + ".tmp"
+            # Save inside the lock (atomic via temp+rename)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.flush()
@@ -97,7 +98,7 @@ def locked_update(path, default=None):
 
 
 def parse_iso(s):
-    """Parse ISO datetime tolerantly. Returns None if invalid."""
+    """Tolerant ISO datetime parse. Returns None if invalid."""
     if not s:
         return None
     try:
@@ -111,7 +112,7 @@ def parse_iso(s):
 
 # v7.1-B — YAML helpers (used by manage_agent_automations)
 def load_yaml(path, default=None):
-    """Load YAML with safe fallback. Default [] if not specified."""
+    """Load YAML with a safe fallback. Default [] if not specified."""
     import yaml
     if default is None:
         default = []
@@ -124,7 +125,7 @@ def load_yaml(path, default=None):
 
 
 def save_yaml(path, data):
-    """Save YAML creating parent directory if needed."""
+    """Save YAML, creating the parent directory if needed."""
     import yaml
     parent = os.path.dirname(path)
     if parent:

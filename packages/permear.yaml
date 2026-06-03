@@ -1,0 +1,232 @@
+# packages/permear.yaml — PERMEAR v8
+# All PERMEAR-specific HA configuration in one place.
+# Loaded automatically via: homeassistant: packages: !include_dir_named packages/
+#
+# Contains: shell_commands (Python script bridges), PERMEAR input entities,
+# and command_line sensors (Organic Memory, ARAS stats, health, config).
+
+# ---------------------------------------------------------------------------
+# Shell commands — Python script bridges called by YAML automations
+# ---------------------------------------------------------------------------
+shell_command:
+  # Organic Memory — event/interaction/flag recording
+  record_event: 'python3 /config/scripts/record_event.py "{{ detalhe }}" "{{ entity_id | default("") }}"'
+  record_flag: 'python3 /config/scripts/record_flag.py "{{ name }}" "{{ value | default(''true'') }}"'
+  record_interaction: 'python3 /config/scripts/record_interaction.py "{{ canal }}" "{{ content }}"'
+  mark_reaction: 'python3 /config/scripts/mark_reaction.py'
+  memory_record_emit: >-
+    python3 /config/scripts/memory_record_emit.py "{{ content }}" "{{ key }}"
+  run_memory_maintenance: 'python3 /config/scripts/run_memory_maintenance.py'
+  cleanup_event_buffer: 'python3 -c "import sys; sys.path.insert(0,\"/config/scripts\"); from lib.memory_db import init_db, cleanup_old_events, reset_daily_flags; init_db(); e=cleanup_old_events(); f=reset_daily_flags(); print(f\"cleanup: {e} events, {f} flags removed\")"'
+  init_memory_db: 'python3 /config/scripts/init_memory_db.py'
+  seed_memory_test: 'python3 /config/scripts/seed_memory_test.py'
+  clear_memory_seeds: 'python3 /config/scripts/seed_memory_test.py clear'
+
+  # Sleep Consolidation cycle
+  build_sleep_prompt: "python3 /config/scripts/build_sleep_prompt.py"
+  apply_sleep_memories: "python3 /config/scripts/apply_sleep_memories.py '{{ memorias_json }}'"
+  sleep_simple: 'python3 /config/scripts/sleep_simple.py'
+
+  # Systems Consolidation cycle
+  build_systems_prompt: 'python3 /config/scripts/build_systems_prompt.py'
+  systems_compile: "python3 /config/scripts/systems_compile.py '{{ insights }}'"
+  forget_old_items: 'python3 /config/scripts/forget_old_items.py'
+  debug_log_weekly: "python3 /config/scripts/debug_log_weekly.py '{{ attempt }}' '{{ text }}'"
+
+  # Heartbeat cycle
+  build_heartbeat_prompt: 'python3 /config/scripts/build_heartbeat.py "{{ health }}"'
+  aras_log_stats: 'python3 /config/scripts/aras_log_stats.py "{{ total }}" "{{ emit }}" "{{ gray }}" "{{ suppress }}" "{{ llm_calls }}" "{{ emit_threshold }}"'
+  aras_evaluate_one: 'python3 /config/scripts/aras_evaluate_one.py "{{ content }}" "{{ entity_id }}"'
+  ha_log_monitor: 'python3 /config/scripts/ha_log_monitor.py'
+
+  # Wake cycle — entity discovery and priority
+  discover_entities: 'python3 /config/scripts/discover_entities.py'
+  add_monitored_entity: "python3 /config/scripts/discover_entities.py --add '{{ entity_id }}' '{{ friendly_name }}'"
+  remove_monitored_entity: "python3 /config/scripts/discover_entities.py --remove '{{ entity_id }}'"
+  set_entity_priority: 'python3 /config/scripts/set_entity_priority.py "{{ entity_id }}" "{{ priority }}"'
+  cat_pending_priority: "cat /config/memory/pending_priority.json 2>/dev/null || echo '{\"entities\":[]}'"
+  generate_buffer_events: 'python3 /config/scripts/generate_buffer_events.py'
+
+  # Fallback and health tracking
+  agent_log_fallback: 'python3 /config/scripts/log_fallback.py'
+  # circuit_breaker.py: inactive since v7.7 ai_task migration (kept for rollback)
+  agent_circuit_check: 'python3 /config/scripts/circuit_breaker.py check'
+  agent_circuit_fail: 'python3 /config/scripts/circuit_breaker.py fail'
+  agent_circuit_success: 'python3 /config/scripts/circuit_breaker.py success'
+  agent_log_retry_success: 'python3 /config/scripts/circuit_breaker.py log_retry_success'
+  agent_log_3fail: 'python3 /config/scripts/circuit_breaker.py log_3fail'
+  agent_daily_summary: 'python3 /config/scripts/circuit_breaker.py daily_summary'
+
+  # Error monitoring and archiving
+  process_log_event: "python3 /config/scripts/process_log_event.py '{{ component }}' '{{ message }}'"
+  archive_error: "python3 /config/scripts/manage_archived.py archive '{{ error_hash }}' '{{ component }}' '{{ message }}'"
+  cleanup_archived_errors: "python3 /config/scripts/manage_archived.py cleanup"
+
+  # Agent-managed automations
+  manage_agent_auto_create: "python3 /config/scripts/manage_agent_automations.py create '{{ spec }}'"
+  manage_agent_auto_create_from_file: 'python3 /config/scripts/manage_agent_automations.py create_from_file'
+  manage_agent_auto_remove: "python3 /config/scripts/manage_agent_automations.py remove '{{ identifier }}'"
+  manage_agent_auto_list: 'python3 /config/scripts/manage_agent_automations.py list'
+  agent_auto_list_json: "python3 /config/scripts/manage_agent_automations.py list --json"
+  agent_auto_details_json: "python3 /config/scripts/manage_agent_automations.py details '{{ identifier }}' --json"
+  agent_auto_disable_json: "python3 /config/scripts/manage_agent_automations.py disable '{{ identifier }}' --json"
+  agent_auto_enable_json: "python3 /config/scripts/manage_agent_automations.py enable '{{ identifier }}' --json"
+  agent_auto_stats_json: "python3 /config/scripts/manage_agent_automations.py stats --json"
+  read_pending_auto_spec: "cat /config/memory/pending_auto_spec.json 2>/dev/null || echo '{}'"
+  write_pending_auto_spec: "python3 /config/scripts/write_pending_spec.py {{ spec | tojson }}"
+  clear_pending_auto_spec: "rm -f /config/memory/pending_auto_spec.json"
+  build_automation_spec: "python3 /config/scripts/build_automation_spec.py"
+  monitored_entities_text: 'python3 /config/scripts/get_monitored_entities_text.py {{ domains | default("") }}'
+
+  # HA update manager
+  ha_updates_check: 'python3 /config/scripts/ha_updates_check.py'
+  ha_update_list: 'python3 /config/scripts/ha_update_manager.py list'
+  ha_update_list_json: 'python3 /config/scripts/ha_update_manager.py list_pending_json'
+  ha_update_execute: "python3 /config/scripts/ha_update_manager.py execute '{{ entity_id }}'"
+  ha_update_skip: "python3 /config/scripts/ha_update_manager.py skip '{{ entity_id }}'"
+  ha_update_check_backup: 'python3 /config/scripts/ha_update_manager.py check_backup'
+  ha_update_create_backup: 'python3 /config/scripts/ha_update_manager.py create_backup'
+
+  # Housekeeping
+  clear_old_logs: "find /config/logs/ -name '*.log' -mtime +7 -delete 2>/dev/null || true"
+  clear_tts_cache: "find /config/tts/ -name '*.flac' -o -name '*.mp3' -mtime +7 -delete"
+  clear_z2m_logs: "find /config/zigbee2mqtt/log/ -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +"
+  clear_ha_log: "rm -f /config/home-assistant.log.1"
+
+# ---------------------------------------------------------------------------
+# PERMEAR input entities
+# ---------------------------------------------------------------------------
+input_text:
+  permear_last_message:
+    name: "PERMEAR Last Message"
+    max: 255
+    initial: ""
+  permear_pending_auto_spec:
+    name: "PERMEAR Pending Automation Spec"
+    max: 255
+    initial: ""
+
+# ---------------------------------------------------------------------------
+# Command-line sensors — read by YAML automations via state/state_attr
+# ---------------------------------------------------------------------------
+command_line:
+  - sensor:
+      name: "PERMEAR Daily Memory"
+      command: "python3 /config/scripts/sensor_daily_memory.py"
+      scan_interval: 300
+      value_template: "ok"
+      json_attributes:
+        - eventos
+        - interacoes
+        - boletim_disparado
+        - briefing_enviado
+  - sensor:
+      name: "PERMEAR Household Data"
+      command: "python3 /config/scripts/sensor_household_data.py"
+      scan_interval: 3600
+      value_template: "ok"
+      json_attributes:
+        - residents
+        - action_items
+  - sensor:
+      name: "PERMEAR Config"
+      command: "python3 /config/scripts/sensor_permear_config.py"
+      scan_interval: 3600
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - conversation
+        - data
+        - conversation_fallback
+        - data_fallback
+        - heartbeat_start
+        - heartbeat_end
+        - sleep_time
+        - systems_time
+  - sensor:
+      name: "PERMEAR Health"
+      command: "python3 /config/scripts/sensor_permear_health.py"
+      scan_interval: 300
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - resumo
+        - fallbacks_gemini_hoje
+        - ultimo_fallback_em
+        - erros_silenciados_ativos
+  - sensor:
+      name: "PERMEAR Attention"
+      command: "python3 /config/scripts/sensor_permear_attention.py"
+      scan_interval: 300
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - emitidos_hoje
+        - suprimidos_hoje
+        - cinzentos_hoje
+        - chamadas_llm_hoje
+        - total_avaliado_hoje
+
+# ---------------------------------------------------------------------------
+# Cycle schedule entities
+# Runtime holders for schedule times configured in permear.yaml.
+# Synced automatically from sensor.permear_config at every HA startup.
+# Trigger times in cycles.yaml reference these entities — changing permear.yaml
+# and reloading HA is all that's needed to update schedules.
+# ---------------------------------------------------------------------------
+input_datetime:
+  permear_heartbeat_start:
+    name: "PERMEAR - Heartbeat start"
+    has_time: true
+    has_date: false
+    initial: "08:30:00"
+  permear_heartbeat_end:
+    name: "PERMEAR - Heartbeat end"
+    has_time: true
+    has_date: false
+    initial: "20:00:00"
+  permear_sleep_time:
+    name: "PERMEAR - Sleep Consolidation time"
+    has_time: true
+    has_date: false
+    initial: "23:30:00"
+  permear_systems_time:
+    name: "PERMEAR - Systems Consolidation time"
+    has_time: true
+    has_date: false
+    initial: "04:00:00"
+
+# ---------------------------------------------------------------------------
+# Schedule sync — keeps input_datetime entities in sync with permear.yaml
+# Fires when sensor.permear_config loads (startup) or updates (hourly).
+# ---------------------------------------------------------------------------
+automation:
+  - alias: "PERMEAR - Sync cycle schedules from permear.yaml"
+    id: permear_sync_schedules
+    trigger:
+      - platform: state
+        entity_id: sensor.permear_config
+        to: "ok"
+    condition:
+      - condition: template
+        value_template: >
+          {{ state_attr('sensor.permear_config', 'sleep_time') is not none }}
+    action:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.permear_heartbeat_start
+        data:
+          time: "{{ state_attr('sensor.permear_config', 'heartbeat_start') }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.permear_heartbeat_end
+        data:
+          time: "{{ state_attr('sensor.permear_config', 'heartbeat_end') }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.permear_sleep_time
+        data:
+          time: "{{ state_attr('sensor.permear_config', 'sleep_time') }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.permear_systems_time
+        data:
+          time: "{{ state_attr('sensor.permear_config', 'systems_time') }}"
+    mode: single

@@ -1,0 +1,968 @@
+# telegram.yaml — PERMEAR v8
+# Telegram Core — the agent's state machine. The 6 automations share
+# input_text.permear_pending_auto_spec as state (awaiting_new → handler
+# processes → confirm/reject → callback executes). Cohesive domain — move together.
+# - permear_telegram_handler: receives messages, processes, controls state
+# - permear_auto_confirm / permear_auto_reject: handle "sim"/"não" responses
+# - permear_telegram_callback: executes inline_keyboard callbacks
+# - permear_list_automations / permear_new_automation_cmd: agent commands
+
+# Telegram message handler — receives messages, controls automation-creation state machine
+- alias: "PERMEAR - Telegram message handler"
+  id: permear_telegram_handler
+  trigger:
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret telegram_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {% set text = trigger.event.data.text | lower | trim %}
+        {% set spec = states('input_text.permear_pending_auto_spec') %}
+        {% set is_answer = text in ['sim', 'yes', 'ok', 'confirmo', 'approve', 'não', 'nao', 'cancel', 'cancelar', 'no', 'reject'] %}
+        {{ not (spec not in ['', 'unknown'] and is_answer) }}
+  action:
+    - action: shell_command.record_interaction
+      data:
+        canal: telegram
+        content: "{{ trigger.event.data.text[:100] }}"
+      continue_on_error: true
+    # SD23-A: mark reacted=true in DB when user replies
+    - action: shell_command.mark_reaction
+      continue_on_error: true
+
+    # Bypass to ai_task when awaiting automation description
+    - variables:
+        _pending_state: "{{ states('input_text.permear_pending_auto_spec') }}"
+        _should_use_ai_task: "{{ _pending_state in ['awaiting_new', 'awaiting_edit'] }}"
+
+    - if:
+        - condition: template
+          value_template: "{{ _should_use_ai_task }}"
+      then:
+        # Load existing spec for edit context (empty if awaiting_new)
+        - action: shell_command.read_pending_auto_spec
+          response_variable: _edit_spec_resp
+        - variables:
+            _is_edit: "{{ _pending_state == 'awaiting_edit' }}"
+            _edit_spec_text: "{{ _edit_spec_resp.stdout | default('') | trim }}"
+
+        # Load monitored entities dynamically for prompt injection
+        - action: shell_command.monitored_entities_text
+          data:
+            domains: "light switch climate media_player cover sensor binary_sensor"
+          response_variable: entities_result
+        - variables:
+            _entities_text: "{{ entities_result.stdout | default('(lista indisponivel)') | trim }}"
+
+        # Generate structured spec via ai_task (primary / skip-primary / fallback)
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >
+                    {% set last_fb = state_attr('sensor.permear_health', 'ultimo_fallback_em') %}
+                    {% if last_fb %}
+                      {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                    {% else %}
+                      false
+                    {% endif %}
+              sequence:
+                - action: shell_command.agent_log_fallback
+                  continue_on_error: true
+                - action: ai_task.generate_data
+                  data:
+                    task_name: "HA automation creation [skip-primary]"
+                    entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                    instructions: >
+                      {% if _is_edit and _edit_spec_text | length > 10 %}
+                      Automacao existente (JSON): {{ _edit_spec_text }}
+
+                      O usuario quer modificar com: "{{ trigger.event.data.text }}"
+                      Produza uma nova especificacao completa aplicando a modificacao solicitada.
+                      {% else %}
+                      Crie uma automacao do Home Assistant baseada na descricao:
+                      "{{ trigger.event.data.text }}"
+                      {% endif %}
+
+                      Regras:
+                      - alias: nome curto em PT-BR, sem aspas especiais
+                      - trigger_type: time | state | numeric_state | time_pattern
+                      - trigger_config: JSON string do trigger no formato HA. Exemplos:
+                        time: {"platform":"time","at":"HH:MM:SS"}
+                        state: {"platform":"state","entity_id":"x","to":"estado"}
+                        numeric_state: {"platform":"numeric_state","entity_id":"sensor.x","above":N}
+                        time_pattern: {"platform":"time_pattern","hours":"/1"}
+                      - action_service: domain.servico (ex: light.turn_on, climate.turn_on, switch.turn_on, switch.turn_off, cover.open_cover, cover.close_cover, media_player.turn_on)
+                      - action_entity: use SOMENTE entity_ids da lista abaixo — nenhum outro sera aceito
+                      - condition_text: condicao em linguagem natural ou deixe vazio
+
+                      Entidades disponiveis nesta casa (use EXATAMENTE estes entity_ids):
+                      {{ _entities_text }}
+
+                      Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.
+                    structure:
+                      alias:
+                        description: "Nome curto da automacao em PT-BR. Vazio se impossivel de mapear."
+                        required: true
+                        selector:
+                          text:
+                      trigger_type:
+                        description: "Tipo do gatilho: time, state, numeric_state ou time_pattern"
+                        required: true
+                        selector:
+                          select:
+                            options: ["time", "state", "numeric_state", "time_pattern"]
+                      trigger_config:
+                        description: "JSON string do trigger compativel com HA. Ex: {\"platform\":\"time\",\"at\":\"18:00:00\"}"
+                        required: true
+                        selector:
+                          text:
+                      action_service:
+                        description: "Service HA. Ex: light.turn_on, switch.turn_on, climate.turn_on, cover.open_cover, media_player.turn_on"
+                        required: true
+                        selector:
+                          text:
+                      action_entity:
+                        description: "Entity ID da lista de entidades disponiveis. Use EXATAMENTE o entity_id da lista."
+                        required: true
+                        selector:
+                          text:
+                      condition_text:
+                        description: "Condicao em linguagem natural ou vazio"
+                        required: false
+                        selector:
+                          text:
+                  response_variable: auto_spec_response
+                  continue_on_error: true
+          default:
+            - action: ai_task.generate_data
+              data:
+                task_name: "HA automation creation"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data') }}"
+                instructions: >
+                  {% if _is_edit and _edit_spec_text | length > 10 %}
+                  Automacao existente (JSON): {{ _edit_spec_text }}
+
+                  O usuario quer modificar com: "{{ trigger.event.data.text }}"
+                  Produza uma nova especificacao completa aplicando a modificacao solicitada.
+                  {% else %}
+                  Crie uma automacao do Home Assistant baseada na descricao:
+                  "{{ trigger.event.data.text }}"
+                  {% endif %}
+
+                  Regras:
+                  - alias: nome curto em PT-BR, sem aspas especiais
+                  - trigger_type: time | state | numeric_state | time_pattern
+                  - trigger_config: JSON string do trigger no formato HA. Exemplos:
+                    time: {"platform":"time","at":"HH:MM:SS"}
+                    state: {"platform":"state","entity_id":"x","to":"estado"}
+                    numeric_state: {"platform":"numeric_state","entity_id":"sensor.x","above":N}
+                    time_pattern: {"platform":"time_pattern","hours":"/1"}
+                  - action_service: domain.servico (ex: light.turn_on, climate.turn_on, switch.turn_on, switch.turn_off, cover.open_cover, cover.close_cover, media_player.turn_on)
+                  - action_entity: use SOMENTE entity_ids da lista abaixo — nenhum outro sera aceito
+                  - condition_text: condicao em linguagem natural ou deixe vazio
+
+                  Entidades disponiveis nesta casa (use EXATAMENTE estes entity_ids):
+                  {{ _entities_text }}
+
+                  Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.
+                structure:
+                  alias:
+                    description: "Nome curto da automacao em PT-BR. Vazio se impossivel de mapear."
+                    required: true
+                    selector:
+                      text:
+                  trigger_type:
+                    description: "Tipo do gatilho: time, state, numeric_state ou time_pattern"
+                    required: true
+                    selector:
+                      select:
+                        options: ["time", "state", "numeric_state", "time_pattern"]
+                  trigger_config:
+                    description: "JSON string do trigger compativel com HA. Ex: {\"platform\":\"time\",\"at\":\"18:00:00\"}"
+                    required: true
+                    selector:
+                      text:
+                  action_service:
+                    description: "Service HA. Ex: light.turn_on, switch.turn_on, climate.turn_on, cover.open_cover, media_player.turn_on"
+                    required: true
+                    selector:
+                      text:
+                  action_entity:
+                    description: "Entity ID da lista de entidades disponiveis. Use EXATAMENTE o entity_id da lista."
+                    required: true
+                    selector:
+                      text:
+                  condition_text:
+                    description: "Condicao em linguagem natural ou vazio"
+                    required: false
+                    selector:
+                      text:
+              response_variable: auto_spec_response
+              continue_on_error: true
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ auto_spec_response is not defined
+                       or auto_spec_response.data is none
+                       or auto_spec_response.data | length == 0 }}
+              then:
+                - action: shell_command.agent_log_fallback
+                  continue_on_error: true
+                - action: ai_task.generate_data
+                  data:
+                    task_name: "HA automation creation [fallback]"
+                    entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                    instructions: >
+                      {% if _is_edit and _edit_spec_text | length > 10 %}
+                      Automacao existente (JSON): {{ _edit_spec_text }}
+
+                      O usuario quer modificar com: "{{ trigger.event.data.text }}"
+                      Produza uma nova especificacao completa aplicando a modificacao solicitada.
+                      {% else %}
+                      Crie uma automacao do Home Assistant baseada na descricao:
+                      "{{ trigger.event.data.text }}"
+                      {% endif %}
+
+                      Regras:
+                      - alias: nome curto em PT-BR, sem aspas especiais
+                      - trigger_type: time | state | numeric_state | time_pattern
+                      - trigger_config: JSON string do trigger no formato HA. Exemplos:
+                        time: {"platform":"time","at":"HH:MM:SS"}
+                        state: {"platform":"state","entity_id":"x","to":"estado"}
+                        numeric_state: {"platform":"numeric_state","entity_id":"sensor.x","above":N}
+                        time_pattern: {"platform":"time_pattern","hours":"/1"}
+                      - action_service: domain.servico (ex: light.turn_on, climate.turn_on, switch.turn_on, switch.turn_off, cover.open_cover, cover.close_cover, media_player.turn_on)
+                      - action_entity: use SOMENTE entity_ids da lista abaixo — nenhum outro sera aceito
+                      - condition_text: condicao em linguagem natural ou deixe vazio
+
+                      Entidades disponiveis nesta casa (use EXATAMENTE estes entity_ids):
+                      {{ _entities_text }}
+
+                      Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.
+                    structure:
+                      alias:
+                        description: "Nome curto da automacao em PT-BR. Vazio se impossivel de mapear."
+                        required: true
+                        selector:
+                          text:
+                      trigger_type:
+                        description: "Tipo do gatilho: time, state, numeric_state ou time_pattern"
+                        required: true
+                        selector:
+                          select:
+                            options: ["time", "state", "numeric_state", "time_pattern"]
+                      trigger_config:
+                        description: "JSON string do trigger compativel com HA. Ex: {\"platform\":\"time\",\"at\":\"18:00:00\"}"
+                        required: true
+                        selector:
+                          text:
+                      action_service:
+                        description: "Service HA. Ex: light.turn_on, switch.turn_on, climate.turn_on, cover.open_cover, media_player.turn_on"
+                        required: true
+                        selector:
+                          text:
+                      action_entity:
+                        description: "Entity ID da lista de entidades disponiveis. Use EXATAMENTE o entity_id da lista."
+                        required: true
+                        selector:
+                          text:
+                      condition_text:
+                        description: "Condicao em linguagem natural ou vazio"
+                        required: false
+                        selector:
+                          text:
+                  response_variable: auto_spec_response
+                  continue_on_error: true
+
+        # Validate alias — if empty, description was incomprehensible
+        - if:
+            - condition: template
+              value_template: "{{ auto_spec_response.data.alias | default('') | trim | length < 3 }}"
+          then:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: |
+                  ⚠️ Nao consegui interpretar a descricao.
+
+                  Tente reformular com mais detalhes, ex:
+                  "ligar AC suite todo dia as 18h"
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: ""
+            - stop: "alias vazio — ai_task nao extraiu spec valido"
+
+        # Save raw fields to pending_auto_spec.json.
+        # tojson on each value individually avoids YAML-style output HA generates for MappingProxy.
+        - action: shell_command.write_pending_auto_spec
+          data:
+            spec: >-
+              {"alias":{{ auto_spec_response.data.alias | tojson }},"trigger_type":{{ auto_spec_response.data.trigger_type | tojson }},"trigger_config":{{ auto_spec_response.data.trigger_config | tojson }},"action_service":{{ auto_spec_response.data.action_service | tojson }},"action_entity":{{ auto_spec_response.data.action_entity | tojson }},"condition_text":{{ auto_spec_response.data.condition_text | default("") | tojson }}}
+
+        # Build canonical HA spec from raw fields
+        - action: shell_command.build_automation_spec
+          response_variable: build_result
+
+        # Validate build succeeded
+        - if:
+            - condition: template
+              value_template: "{{ 'ERROR:' in (build_result.stdout | default('')) }}"
+          then:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: |
+                  ❌ Erro ao montar a automacao.
+
+                  {{ build_result.stdout | default('erro desconhecido') | trim | truncate(200, False, '') }}
+            - stop: "build_automation_spec falhou"
+
+        # Set state "pending" for inline_keyboard callbacks (cnew_, cedt_, cdsc_)
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.permear_pending_auto_spec
+          data:
+            value: "pending"
+
+        # Read built spec to compose Card 1
+        - action: shell_command.read_pending_auto_spec
+          response_variable: built_spec_resp
+
+        - variables:
+            _spec: "{{ built_spec_resp.stdout | default('{}') | from_json | default({}, true) }}"
+            _auto_alias: "{{ _spec.alias | default('automacao') }}"
+            _trigger_desc: >
+              {% set t = _spec.trigger[0] if (_spec.trigger | default([]) | length) > 0 else {} %}
+              {% if t.platform == 'time' %}
+                Todo dia as {{ t.at | default('?') }}
+              {% elif t.platform == 'state' %}
+                {% set nome = t.entity_id.split('.')[1].replace('_', ' ') if t.entity_id is defined and '.' in t.entity_id else t.entity_id | default('?') %}
+                {{ nome | capitalize }} muda para {{ t.to | default('novo estado') }}
+              {% elif t.platform == 'numeric_state' %}
+                {% set nome = t.entity_id.split('.')[1].replace('_', ' ') if t.entity_id is defined and '.' in t.entity_id else t.entity_id | default('?') %}
+                {{ nome | capitalize }} {{ 'acima de ' ~ t.above if t.above is defined else 'abaixo de ' ~ t.below if t.below is defined else 'valor limite' }}
+              {% elif t.platform == 'time_pattern' %}
+                {% if t.hours is defined %}A cada {{ t.hours }} hora(s)
+                {% elif t.minutes is defined %}A cada {{ t.minutes }} minuto(s)
+                {% else %}Padrao de tempo recorrente{% endif %}
+              {% elif t.platform == 'sun' %}
+                {{ 'Ao nascer do sol' if t.event | default('') == 'sunrise' else 'Ao por do sol' }}
+              {% elif t.platform == 'homeassistant' %}
+                Quando o Home Assistant inicia
+              {% else %}
+                Gatilho configurado
+              {% endif %}
+            _action_desc: >
+              {% set a = _spec.action[0] if (_spec.action | default([]) | length) > 0 else {} %}
+              {% set svc = a.service | default('') %}
+              {% set domain = svc.split('.')[0] if '.' in svc else '' %}
+              {% set cmd = svc.split('.')[1] if '.' in svc else svc %}
+              {% set eid = a.target.entity_id if a.target is defined and a.target.entity_id is defined else '' %}
+              {% set nome = eid.split('.')[1].replace('_', ' ') if '.' in eid else eid %}
+              {% if domain == 'light' and cmd == 'turn_on' %}Ligar luz{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'light' and cmd == 'turn_off' %}Desligar luz{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'switch' and cmd == 'turn_on' %}Ligar {{ nome if nome else 'dispositivo' }}
+              {% elif domain == 'switch' and cmd == 'turn_off' %}Desligar {{ nome if nome else 'dispositivo' }}
+              {% elif domain == 'climate' and cmd == 'turn_on' %}Ligar ar condicionado{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'climate' and cmd == 'turn_off' %}Desligar ar condicionado{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'climate' and cmd == 'set_temperature' %}Ajustar temperatura{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'media_player' and cmd == 'turn_on' %}Ligar midia{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'media_player' and cmd == 'turn_off' %}Desligar midia{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'telegram_bot' %}Enviar mensagem Telegram
+              {% elif domain == 'script' %}Executar script{{ ' ' ~ nome if nome else '' }}
+              {% elif domain == 'shell_command' %}Executar comando
+              {% elif cmd == 'turn_on' %}Ligar {{ nome if nome else svc }}
+              {% elif cmd == 'turn_off' %}Desligar {{ nome if nome else svc }}
+              {% else %}{{ svc if svc else 'acao configurada' }}{% endif %}
+
+        # Card 1 — Preview com botoes (mesmo formato do Sprint C)
+        - action: telegram_bot.send_message
+          data:
+            chat_id: !secret telegram_chat_id
+            parse_mode: plain_text
+            message: |
+              ✨ Nova automacao
+
+              📌 {{ _auto_alias | trim }}
+
+              Quando: {{ _trigger_desc | trim }}
+              O que faz: {{ _action_desc | trim }}
+            inline_keyboard:
+              - "Criar:/cnew_confirm, Ajustar:/cedt_request"
+              - "Descartar:/cdsc_clear"
+
+        - stop: "Spec created via ai_task — Card 1 sent"
+
+    # === Main flow: conversation.process (regular messages, REMOVE_AUTO, LIST_AUTOS) ===
+    - variables:
+        prompt_telegram: >
+          {% set msg = trigger.event.data.text | lower %}
+          {% set pending_state = states('input_text.permear_pending_auto_spec') %}
+          {% set is_awaiting = pending_state in ['awaiting_new', 'awaiting_edit'] %}
+          {% set is_auto_request = 'automação' in msg or 'automacao' in msg or 'criar auto' in msg or 'crie auto' in msg or 'remove auto' in msg or 'remova auto' in msg or 'list auto' in msg %}
+          {% set should_create_auto = is_awaiting or is_auto_request %}
+          {% set ultima = states('input_text.permear_last_message') %}
+          {% if should_create_auto %}
+          [INSTRUCAO OBRIGATORIA: Responda APENAS com uma linha no formato exato abaixo, sem nenhum outro texto:
+          Para remover: REMOVE_AUTO: alias
+          Para listar: LIST_AUTOS
+          NAO escreva nada alem dessa linha. NAO confirme, NAO explique.]
+          {% elif ultima and ultima not in ['unknown', ''] %}
+          [Contexto: sua última mensagem foi: "{{ ultima }}"]
+          {% endif %}
+          [Morador]: {{ trigger.event.data.text }}
+    # === BEGIN CONVERSATION PRIMARY RETRY BLOCK ===
+    - variables:
+        agent_attempt: 0
+        agent_delays: [0, 15, 45]
+        agent_max_attempts: 3
+        agent_text: ""
+        agent_success: false
+    - repeat:
+        sequence:
+          - variables:
+              agent_attempt: "{{ agent_attempt + 1 }}"
+          - if:
+              - condition: template
+                value_template: "{{ agent_attempt > 1 }}"
+            then:
+              - delay:
+                  seconds: "{{ agent_delays[agent_attempt - 1] }}"
+          - action: conversation.process
+            data:
+              agent_id: "{{ state_attr('sensor.permear_config', 'conversation') }}"
+              text: "{{ prompt_telegram }}"
+              conversation_id: "telegram_resident_{{ now().strftime('%Y%m%d') }}b"
+            response_variable: gemini_resp
+          - variables:
+              raw_text: "{{ gemini_resp.response.speech.plain.speech | default('') | trim }}"
+              is_error: >
+                {{ 'Sorry, I had a problem' in raw_text
+                   or '503' in raw_text
+                   or 'UNAVAILABLE' in raw_text
+                   or raw_text | length < 5 }}
+              agent_text: "{{ raw_text }}"
+              agent_success: "{{ not is_error }}"
+        until:
+          - condition: template
+            value_template: "{{ agent_success or agent_attempt >= agent_max_attempts }}"
+    - if:
+        - condition: template
+          value_template: "{{ not agent_success }}"
+      then:
+        # Reading 2 — conversation_fallback takes over with full tools
+        - variables:
+            fb_attempt: 0
+            fb_delays: [0, 15, 45]
+            fb_max_attempts: 3
+            fb_text: ""
+            fb_success: false
+        - repeat:
+            sequence:
+              - variables:
+                  fb_attempt: "{{ fb_attempt + 1 }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ fb_attempt > 1 }}"
+                then:
+                  - delay:
+                      seconds: "{{ fb_delays[fb_attempt - 1] }}"
+              - action: conversation.process
+                data:
+                  agent_id: "{{ state_attr('sensor.permear_config', 'conversation_fallback') }}"
+                  text: "{{ prompt_telegram }}"
+                  conversation_id: "telegram_resident_{{ now().strftime('%Y%m%d') }}b"
+                response_variable: fb_resp
+              - variables:
+                  fb_raw: "{{ fb_resp.response.speech.plain.speech | default('') | trim }}"
+                  fb_is_error: >
+                    {{ 'Sorry, I had a problem' in fb_raw
+                       or '503' in fb_raw
+                       or 'UNAVAILABLE' in fb_raw
+                       or fb_raw | length < 5 }}
+                  fb_text: "{{ fb_raw }}"
+                  fb_success: "{{ not fb_is_error }}"
+            until:
+              - condition: template
+                value_template: "{{ fb_success or fb_attempt >= fb_max_attempts }}"
+
+        - if:
+            - condition: template
+              value_template: "{{ fb_success }}"
+          then:
+            - variables:
+                agent_text: "{{ fb_text }}"
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: shell_command.record_event
+              data:
+                detalhe: "conv_primary_failed_fallback_assumed"
+          else:
+            # Reading B: both providers failed — honest error, no degraded mode
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: "Sistema temporariamente indisponível. Tente em alguns minutos."
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: shell_command.record_event
+              data:
+                detalhe: "conv_primary_and_fallback_failed_total"
+            - stop: "Total failure — both providers failed"
+    - variables:
+        speech: "{{ agent_text }}"
+    # === END CONVERSATION PRIMARY RETRY BLOCK ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ 'REMOVE_AUTO:' in speech }}"
+          sequence:
+            - variables:
+                auto_id: "{{ speech.split('REMOVE_AUTO:')[1].strip().split('\n')[0].strip() }}"
+            - action: shell_command.manage_agent_auto_remove
+              data:
+                identifier: "{{ auto_id }}"
+              response_variable: remove_result
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: "{{ remove_result.stdout | default('') | trim | default('Erro ao remover automacao.') }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ 'LIST_AUTOS' in speech }}"
+          sequence:
+            - action: shell_command.manage_agent_auto_list
+              response_variable: list_result
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: "{{ list_result.stdout | default('') | trim | default('Nenhuma automacao cadastrada.') }}"
+      default:
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >
+                    {{ speech | length > 0 and
+                       speech not in ['LIST_AUTOS', 'NO_AUTOMATIONS', 'CREATE_AUTO:', 'REMOVE_AUTO:'] and
+                       not speech.startswith('CREATE_AUTO:') and
+                       not speech.startswith('REMOVE_AUTO:') }}
+              sequence:
+                - action: telegram_bot.send_message
+                  data:
+                    chat_id: !secret telegram_chat_id
+                    parse_mode: plain_text
+                    message: "{{ speech }}"
+                - action: input_text.set_value
+                  target:
+                    entity_id: input_text.permear_last_message
+                  data:
+                    value: "{{ speech[:255] }}"
+          default:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message: "⚠️ Nao consegui responder agora. Tente em alguns instantes."
+  mode: queued
+  max: 5
+
+# Confirm automation creation
+- alias: "PERMEAR - Confirm automation creation"
+  id: permear_auto_confirm
+  trigger:
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret telegram_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {% set text = trigger.event.data.text | lower | trim %}
+        {% set spec = states('input_text.permear_pending_auto_spec') %}
+        {{ spec not in ['', 'unknown'] and
+           text in ['sim', 'yes', 'ok', 'confirmo', 'approve'] }}
+  action:
+    - action: shell_command.manage_agent_auto_create_from_file
+      response_variable: create_result
+    - action: shell_command.clear_pending_auto_spec
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.permear_pending_auto_spec
+      data:
+        value: ""
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ create_result.stdout | default('') | trim | length > 0 }}"
+          sequence:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: "{{ create_result.stdout | default('') | trim | default('Erro ao criar automação.') }}"
+      default:
+        - action: telegram_bot.send_message
+          data:
+            chat_id: !secret telegram_chat_id
+            message: "❌ Erro ao criar automacao. Verifique os logs do HA."
+  mode: single
+
+# Reject automation creation
+- alias: "PERMEAR - Reject automation creation"
+  id: permear_auto_reject
+  trigger:
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret telegram_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {% set text = trigger.event.data.text | lower | trim %}
+        {% set spec = states('input_text.permear_pending_auto_spec') %}
+        {{ spec not in ['', 'unknown'] and
+           text in ['não', 'nao', 'cancel', 'cancelar', 'no', 'reject'] }}
+  action:
+    - action: shell_command.clear_pending_auto_spec
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.permear_pending_auto_spec
+      data:
+        value: ""
+    - action: telegram_bot.send_message
+      data:
+        chat_id: !secret telegram_chat_id
+        message: "Automação cancelada."
+  mode: single
+
+# Unified Telegram callback handler (inline_keyboard buttons)
+- alias: "PERMEAR - Telegram callback handler"
+  id: permear_telegram_callback
+  mode: queued
+  max: 10
+  trigger:
+    - platform: event
+      event_type: telegram_callback
+      event_data:
+        chat_id: !secret telegram_chat_id
+  action:
+    - variables:
+        cb_data: "{{ trigger.event.data.data | default('') }}"
+        msg_id: "{{ trigger.event.data.message.message_id }}"
+        cb_id: "{{ trigger.event.data.id }}"
+        original_msg: "{{ trigger.event.data.message.text | default('') }}"
+    - choose:
+        # === Silence error ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'Silenciar' in cb_data }}"
+          sequence:
+            - variables:
+                err_hash: "{{ original_msg.split('[id:')[1].split(']')[0] if '[id:' in original_msg else '' }}"
+            - condition: template
+              value_template: "{{ err_hash | length > 0 }}"
+            - action: shell_command.archive_error
+              data:
+                error_hash: "{{ err_hash }}"
+                component: "auto"
+                message: "{{ original_msg | replace(\"'\", '') | truncate(80, False, '') }}"
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Silenciado por 24h"
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                message: "{{ original_msg }}\n[silenciado 24h]"
+                parse_mode: plain_text
+
+        # === Update ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'Atualizar' in cb_data }}"
+          sequence:
+            - variables:
+                entity: "{{ original_msg.split('[entity:')[1].split(']')[0] if '[entity:' in original_msg else '' }}"
+            - condition: template
+              value_template: "{{ entity | length > 0 }}"
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Iniciando atualização..."
+            - action: shell_command.ha_update_check_backup
+              response_variable: backup_check
+            - action: shell_command.ha_update_execute
+              data:
+                entity_id: "{{ entity }}"
+              response_variable: exec_result
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: >
+                  {{ original_msg }}
+
+                  [INICIADO]
+                  {{ exec_result.stdout | default('') | trim }}
+
+        # === Ignore update ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'Ignorar' in cb_data }}"
+          sequence:
+            - variables:
+                entity: "{{ original_msg.split('[entity:')[1].split(']')[0] if '[entity:' in original_msg else '' }}"
+            - condition: template
+              value_template: "{{ entity | length > 0 }}"
+            - action: shell_command.ha_update_skip
+              data:
+                entity_id: "{{ entity }}"
+              response_variable: skip_result
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Ignorado ate nova versao"
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "{{ original_msg }}\n[ignorado]"
+
+        # === cnew_ — Confirm and create automation ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'cnew_' in cb_data }}"
+          sequence:
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Criando..."
+            - action: shell_command.manage_agent_auto_create_from_file
+              response_variable: create_result
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: ""
+            - action: shell_command.clear_pending_auto_spec
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: |
+                  {{ original_msg }}
+
+                  {{ create_result.stdout | default('') | trim | default('Criada.') }}
+
+        # === cedt_ — Request adjustment ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'cedt_' in cb_data }}"
+          sequence:
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Aguardando ajuste..."
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: "awaiting_edit"
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: |
+                  {{ original_msg }}
+
+                  Ajustar — me diga o que mudar.
+
+        # === cdsc_ — Discard proposal ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'cdsc_' in cb_data }}"
+          sequence:
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Descartada"
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.permear_pending_auto_spec
+              data:
+                value: ""
+            - action: shell_command.clear_pending_auto_spec
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: |
+                  {{ original_msg }}
+
+                  Descartada.
+
+        # === drmv_confirm_ — Confirm and execute removal ===
+        - conditions:
+            - condition: template
+              value_template: "{{ 'drmv_confirm_' in cb_data }}"
+          sequence:
+            - variables:
+                auto_id: "{{ cb_data.split('drmv_confirm_')[1] }}"
+            - action: shell_command.manage_agent_auto_remove
+              data:
+                identifier: "{{ auto_id }}"
+              response_variable: remove_result
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Removida"
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: "{{ remove_result.stdout | default('') | trim | default('Automacao removida.') }}"
+
+        # === prio_set_ — Set priority for sensitive entity ===
+        - conditions:
+            - condition: template
+              value_template: "{{ cb_data.startswith('/prio_set_') }}"
+          sequence:
+            - variables:
+                prio_payload: "{{ cb_data.replace('/prio_set_', '') }}"
+                prio_nivel: "{{ prio_payload.split('_')[0] }}"
+                prio_entity: "{{ prio_payload.split('_', 1)[1] }}"
+            - action: shell_command.set_entity_priority
+              data:
+                entity_id: "{{ prio_entity }}"
+                priority: "{{ prio_nivel }}"
+              response_variable: prio_result
+            - action: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ cb_id }}"
+                message: "Prioridade definida"
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: !secret telegram_chat_id
+                message_id: "{{ msg_id }}"
+                parse_mode: plain_text
+                message: >
+                  {{ original_msg }}
+
+                  Prioridade definida: nivel {{ prio_nivel }}.
+                  {% if prio_nivel | int == 2 %}Você será avisado sempre que este sensor disparar.
+                  {% elif prio_nivel | int == 1 %}Você será avisado só em situações anormais.
+                  {% else %}Sensor ignorado nos alertas.{% endif %}
+
+      default:
+        - action: telegram_bot.answer_callback_query
+          data:
+            callback_query_id: "{{ cb_id }}"
+            message: "DEBUG cb={{ cb_data }}"
+
+# List agent automations with Card 2 (clickable remove buttons)
+- alias: "PERMEAR - List agent automations"
+  id: permear_list_automations
+  mode: queued
+  max: 3
+  trigger:
+    - platform: event
+      event_type: telegram_command
+      event_data:
+        command: "/listar_automacoes"
+        chat_id: !secret telegram_chat_id
+    - platform: event
+      event_type: telegram_text
+      event_data:
+        chat_id: !secret telegram_chat_id
+  condition:
+    - condition: template
+      value_template: >
+        {% if trigger.event.event_type == 'telegram_command' %}
+          true
+        {% else %}
+          {% set text = trigger.event.data.text | lower %}
+          {{ 'listar automacao' in text or 'minhas automacoes' in text
+             or 'listar automações' in text or 'minhas automações' in text }}
+        {% endif %}
+  action:
+    - action: shell_command.agent_auto_list_json
+      response_variable: list_result
+    - variables:
+        list_data: "{{ list_result.stdout | default('{}') | from_json | default({}, true) }}"
+        autos: "{{ list_data.automations | default([]) }}"
+        total: "{{ list_data.count | default(0) }}"
+    - if:
+        - condition: template
+          value_template: "{{ total == 0 }}"
+      then:
+        - action: telegram_bot.send_message
+          data:
+            chat_id: !secret telegram_chat_id
+            parse_mode: plain_text
+            message: |
+              🤖 Suas automacoes
+
+              Nenhuma automacao criada pelo agente ainda.
+              Use /nova_automacao para criar uma.
+        - stop: "Lista vazia"
+    - variables:
+        list_text: >
+          {% set ns = namespace(lines=['🤖 Suas automacoes (' ~ total ~ ')', '']) %}
+          {% for a in autos[:10] %}
+          {% set ns.lines = ns.lines + [(loop.index | string) ~ '. ' ~ a.alias] %}
+          {% endfor %}
+          {% set ns.lines = ns.lines + ['', 'Toque em Remover N para excluir.'] %}
+          {{ ns.lines | join('\n') }}
+        kb_rows: >
+          {% set ns = namespace(rows=[]) %}
+          {% for a in autos[:10] %}
+          {% set ns.rows = ns.rows + ['Remover ' ~ loop.index ~ ':/drmv_confirm_' ~ a.id] %}
+          {% endfor %}
+          {{ {"rows": ns.rows} | tojson }}
+    - action: telegram_bot.send_message
+      data:
+        chat_id: !secret telegram_chat_id
+        parse_mode: plain_text
+        message: "{{ list_text }}"
+        inline_keyboard: "{{ (kb_rows | trim | from_json).rows }}"
+
+# /nova_automacao command — initiates reactive automation-creation flow
+- alias: "PERMEAR - New automation command"
+  id: permear_new_automation_cmd
+  trigger:
+    - platform: event
+      event_type: telegram_command
+      event_data:
+        command: "/nova_automacao"
+        chat_id: !secret telegram_chat_id
+  action:
+    - action: telegram_bot.send_message
+      data:
+        chat_id: !secret telegram_chat_id
+        parse_mode: plain_text
+        message: |
+          Nova automacao
+
+          Descreva o que ela deve fazer.
+          Ex: "ligar AC suite as 18h se temperatura passar de 25 graus"
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.permear_pending_auto_spec
+      data:
+        value: "awaiting_new"
+  mode: single

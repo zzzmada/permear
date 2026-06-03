@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Parse HA home-assistant.log and output compact health summary.
-v7.0: uses lib helpers.
-v7.3-B.1: reverse-seek tail (O(1) RAM, independent of log size).
+Designed for RPi4 performance: last 500 lines, 2h window.
 """
 import re
 import os
@@ -13,22 +12,20 @@ from permear_config import *
 
 MAX_ERRORS = 5
 MAX_WARNINGS = 5
-DEFAULT_TAIL_LINES = 500
 
 
-def read_last_lines(path, max_lines=DEFAULT_TAIL_LINES, block_size=8192, max_bytes=10_000_000):
+def read_last_lines(path, max_lines=500, block_size=8192, max_bytes=10_000_000):
     """
-    v7.3-B.1 — Read last N lines of a file using reverse-seek.
+    v7.3-B.1 — Reads the last N lines of a file using reverse-seek.
     RAM usage O(1) instead of O(N).
 
     Args:
         path: file path
-        max_lines: maximum lines to return
-        block_size: read chunk size (bytes)
-        max_bytes: safety limit, never read more than 10MB regardless of file size
-
+        max_lines: maximum number of lines to return
+        block_size: size of each read (bytes)
+        max_bytes: safety limit — does not read more than 10MB
     Returns:
-        list[str] with at most max_lines lines, in chronological order
+        list[str] with up to max_lines lines, already in chronological order
     """
     if not os.path.exists(path):
         return []
@@ -37,7 +34,6 @@ def read_last_lines(path, max_lines=DEFAULT_TAIL_LINES, block_size=8192, max_byt
     if file_size == 0:
         return []
 
-    # Safety limit so absurd files don't blow up
     read_limit = min(file_size, max_bytes)
 
     lines = []
@@ -56,22 +52,20 @@ def read_last_lines(path, max_lines=DEFAULT_TAIL_LINES, block_size=8192, max_byt
 
                 parts = buffer.split(b'\n')
                 if position > 0:
-                    # Keep the first piece (may be incomplete) for next iteration
+                    # First fragment may be incomplete — keep it for the next block
                     buffer = parts[0]
                     new_lines = parts[1:]
                 else:
+                    # Reached the start of the file — everything is valid
                     buffer = b""
                     new_lines = parts
 
                 lines = new_lines + lines
 
-        # Filter trailing empty bytes (split(b'\n') leaves b"" after final \n)
-        # before slicing — otherwise [-max_lines:] includes empty entries.
-        lines = [ln for ln in lines if ln]
-
-        # Decode and cap to max_lines
+        # Filter empties (trailing \n produces b"") before truncating to max_lines
+        non_empty = [l for l in lines if l]
         decoded = []
-        for line in lines[-max_lines:]:
+        for line in non_empty[-max_lines:]:
             try:
                 decoded.append(line.decode('utf-8', errors='replace'))
             except Exception:
@@ -98,14 +92,14 @@ def parse_log():
     unavailable = []
     new_devices = []
 
-    # v7.3-B.1 — Reverse-seek instead of readlines()
+    # v7.3-B.1 — Reverse-seek instead of readlines() (RAM O(1) vs O(N))
     lines = read_last_lines(HA_LOG_PATH, max_lines=500)
     if not lines:
         print("HEALTH: OK")
         return
 
     for line in lines:
-        # Extract timestamp if present
+        # Try to extract timestamp
         ts_match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
         if ts_match:
             try:
@@ -135,6 +129,7 @@ def parse_log():
                 else:
                     other_errors.append(entry)
             else:
+                # Unstructured error line: check if any SELF_COMPONENT keyword appears
                 entry = line.strip()[:80]
                 if is_self_component(line):
                     if len(self_errors) < MAX_ERRORS:

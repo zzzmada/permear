@@ -1,45 +1,50 @@
 #!/usr/bin/env python3
 """
-v7.0 — Active forgetting: archives patterns and pending items without mention for 30+ days.
-v7.3-B.2 — migrated to locked_update for atomic read-modify-write.
+v7.0 — Active forgetting: archives pending and suggestions not mentioned in 30+ days.
+v8-S1: migrated from insights.json to guidelines.json (action_items).
+
+State in guidelines.json (action_items._timestamps):
+  "_timestamps": {
+    "pending":     {"<text>": "<iso datetime last_seen>"},
+    "suggestions": {"<text>": "<iso datetime last_seen>"}
+  }
+
+Output file: insights_archived.json
+  {"items": [{"type": ..., "text": ..., "last_seen": ..., "archived_at": ...}]}
 """
 import sys
 import os
 from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib.memory import locked_update, parse_iso
-from permear_config import MEMORY_DIR, INSIGHTS_ARCHIVED_PATH
+from lib.memory import load_json, save_json, parse_iso, locked_update
+from permear_config import MEMORY_DIR, INSIGHTS_ARCHIVED_PATH, GUIDELINES_PATH
 
-INSIGHTS_PATH = os.path.join(MEMORY_DIR, "insights.json")
 RETENTION_DAYS = 30
 
 
-def ensure_timestamps(insights):
-    """Ensure _timestamps for all current items (first run: now)."""
-    if "_timestamps" not in insights:
-        insights["_timestamps"] = {}
-
+def ensure_timestamps(guidelines):
+    """Ensure _timestamps inside action_items for all current items."""
+    action = guidelines.setdefault("action_items", {})
+    ts = action.setdefault("_timestamps", {})
     now = datetime.now().isoformat()
-
-    for field in ["detected_patterns", "pending"]:
-        if field not in insights["_timestamps"]:
-            insights["_timestamps"][field] = {}
-
-        for item in insights.get(field, []):
-            if item not in insights["_timestamps"][field]:
-                insights["_timestamps"][field][item] = now
-
-    return insights
+    for field in ["pending", "suggestions"]:
+        ts.setdefault(field, {})
+        for item in action.get(field, []):
+            if item not in ts[field]:
+                ts[field][item] = now
+    return guidelines
 
 
-def archive_old_items(insights):
-    """Move items with last_seen > RETENTION_DAYS to archived list."""
+def archive_old_items(guidelines):
+    """Move items with last_seen > RETENTION_DAYS to the archived list."""
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
     archived_items = []
+    action = guidelines.get("action_items", {})
+    ts = action.get("_timestamps", {})
 
-    for field in ["detected_patterns", "pending"]:
-        items = insights.get(field, [])
-        timestamps = insights.get("_timestamps", {}).get(field, {})
+    for field in ["pending", "suggestions"]:
+        items = action.get(field, [])
+        timestamps = ts.get(field, {})
 
         kept = []
         for item in items:
@@ -60,28 +65,25 @@ def archive_old_items(insights):
             else:
                 kept.append(item)
 
-        insights[field] = kept
+        action[field] = kept
 
-    return insights, archived_items
+    return guidelines, archived_items
 
 
 def main():
-    # v7.3-B.2 — atomic read-modify-write
-    archived = []
-    found_data = False
-    with locked_update(INSIGHTS_PATH) as insights:
-        if not insights:
-            return
-        found_data = True
-        insights = ensure_timestamps(insights)
-        insights, archived = archive_old_items(insights)
-
-    if not found_data:
-        print("insights.json empty or not found.")
+    guidelines_pre = load_json(GUIDELINES_PATH)
+    if not guidelines_pre:
+        print("guidelines.json empty or not found.")
         return
 
+    # v7.3-B.2 — locked_update for guidelines (lock 1)
+    archived = []
+    with locked_update(GUIDELINES_PATH) as guidelines:
+        ensure_timestamps(guidelines)
+        guidelines, archived = archive_old_items(guidelines)
+
     if archived:
-        # Append to archive (separate file, separate lock)
+        # locked_update for archive (lock 2 — different file, no deadlock)
         with locked_update(INSIGHTS_ARCHIVED_PATH, default={"items": []}) as archive:
             archive["items"].extend(archived)
             archive["last_run"] = datetime.now().isoformat()

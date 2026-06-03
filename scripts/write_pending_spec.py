@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v6.x — Write automation spec to pending_auto_spec.json (avoids 255-char input_text limit)."""
+"""Write automation spec to pending_auto_spec.json (avoids 255-char input_text limit)."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

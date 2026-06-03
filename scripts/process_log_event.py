@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-v7.0 — Entry point for log event processing.
-Logic lives in lib/logs.py.
+v7.0 — Entry point para processamento de log events.
+Logica vive em lib/logs.py.
 
-Called by shell_command.process_log_event from the permear_realtime_error_monitor automation.
+Chamado por shell_command.process_log_event a partir da automacao
+permear_error_monitor.
 
 Usage: process_log_event.py '<component>' '<message>'
 """

@@ -1,0 +1,628 @@
+# cycles.yaml — PERMEAR v8
+# The three PERMEAR cycles:
+# - Sleep Consolidation (23:30): extracts daily memories, writes to DB,
+#   runs tier maintenance (tiers breathe, patterns emerge, loop tiers→priority)
+# - Systems Consolidation (Sunday 04:00): weekly compile
+# - Heartbeat (hourly 08:30-20:00): build_candidates → ARAS → emit/suppress/gray
+
+# Sleep Consolidation — time configured in permear.yaml → cycles.sleep_time
+- alias: "PERMEAR - Sleep Consolidation"
+  id: permear_sleep_consolidation
+  trigger:
+    - platform: time
+      at: input_datetime.permear_sleep_time
+  action:
+    # v7.7-llm: migrated conversation.process → ai_task (primary data / fallback data)
+    - action: shell_command.build_sleep_prompt
+      response_variable: prompt_result
+
+    # === AI Task with standard fallback ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'ultimo_fallback_em') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: ai_task.generate_data
+              data:
+                task_name: "Sleep Consolidation [skip-primary]"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                instructions: "{{ prompt_result.stdout | default('') | trim }}"
+                structure:
+                  briefing:
+                    description: "Full briefing text, max 120 words, PT-BR, no markdown."
+                    required: true
+                    selector:
+                      text:
+                        multiline: true
+              response_variable: briefing_resp
+              continue_on_error: true
+      default:
+        - action: ai_task.generate_data
+          data:
+            task_name: "Sleep Consolidation"
+            entity_id: "{{ state_attr('sensor.permear_config', 'data') }}"
+            instructions: "{{ prompt_result.stdout | default('') | trim }}"
+            structure:
+              briefing:
+                description: "Full briefing text, max 120 words, PT-BR, no markdown."
+                required: true
+                selector:
+                  text:
+                    multiline: true
+          response_variable: briefing_resp
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ briefing_resp is not defined
+                   or briefing_resp.data is none
+                   or briefing_resp.data | length == 0 }}
+          then:
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: ai_task.generate_data
+              data:
+                task_name: "Sleep Consolidation [fallback]"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                instructions: "{{ prompt_result.stdout | default('') | trim }}"
+                structure:
+                  briefing:
+                    description: "Full briefing text, max 120 words, PT-BR, no markdown."
+                    required: true
+                    selector:
+                      text:
+                        multiline: true
+              response_variable: briefing_resp
+              continue_on_error: true
+
+    - variables:
+        briefing_speech: "{{ briefing_resp.data.briefing | default('') | trim if briefing_resp is defined and briefing_resp.data is not none else '' }}"
+        briefing_success: "{{ briefing_resp is defined and briefing_resp.data is not none and briefing_speech | length > 5 }}"
+
+    # === DECISION: success or fallback? ===
+    - if:
+        - condition: template
+          value_template: "{{ briefing_success }}"
+      then:
+        - action: shell_command.agent_daily_summary
+          response_variable: summary_result
+        - variables:
+            summary_text: "{{ summary_result.stdout | default('') | trim }}"
+            final_message: >
+              {{ briefing_speech }}{% if summary_text %}
+
+              {{ summary_text }}{% endif %}
+        - action: telegram_bot.send_message
+          data:
+            chat_id: !secret telegram_chat_id
+            parse_mode: plain_text
+            message: "{{ final_message }}"
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.permear_last_message
+          data:
+            value: "{{ briefing_speech | truncate(255, False, '') }}"
+        # === HA UPDATE CARDS ===
+        - action: shell_command.ha_update_list_json
+          response_variable: updates_json
+        - variables:
+            updates_list: "{{ updates_json.stdout | default('[]') | from_json | default([]) }}"
+        - if:
+            - condition: template
+              value_template: "{{ updates_list | length > 0 }}"
+          then:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: "{{ updates_list | length }} atualizacao(oes) disponivel(eis):"
+            - repeat:
+                for_each: "{{ updates_list }}"
+                sequence:
+                  - action: telegram_bot.send_message
+                    data:
+                      chat_id: !secret telegram_chat_id
+                      parse_mode: plain_text
+                      message: "{{ repeat.item.name }}: {{ repeat.item.current | default('?') }} para {{ repeat.item.latest | default('?') }}\n[entity:{{ repeat.item.entity_id }}]"
+                      inline_keyboard:
+                        - "Atualizar:/Atualizar, Ignorar:/Ignorar"
+      else:
+        - action: shell_command.sleep_simple
+          response_variable: simple_result
+        - action: telegram_bot.send_message
+          data:
+            chat_id: !secret telegram_chat_id
+            parse_mode: plain_text
+            message: "{{ simple_result.stdout | default('Briefing indisponivel.') | trim }}"
+        - action: shell_command.record_event
+          data:
+            detalhe: "sleep_consolidation_fallback_both_ai_task_failed"
+        - stop: "ai_task failed — simple fallback used."
+
+    # === MEMORY EXTRACTION (only if briefing succeeded) ===
+    - delay:
+        seconds: 5
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'ultimo_fallback_em') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: ai_task.generate_data
+              data:
+                task_name: "Memory extraction [skip-primary]"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                instructions: >
+                  Analyze today's events and interactions and extract up to 5
+                  relevant memories (not trivialities). Short, factual phrases
+                  that make sense to re-read days later, in Brazilian Portuguese.
+
+                  Today's events: {{ state_attr('sensor.permear_daily_memory', 'eventos') | default([]) | tojson }}
+                  Interactions: {{ state_attr('sensor.permear_daily_memory', 'interacoes') | default([]) | tojson }}
+
+                  If nothing is relevant, return an empty list.
+                structure:
+                  memorias:
+                    description: "List of relevant memories (short phrases, PT-BR)"
+                    required: true
+                    selector:
+                      text:
+                        multiple: true
+              response_variable: memories_response
+              continue_on_error: true
+      default:
+        - action: ai_task.generate_data
+          data:
+            task_name: "Memory extraction"
+            entity_id: "{{ state_attr('sensor.permear_config', 'data') }}"
+            instructions: >
+              Analyze today's events and interactions and extract up to 5
+              relevant memories (not trivialities). Short, factual phrases
+              that make sense to re-read days later, in Brazilian Portuguese.
+
+              Today's events: {{ state_attr('sensor.permear_daily_memory', 'eventos') | default([]) | tojson }}
+              Interactions: {{ state_attr('sensor.permear_daily_memory', 'interacoes') | default([]) | tojson }}
+
+              If nothing is relevant, return an empty list.
+            structure:
+              memorias:
+                description: "List of relevant memories (short phrases, PT-BR)"
+                required: true
+                selector:
+                  text:
+                    multiple: true
+          response_variable: memories_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ memories_response is not defined
+                   or memories_response.data is none
+                   or memories_response.data | length == 0 }}
+          then:
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: ai_task.generate_data
+              data:
+                task_name: "Memory extraction [fallback]"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                instructions: >
+                  Analyze today's events and interactions and extract up to 5
+                  relevant memories (not trivialities). Short, factual phrases
+                  that make sense to re-read days later, in Brazilian Portuguese.
+
+                  Today's events: {{ state_attr('sensor.permear_daily_memory', 'eventos') | default([]) | tojson }}
+                  Interactions: {{ state_attr('sensor.permear_daily_memory', 'interacoes') | default([]) | tojson }}
+
+                  If nothing is relevant, return an empty list.
+                structure:
+                  memorias:
+                    description: "List of relevant memories (short phrases, PT-BR)"
+                    required: true
+                    selector:
+                      text:
+                        multiple: true
+              response_variable: memories_response
+              continue_on_error: true
+
+    - action: shell_command.apply_sleep_memories
+      data:
+        memorias_json: "{{ memories_response.data.memorias | default([]) | tojson }}"
+    # v7.9-B: memory reorganizes during sleep (runs after writes)
+    - action: shell_command.run_memory_maintenance
+      continue_on_error: true
+    - action: shell_command.record_flag
+      data:
+        name: daily_briefing_enviado
+        value: "true"
+      continue_on_error: true
+    - event: permear_sleep_consolidation_complete
+  mode: single
+
+# Systems Consolidation — Sunday, time configured in permear.yaml → cycles.systems_time
+# v7.1-G: migrated to focused ai_task calls (soul/users sub-tasks removed in v8-S3/S4)
+- alias: "PERMEAR - Systems Consolidation"
+  id: permear_systems_consolidation
+  trigger:
+    - platform: time
+      at: input_datetime.permear_systems_time
+  condition:
+    - condition: time
+      weekday:
+        - sun
+  action:
+    # Forget active: archives stale items before weekly processing
+    - action: shell_command.forget_old_items
+
+    # Build weekly context from Organic Memory DB (memories + interactions of last 7 days)
+    - action: shell_command.build_systems_prompt
+      response_variable: weekly_ctx
+
+    # === INSIGHTS (weekly patterns, suggestions, pending items) ===
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {% set last_fb = state_attr('sensor.permear_health', 'ultimo_fallback_em') %}
+                {% if last_fb %}
+                  {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                {% else %}
+                  false
+                {% endif %}
+          sequence:
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: ai_task.generate_data
+              data:
+                task_name: "Systems Consolidation - insights [skip-primary]"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                instructions: >
+                  Analyze this week's events and interactions. Propose:
+                  - MAX 3 novos_padroes (observed on 3+ days)
+                  - MAX 3 novas_sugestoes (actionable automations)
+                  - MAX 3 novas_pendencias (household items ONLY, NEVER framework bugs)
+                  - items to remove (no mention in 30+ days)
+
+                  Current state: {{ state_attr('sensor.permear_household_data', 'action_items') | default({}) | tojson }}
+
+                  Weekly context (memories and interactions from Organic Memory DB):
+                  {{ weekly_ctx.stdout | default('(no weekly context available)') | trim }}
+                structure:
+                  novos_padroes:
+                    description: "New patterns detected"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  remover_padroes:
+                    description: "Patterns to remove (exact text)"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  novas_pendencias:
+                    description: "Household pending items to register"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  remover_pendencias:
+                    description: "Pending items to remove (exact text)"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  novas_sugestoes:
+                    description: "Automation suggestions"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+              response_variable: insights_response
+              continue_on_error: true
+      default:
+        - action: ai_task.generate_data
+          data:
+            task_name: "Systems Consolidation - insights"
+            entity_id: "{{ state_attr('sensor.permear_config', 'data') }}"
+            instructions: >
+              Analyze this week's events and interactions. Propose:
+              - MAX 3 novos_padroes (observed on 3+ days)
+              - MAX 3 novas_sugestoes (actionable automations)
+              - MAX 3 novas_pendencias (household items ONLY, NEVER framework bugs)
+              - items to remove (no mention in 30+ days)
+
+              Current state: {{ state_attr('sensor.permear_household_data', 'action_items') | default({}) | tojson }}
+
+              Weekly context (memories and interactions from Organic Memory DB):
+              {{ weekly_ctx.stdout | default('(no weekly context available)') | trim }}
+            structure:
+              novos_padroes:
+                description: "New patterns detected"
+                required: false
+                selector:
+                  text:
+                    multiple: true
+              remover_padroes:
+                description: "Patterns to remove (exact text)"
+                required: false
+                selector:
+                  text:
+                    multiple: true
+              novas_pendencias:
+                description: "Household pending items to register"
+                required: false
+                selector:
+                  text:
+                    multiple: true
+              remover_pendencias:
+                description: "Pending items to remove (exact text)"
+                required: false
+                selector:
+                  text:
+                    multiple: true
+              novas_sugestoes:
+                description: "Automation suggestions"
+                required: false
+                selector:
+                  text:
+                    multiple: true
+          response_variable: insights_response
+          continue_on_error: true
+        - if:
+            - condition: template
+              value_template: >
+                {{ insights_response is not defined
+                   or insights_response.data is none
+                   or insights_response.data | length == 0 }}
+          then:
+            - action: shell_command.agent_log_fallback
+              continue_on_error: true
+            - action: ai_task.generate_data
+              data:
+                task_name: "Systems Consolidation - insights [fallback]"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                instructions: >
+                  Analyze this week's events and interactions. Propose:
+                  - MAX 3 novos_padroes (observed on 3+ days)
+                  - MAX 3 novas_sugestoes (actionable automations)
+                  - MAX 3 novas_pendencias (household items ONLY, NEVER framework bugs)
+                  - items to remove (no mention in 30+ days)
+
+                  Current state: {{ state_attr('sensor.permear_household_data', 'action_items') | default({}) | tojson }}
+
+                  Weekly context (memories and interactions from Organic Memory DB):
+                  {{ weekly_ctx.stdout | default('(no weekly context available)') | trim }}
+                structure:
+                  novos_padroes:
+                    description: "New patterns detected"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  remover_padroes:
+                    description: "Patterns to remove (exact text)"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  novas_pendencias:
+                    description: "Household pending items to register"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  remover_pendencias:
+                    description: "Pending items to remove (exact text)"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+                  novas_sugestoes:
+                    description: "Automation suggestions"
+                    required: false
+                    selector:
+                      text:
+                        multiple: true
+              response_variable: insights_response
+              continue_on_error: true
+
+    # === CONSOLIDATE ===
+    - action: shell_command.systems_compile
+      data:
+        insights: >
+          {{ insights_response.data | default({}) | tojson
+             if insights_response is defined else '{}' }}
+      response_variable: compile_result
+    - action: telegram_bot.send_message
+      data:
+        chat_id: !secret telegram_chat_id
+        parse_mode: plain_text
+        message: "{{ compile_result.stdout | default('Compilacao concluida sem detalhes.') | trim }}"
+  mode: single
+
+# Heartbeat — hourly attentional cycle, window configured in permear.yaml → cycles.heartbeat_*
+# Flow: build_candidates → dedup by canonical key → ARAS evaluation with dynamic
+# threshold → emit direct / suppress / gray zone (gray: one ai_task call).
+- alias: "PERMEAR - Heartbeat"
+  id: permear_heartbeat
+  trigger:
+    - platform: time_pattern
+      hours: "/1"
+  condition:
+    - condition: time
+      after: input_datetime.permear_heartbeat_start
+      before: input_datetime.permear_heartbeat_end
+  action:
+    # === JITTER: 60–300s random to avoid firing exactly at XX:00 ===
+    - delay:
+        seconds: "{{ range(60, 301) | random }}"
+
+    # === ARAS: classify candidates ===
+    - action: shell_command.ha_log_monitor
+      response_variable: health_result
+    - action: shell_command.build_heartbeat_prompt
+      data:
+        health: "{{ health_result.stdout | default('HEALTH: OK') }}"
+      response_variable: prompt_result
+    - variables:
+        pb: "{{ prompt_result.stdout | default('{}') | from_json | default({}, true) }}"
+        pb_emits: "{{ pb.emits | default([]) }}"
+        pb_gray_prompt: "{{ pb.gray_prompt | default('') }}"
+        pb_stats: "{{ pb.stats | default({'total':0,'emit':0,'gray':0,'suppress':0,'emit_threshold':0}) }}"
+        llm_called: 0
+        resposta_llm: ""
+        llm_success: false
+
+    # === Direct emits (no LLM) ===
+    # repeat.item is {content, key}
+    - repeat:
+        for_each: "{{ pb_emits }}"
+        sequence:
+          - action: telegram_bot.send_message
+            data:
+              chat_id: !secret telegram_chat_id
+              parse_mode: plain_text
+              message: "{{ repeat.item.content }}"
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.permear_last_message
+            data:
+              value: "{{ repeat.item.content | truncate(255, False, '') }}"
+          - action: shell_command.memory_record_emit
+            data:
+              content: "{{ repeat.item.content }}"
+              key: "{{ repeat.item.key }}"
+            continue_on_error: true
+
+    # === Gray zone: LLM arbitrates (only if gray_prompt non-empty) ===
+    # v7.7-llm: migrated conversation.process → ai_task (primary / fallback)
+    - if:
+        - condition: template
+          value_template: "{{ pb_gray_prompt | length > 0 }}"
+      then:
+        - variables:
+            llm_called: 1
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >
+                    {% set last_fb = state_attr('sensor.permear_health', 'ultimo_fallback_em') %}
+                    {% if last_fb %}
+                      {{ (now() - (last_fb | as_datetime)).total_seconds() < 3600 }}
+                    {% else %}
+                      false
+                    {% endif %}
+              sequence:
+                - action: shell_command.agent_log_fallback
+                  continue_on_error: true
+                - action: ai_task.generate_data
+                  data:
+                    task_name: "ARAS gray zone [skip-primary]"
+                    entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                    instructions: "{{ pb_gray_prompt }}"
+                    structure:
+                      resposta:
+                        description: "Alert messages to emit, or SILENCIO if nothing warrants attention."
+                        required: true
+                        selector:
+                          text:
+                            multiline: true
+                  response_variable: avaliacao_resp
+                  continue_on_error: true
+          default:
+            - action: ai_task.generate_data
+              data:
+                task_name: "ARAS gray zone"
+                entity_id: "{{ state_attr('sensor.permear_config', 'data') }}"
+                instructions: "{{ pb_gray_prompt }}"
+                structure:
+                  resposta:
+                    description: "Alert messages to emit, or SILENCIO if nothing warrants attention."
+                    required: true
+                    selector:
+                      text:
+                        multiline: true
+              response_variable: avaliacao_resp
+              continue_on_error: true
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ avaliacao_resp is not defined
+                       or avaliacao_resp.data is none
+                       or avaliacao_resp.data | length == 0 }}
+              then:
+                - action: shell_command.agent_log_fallback
+                  continue_on_error: true
+                - action: ai_task.generate_data
+                  data:
+                    task_name: "ARAS gray zone [fallback]"
+                    entity_id: "{{ state_attr('sensor.permear_config', 'data_fallback') }}"
+                    instructions: "{{ pb_gray_prompt }}"
+                    structure:
+                      resposta:
+                        description: "Alert messages to emit, or SILENCIO if nothing warrants attention."
+                        required: true
+                        selector:
+                          text:
+                            multiline: true
+                  response_variable: avaliacao_resp
+                  continue_on_error: true
+
+        - variables:
+            resposta_llm: "{{ avaliacao_resp.data.resposta | default('SILENCIO') | trim if avaliacao_resp is defined and avaliacao_resp.data is not none else 'SILENCIO' }}"
+            llm_success: "{{ avaliacao_resp is defined and avaliacao_resp.data is not none }}"
+
+        - if:
+            - condition: template
+              value_template: >
+                {{ llm_success and 'SILENCIO' not in resposta_llm.upper()
+                   and resposta_llm | length > 2 }}
+          then:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: !secret telegram_chat_id
+                parse_mode: plain_text
+                message: "{{ resposta_llm }}"
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.permear_last_message
+              data:
+                value: "{{ resposta_llm | truncate(255, False, '') }}"
+            - action: shell_command.record_interaction
+              data:
+                canal: heartbeat
+                content: "{{ resposta_llm | truncate(100, False, '') }}"
+              continue_on_error: true
+            - action: shell_command.memory_record_emit
+              data:
+                content: "{{ resposta_llm }}"
+                key: ""
+              continue_on_error: true
+
+    # === Log ARAS stats ===
+    - action: shell_command.aras_log_stats
+      data:
+        total: "{{ pb_stats.total | default(0) }}"
+        emit: "{{ pb_stats.emit | default(0) }}"
+        gray: "{{ pb_stats.gray | default(0) }}"
+        suppress: "{{ pb_stats.suppress | default(0) }}"
+        llm_calls: "{{ llm_called }}"
+        emit_threshold: "{{ pb_stats.emit_threshold | default(0) }}"
+      continue_on_error: true
+  mode: single
