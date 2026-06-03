@@ -2,11 +2,11 @@
 v7.0 — HA log processing and error classification.
 
 Functions:
-- is_provider_transient: detects transient LLM agent errors (503/UNAVAILABLE)
-- compute_hash: stable hash of error signature
-- is_archived: checks archived_errors via subprocess
+- is_provider_transient: detects transient agent errors (503/UNAVAILABLE)
+- compute_hash: stable hash of an error signature
+- is_archived: queries archived_errors via subprocess
 - emit: prints structured JSON
-- process_event: complete log event processing pipeline
+- process_event: full log-event processing pipeline
 """
 import sys
 import os
@@ -21,18 +21,27 @@ ARCHIVE_SCRIPT = "/config/scripts/manage_archived.py"
 CIRCUIT_SCRIPT = "/config/scripts/circuit_breaker.py"
 
 
+TRANSIENT_MSG_KEYWORDS = [
+    "clientconnectionreseterror",
+    "cannot write to closing transport",
+    "connectionreseterror",
+]
+
+
 def is_provider_transient(component, message):
-    """Detects 503/UNAVAILABLE from LLM agent — silenced because retry resolves."""
+    """Detect expected transient errors — LLM 503 and device connections."""
     comp = component.lower()
     msg = message.lower()
-    is_agent = (
-        "google_generative_ai" in comp
-        or "google_ai" in comp
-        or "openrouter" in comp
-        or "deepseek" in comp
-    )
-    is_transient = "503" in msg or "unavailable" in msg
-    return is_agent and is_transient
+    # LLM 503/UNAVAILABLE/429 (Gemini quota + transient — handled by fallback)
+    if "google_generative_ai" in comp and (
+        "503" in msg or "unavailable" in msg
+        or "429" in msg or "resource_exhausted" in msg
+    ):
+        return True
+    # Transient WebSocket/TCP connection errors (TV, media players, etc.)
+    if any(kw in msg for kw in TRANSIENT_MSG_KEYWORDS):
+        return True
+    return False
 
 
 def compute_hash(component, message):
@@ -42,7 +51,7 @@ def compute_hash(component, message):
 
 
 def is_archived(hash_val):
-    """Query manage_archived.py to check if hash is silenced for 24h."""
+    """Ask manage_archived.py whether the hash is in the 24h-silenced list."""
     try:
         result = subprocess.run(
             ["python3", ARCHIVE_SCRIPT, "is_archived", hash_val],
@@ -54,7 +63,7 @@ def is_archived(hash_val):
 
 
 def emit(silenced, hash_val="", message="", reason=""):
-    """Print result as structured JSON for the automation to parse."""
+    """Print the result as structured JSON for the automation to parse."""
     print(json.dumps({
         "silenced": silenced,
         "hash": hash_val,
@@ -65,8 +74,8 @@ def emit(silenced, hash_val="", message="", reason=""):
 
 def process_event(component, message):
     """
-    Complete log event processing pipeline.
-    Applies filters NOISY -> archived -> transient -> classifies SELF/HA.
+    Full log-event processing pipeline.
+    Applies NOISY → archived → transient filters → classifies SELF/HA.
     """
     if not component:
         emit(True, reason="missing_args")
@@ -75,7 +84,7 @@ def process_event(component, message):
     message = message[:200]
     comp_lower = component.lower()
 
-    # Filter 1: NOISY components
+    # Filter 1: NOISY
     for noisy in NOISY_COMPONENTS:
         if noisy in comp_lower:
             emit(True, reason="noisy")
@@ -83,12 +92,12 @@ def process_event(component, message):
 
     err_hash = compute_hash(component, message)
 
-    # Filter 2: archived (silenced by user)
+    # Filter 2: archived
     if is_archived(err_hash):
         emit(True, hash_val=err_hash, reason="archived")
         return
 
-    # Filter 3: provider transient 503/UNAVAILABLE — retry will resolve
+    # Filter 3: provider 503/UNAVAILABLE — transient, retry resolves it
     if is_provider_transient(component, message):
         try:
             subprocess.run(
@@ -97,12 +106,12 @@ def process_event(component, message):
             )
         except Exception:
             pass
-        emit(True, hash_val=err_hash, reason="provider_transient")
+        emit(True, hash_val=err_hash, reason="gemini_transient")
         return
 
     # Classification
     is_self = any(sc in comp_lower for sc in SELF_COMPONENTS)
-    prefix = "SELF_ERROR" if is_self else "HA_ERROR"
+    prefix = "ERRO PROPRIO" if is_self else "ERRO HA"
     formatted = f"{prefix}: {component} - {message}"
 
     emit(False, hash_val=err_hash, message=formatted, reason="ok")

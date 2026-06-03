@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-v7.0 — Entry point for circuit breaker and daily stats.
-Logic lives in lib/agent.py.
+v7.0 — Entry point para circuit breaker e daily stats.
+Logica vive em lib/agent.py.
 
-Kept as wrapper because it's called by shell_commands:
+Mantido este wrapper porque eh chamado por shell_commands:
   agent_circuit_check, agent_circuit_fail, agent_circuit_success,
   agent_log_retry_success, agent_log_3fail, agent_daily_summary
 

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-HA Updates manager via REST API and Supervisor API.
-Usage:
+Gerenciador de atualizacoes do HA via REST API e Supervisor API.
+Uso:
   ha_update_manager.py list
-  ha_update_manager.py list_pending_json
   ha_update_manager.py check_backup
   ha_update_manager.py execute <entity_id>
   ha_update_manager.py skip <entity_id>
@@ -56,21 +55,11 @@ def supervisor_api(endpoint, method="GET", data=None):
         return None
 
 
-def _classify_entity(entity_id):
-    """Return category: addon, core, or haos."""
-    eid_lower = entity_id.lower()
-    if "homeassistant" in eid_lower and "os" in eid_lower:
-        return "haos"
-    if entity_id == "update.home_assistant_core_update" or "core" in eid_lower:
-        return "core"
-    return "addon"
-
-
 def cmd_list():
     token = load_token()
     result = ha_api("states", token=token)
     if result is None:
-        print("Could not query HA.")
+        print("Nao foi possivel consultar o HA.")
         return
 
     addons = []
@@ -82,8 +71,10 @@ def cmd_list():
         if not entity_id.startswith("update."):
             continue
         attrs = state.get("attributes", {})
+        # Skip if no update available
         if state.get("state") != "on":
             continue
+        # Skip if version was skipped
         if attrs.get("skipped_version"):
             continue
 
@@ -92,36 +83,37 @@ def cmd_list():
         new = attrs.get("latest_version", "?")
         entry = (name, cur, new, entity_id)
 
-        category = _classify_entity(entity_id)
-        if category == "haos":
+        eid_lower = entity_id.lower()
+        if "homeassistant" in eid_lower and "os" in eid_lower:
             haos.append(entry)
-        elif category == "core":
+        elif entity_id == "update.home_assistant_core_update" or "core" in eid_lower:
             core.append(entry)
         else:
             addons.append(entry)
 
     all_updates = addons + core + haos
     if not all_updates:
-        print("No updates available.")
+        print("Nenhuma atualizacao disponivel.")
         return
 
-    lines = [f"Updates available ({len(all_updates)}):"]
+    lines = [f"Atualizacoes disponiveis ({len(all_updates)}):"]
     for i, (name, cur, new, _) in enumerate(all_updates, 1):
-        lines.append(f"{i}. {name} {cur} to {new}")
+        lines.append(f"{i}. {name} {cur} para {new}")
     print("\n".join(lines))
 
 
 def cmd_check_backup():
     result = supervisor_api("backups")
     if result is None or result.get("result") != "ok":
-        print("Could not query backups.")
+        print("Nao foi possivel consultar os backups.")
         return
 
     backups = result.get("data", {}).get("backups", [])
     if not backups:
-        print("No backups found.")
+        print("Nenhum backup encontrado.")
         return
 
+    # Find most recent
     most_recent = None
     most_recent_dt = None
     for b in backups:
@@ -135,7 +127,7 @@ def cmd_check_backup():
             continue
 
     if most_recent is None:
-        print("Could not determine most recent backup.")
+        print("Nao foi possivel determinar o backup mais recente.")
         return
 
     name = most_recent.get("name", "backup")
@@ -145,17 +137,17 @@ def cmd_check_backup():
     age_days = int(age_hours / 24)
 
     if age_days >= 1:
-        age_txt = f"{age_days} day{'s' if age_days > 1 else ''}"
-        print(f"Old backup: {name} is {age_txt} old. Recommend creating a new one before updating.")
+        age_txt = f"{age_days} dia{'s' if age_days > 1 else ''}"
+        print(f"Backup antigo: {name} tem {age_txt}. Recomendo criar um novo antes de atualizar.")
     else:
-        print(f"Backup OK: {name} is {age_hours} hour{'s' if age_hours != 1 else ''} old.")
+        print(f"Backup OK: {name} tem {age_hours} hora{'s' if age_hours != 1 else ''}.")
 
 
 def cmd_execute(entity_id):
     token = load_token()
-    domain, _, _ = entity_id.partition(".")
+    domain, _, service_name = entity_id.partition(".")
     if domain != "update":
-        print(f"Invalid entity: {entity_id}. Must be from 'update' domain.")
+        print(f"Entidade invalida: {entity_id}. Deve ser do dominio 'update'.")
         return
 
     result = ha_api("services/update/install", method="POST",
@@ -163,9 +155,9 @@ def cmd_execute(entity_id):
     if result is not None:
         attrs = ha_api(f"states/{entity_id}", token=token)
         name = attrs.get("attributes", {}).get("friendly_name", entity_id) if attrs else entity_id
-        print(f"Update started: {name}.")
+        print(f"Atualizacao iniciada: {name}.")
     else:
-        print(f"Error starting update for {entity_id}.")
+        print(f"Erro ao iniciar atualizacao de {entity_id}.")
 
 
 def cmd_skip(entity_id):
@@ -175,9 +167,9 @@ def cmd_skip(entity_id):
     if result is not None:
         attrs = ha_api(f"states/{entity_id}", token=token)
         name = attrs.get("attributes", {}).get("friendly_name", entity_id) if attrs else entity_id
-        print(f"Update skipped: {name}. Will be notified again on next version.")
+        print(f"Atualizacao ignorada: {name}. Sera notificado na proxima versao.")
     else:
-        print(f"Error skipping update for {entity_id}.")
+        print(f"Erro ao ignorar atualizacao de {entity_id}.")
 
 
 def cmd_list_pending_json():
@@ -206,10 +198,10 @@ def cmd_list_pending_json():
         new = attrs.get("latest_version", "?")
         entry = {"entity_id": entity_id, "name": name, "current": cur, "latest": new}
 
-        category = _classify_entity(entity_id)
-        if category == "haos":
+        eid_lower = entity_id.lower()
+        if "homeassistant" in eid_lower and "os" in eid_lower:
             haos.append(entry)
-        elif category == "core":
+        elif entity_id == "update.home_assistant_core_update" or "core" in eid_lower:
             core.append(entry)
         else:
             addons.append(entry)
@@ -223,14 +215,14 @@ def cmd_create_backup():
     result = supervisor_api("backups/new/full", method="POST",
                             data={"name": backup_name})
     if result and result.get("result") == "ok":
-        print("Backup created successfully.")
+        print("Backup criado com sucesso.")
     else:
-        print("Error creating backup.")
+        print("Erro ao criar backup.")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ha_update_manager.py [list|list_pending_json|check_backup|execute|skip|create_backup]")
+        print("Uso: ha_update_manager.py [list|list_pending_json|check_backup|execute|skip|create_backup]")
         return
 
     command = sys.argv[1].lower()
@@ -243,18 +235,18 @@ def main():
         cmd_check_backup()
     elif command == "execute":
         if len(sys.argv) < 3:
-            print("Provide the update entity_id.")
+            print("Informe o entity_id do update.")
             return
         cmd_execute(sys.argv[2])
     elif command == "skip":
         if len(sys.argv) < 3:
-            print("Provide the update entity_id.")
+            print("Informe o entity_id do update.")
             return
         cmd_skip(sys.argv[2])
     elif command == "create_backup":
         cmd_create_backup()
     else:
-        print(f"Unknown command: {command}")
+        print(f"Comando desconhecido: {command}")
 
 
 if __name__ == "__main__":

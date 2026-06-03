@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-CRUD for agent-managed automations in agent_automations.yaml.
-v7.1-B: JSON output mode, new commands (details, disable, enable, stats).
-v7.3-C: validate_ha_config before reload (rollback if invalid).
-v7.3-C: fix_json returns tuple (parsed, needed_repair) for circuit breaker tracking.
-
+CRUD for agent-managed automations in permear_agent.yaml.
 Usage:
   manage_agent_automations.py list [--json]
   manage_agent_automations.py create '<json_automation>' [--json]
@@ -17,10 +13,10 @@ Usage:
 """
 import json
 import re
+import subprocess
 import sys
 import os
 import time
-import subprocess
 import yaml
 from urllib.request import Request, urlopen
 from urllib.error import URLError
@@ -30,33 +26,38 @@ from lib.memory import load_yaml, save_yaml
 
 
 # ==============================================================================
-# Utility helpers
+# Helpers utilitários
 # ==============================================================================
 
 def parse_json_flag(args):
+    """Detecta e remove --json dos args. Retorna (json_mode, clean_args)."""
     json_mode = "--json" in args
     clean_args = [a for a in args if a != "--json"]
     return json_mode, clean_args
 
 
 def emit_json(data):
+    """Imprime JSON valido em UTF-8 sem ASCII escape."""
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def fix_json(raw):
     """
-    v7.3-C — Returns tuple (parsed, needed_repair: bool).
-    needed_repair=True signals provider degradation (inferential).
+    v7.3-C — Tenta recuperar JSON malformado. Retorna (parsed, needed_repair).
+    needed_repair=False: JSON puro aceito sem modificacao.
+    needed_repair=True: foi necessario reparar (sinal de degradacao do modelo).
     """
     if not raw or not raw.strip():
         return None, False
 
-    # Try pure parse first
+    # Tentativa 1: parse puro — sem reparo
     try:
         return json.loads(raw), False
     except json.JSONDecodeError:
         pass
 
+    # A partir daqui: repair necessario
+    # [rollback fix_json v7.1] return json.loads(raw) sem segundo valor
     needed_repair = True
     text = re.sub(r'```(?:json)?\s*', '', raw).strip().rstrip('`').strip()
     try:
@@ -83,19 +84,8 @@ def fix_json(raw):
     return None, needed_repair
 
 
-def log_inferential_degradation():
-    """v7.3-C — fire-and-forget log to circuit breaker when fix_json had to repair."""
-    try:
-        subprocess.run(
-            ["python3", "/config/scripts/circuit_breaker.py", "log_503"],
-            capture_output=True, timeout=3
-        )
-    except Exception:
-        pass
-
-
 # ==============================================================================
-# HA infrastructure
+# Infra HA
 # ==============================================================================
 
 def load_token():
@@ -131,9 +121,10 @@ def reload_automations(token):
 
 def validate_ha_config(token):
     """
-    v7.3-C — Call Supervisor API to validate HA config before reload.
-    Returns (ok: bool, error_message: str).
-    Outside HAOS container (no SUPERVISOR_TOKEN): returns (True, "") for backward compat.
+    v7.3-C — Chama Supervisor API para validar config HA antes do reload.
+    Retorna (ok: bool, error_message: str).
+    Fora do container HAOS (sem SUPERVISOR_TOKEN): retorna (True, "") — backward compat.
+    Se a chamada falhar: retorna (True, "") — modo degradado, nao bloqueia.
     """
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not supervisor_token:
@@ -149,20 +140,19 @@ def validate_ha_config(token):
         result = data.get("result", "unknown")
         if result == "valid":
             return True, ""
-        else:
-            errors = data.get("errors") or "config check failed"
-            return False, str(errors)[:500]
+        errors = data.get("errors") or "config check failed"
+        return False, str(errors)[:500]
     except (URLError, json.JSONDecodeError) as e:
         print(f"WARNING: validate_ha_config failed ({e}), skipping check", file=sys.stderr)
         return True, ""
 
 
 # ==============================================================================
-# Automation I/O
+# I/O de automacoes (wraps lib.memory.save_yaml com validacao pos-escrita)
 # ==============================================================================
 
 def save_automations(automations):
-    """Save and validate YAML syntax. Returns True if OK."""
+    """Salva e valida YAML. Retorna True se OK, False se invalido."""
     save_yaml(AGENT_YAML, automations)
     try:
         with open(AGENT_YAML, 'r') as f:
@@ -174,10 +164,11 @@ def save_automations(automations):
 
 
 # ==============================================================================
-# Summary helpers
+# Helpers de resumo (usados por list, details, stats no modo --json)
 # ==============================================================================
 
 def _find_automation(automations, identifier):
+    """Encontra automacao por id ou alias (case-insensitive)."""
     identifier_lower = identifier.strip().lower()
     for a in automations:
         if a.get("id", "").lower() == identifier_lower or \
@@ -187,82 +178,86 @@ def _find_automation(automations, identifier):
 
 
 def _summarize_trigger(triggers):
+    """Resumo curto PT-BR do trigger para exibicao em cards."""
     if not triggers:
-        return "no trigger"
+        return "sem trigger"
     if not isinstance(triggers, list):
         triggers = [triggers]
     t = triggers[0]
     platform = t.get("platform", "?")
     if platform == "time":
-        return f"every day at {t.get('at', '?')}"
+        return f"todo dia as {t.get('at', '?')}"
     if platform == "state":
         entity = t.get("entity_id", "?")
         to = t.get("to")
-        return f"{entity} change to {to}" if to else f"{entity} state change"
+        return f"{entity} mudar para {to}" if to else f"{entity} mudar de estado"
     if platform == "numeric_state":
         entity = t.get("entity_id", "?")
         above = t.get("above")
         below = t.get("below")
         if above is not None:
-            return f"{entity} above {above}"
+            return f"{entity} acima de {above}"
         if below is not None:
-            return f"{entity} below {below}"
-        return f"{entity} (numeric value)"
+            return f"{entity} abaixo de {below}"
+        return f"{entity} (valor numerico)"
     if platform == "time_pattern":
-        return "recurring time pattern"
+        return "padrao de tempo recorrente"
     if platform == "event":
-        return f"event {t.get('event_type', '?')}"
+        return f"evento {t.get('event_type', '?')}"
     return f"trigger {platform}"
 
 
 def _summarize_action(actions):
+    """Resumo curto PT-BR da acao para cards."""
     if not actions:
-        return "no action"
+        return "sem acao"
     if not isinstance(actions, list):
         actions = [actions]
     a = actions[0]
     service = a.get("service", a.get("action", "?"))
     target = a.get("target", {}).get("entity_id", a.get("entity_id", ""))
-    return f"{service} on {target}" if target else service
+    return f"{service} em {target}" if target else service
 
 
 # ==============================================================================
-# Commands - list and details
+# Comandos — lista e detalhes
 # ==============================================================================
 
 def cmd_list(json_mode=False):
+    """Lista automacoes criadas pelo agente."""
     automations = load_yaml(AGENT_YAML, default=[])
     if json_mode:
         items = []
         for a in automations:
             items.append({
                 "id": a.get("id", ""),
-                "alias": a.get("alias", "unnamed"),
+                "alias": a.get("alias", "sem nome"),
                 "enabled": a.get("initial_state", "on") == "on",
                 "trigger_summary": _summarize_trigger(a.get("trigger", [])),
             })
         emit_json({"count": len(items), "automations": items})
         return
     if not automations:
-        print("No automations created yet.")
+        print("Nenhuma automacao criada ainda.")
         return
-    lines = [f"Active automations ({len(automations)}):"]
+    lines = [f"Automacoes ativas ({len(automations)}):"]
     for i, a in enumerate(automations, 1):
         alias = a.get("alias", "?")
         triggers = len(a.get("trigger", []))
         actions = len(a.get("action", []))
-        lines.append(f"{i}. {alias} ({triggers} trigger, {actions} action)")
+        lines.append(f"{i}. {alias} ({triggers} gatilho, {actions} acao)")
     print("\n".join(lines))
 
 
 def cmd_details(identifier, json_mode=False):
+    """Retorna detalhes de uma automacao especifica."""
     automations = load_yaml(AGENT_YAML, default=[])
     auto = _find_automation(automations, identifier)
     if not auto:
         if json_mode:
-            emit_json({"success": False, "error": f"Automation '{identifier}' not found"})
+            emit_json({"success": False, "error": f"Automacao '{identifier}' nao encontrada"})
         else:
-            print(f"Automation '{identifier}' not found.")
+            print(f"Automacao '{identifier}' nao encontrada.")
         return
     if json_mode:
         emit_json({
@@ -278,14 +273,15 @@ def cmd_details(identifier, json_mode=False):
             "mode": auto.get("mode", "single"),
         })
         return
-    print(f"Automation: {auto.get('alias', 'unnamed')}")
+    print(f"Automacao: {auto.get('alias', 'sem nome')}")
     print(f"  ID: {auto.get('id', '?')}")
-    print(f"  Status: {'active' if auto.get('initial_state', 'on') == 'on' else 'disabled'}")
+    print(f"  Status: {'ativa' if auto.get('initial_state', 'on') == 'on' else 'desativada'}")
     print(f"  Trigger: {_summarize_trigger(auto.get('trigger', []))}")
-    print(f"  Action: {_summarize_action(auto.get('action', []))}")
+    print(f"  Acao: {_summarize_action(auto.get('action', []))}")
 
 
 def cmd_stats(json_mode=False):
+    """Estatisticas gerais das automacoes do agente."""
     automations = load_yaml(AGENT_YAML, default=[])
     total = len(automations)
     active = sum(1 for a in automations if a.get("initial_state", "on") == "on")
@@ -306,53 +302,60 @@ def cmd_stats(json_mode=False):
             "triggers_by_type": triggers_by_type,
         })
         return
-    print(f"Total agent automations: {total}")
-    print(f"  Active: {active}")
-    print(f"  Disabled: {disabled}")
+    print(f"Total de automacoes do agente: {total}")
+    print(f"  Ativas: {active}")
+    print(f"  Desativadas: {disabled}")
     if triggers_by_type:
-        print("  Trigger types:")
+        print("  Tipos de trigger:")
         for tp, count in sorted(triggers_by_type.items()):
             print(f"    - {tp}: {count}")
 
 
 # ==============================================================================
-# Commands - create / remove (with validate-before-reload)
+# Comandos — create / remove
 # ==============================================================================
 
 def cmd_create(json_str, token, json_mode=False):
+    """Cria automacao a partir de spec JSON."""
     if not json_str or not json_str.strip():
         if json_mode:
-            emit_json({"success": False, "error": "empty JSON spec"})
+            emit_json({"success": False, "error": "spec JSON vazia"})
         else:
-            print("ERROR: Empty spec.")
+            print("ERROR: Empty spec. Pass JSON as: manage_agent_auto_create spec='{{...}}'")
         return
 
-    # v7.3-C — fix_json returns tuple
+    # v7.3-C — fix_json agora retorna (result, needed_repair)
     spec, needed_repair = fix_json(json_str)
-    if needed_repair:
-        log_inferential_degradation()
-
     if spec is None:
         if json_mode:
-            emit_json({"success": False, "error": "invalid JSON and could not auto-correct"})
+            emit_json({"success": False, "error": "JSON invalido e nao foi possivel corrigir"})
         else:
             print("ERROR: Invalid JSON and could not auto-correct.")
         return
+    if needed_repair:
+        # JSON malformado do modelo — registra como sinal de degradacao
+        try:
+            subprocess.run(
+                ["python3", "/config/scripts/circuit_breaker.py", "log_503"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3
+            )
+        except Exception:
+            pass
 
     alias = spec.get("alias", "").strip()
     if not alias:
         if json_mode:
-            emit_json({"success": False, "error": "'alias' is required"})
+            emit_json({"success": False, "error": "'alias' e obrigatorio"})
         else:
             print("ERROR: 'alias' is required.")
         return
 
-    auto_id = spec.get("id") or f"agent_auto_{int(time.time())}"
+    auto_id = f"permear_agent_{int(time.time())}"
 
     trigger = spec.get("trigger")
     if not trigger:
         if json_mode:
-            emit_json({"success": False, "error": "'trigger' is required"})
+            emit_json({"success": False, "error": "'trigger' e obrigatorio"})
         else:
             print("ERROR: 'trigger' is required.")
         return
@@ -374,7 +377,7 @@ def cmd_create(json_str, token, json_mode=False):
             eid = t.get("entity_id")
             if eid and not entity_exists(eid, token):
                 if json_mode:
-                    emit_json({"success": False, "error": f"Entity '{eid}' does not exist in HA"})
+                    emit_json({"success": False, "error": f"Entidade '{eid}' nao existe no HA"})
                 else:
                     print(f"ERROR: Entity '{eid}' does not exist in HA.")
                 return
@@ -383,7 +386,7 @@ def cmd_create(json_str, token, json_mode=False):
         eid = trigger.get("entity_id")
         if eid and not entity_exists(eid, token):
             if json_mode:
-                emit_json({"success": False, "error": f"Entity '{eid}' does not exist in HA"})
+                emit_json({"success": False, "error": f"Entidade '{eid}' nao existe no HA"})
             else:
                 print(f"ERROR: Entity '{eid}' does not exist in HA.")
             return
@@ -392,7 +395,7 @@ def cmd_create(json_str, token, json_mode=False):
     action = spec.get("action")
     if not action:
         if json_mode:
-            emit_json({"success": False, "error": "'action' is required"})
+            emit_json({"success": False, "error": "'action' e obrigatorio"})
         else:
             print("ERROR: 'action' is required.")
         return
@@ -408,7 +411,7 @@ def cmd_create(json_str, token, json_mode=False):
             eid = a["data"]["entity_id"]
             if not entity_exists(eid, token):
                 if json_mode:
-                    emit_json({"success": False, "error": f"Entity '{eid}' in action does not exist"})
+                    emit_json({"success": False, "error": f"Entidade '{eid}' na acao nao existe"})
                 else:
                     print(f"ERROR: Entity '{eid}' in action does not exist.")
                 return
@@ -416,7 +419,7 @@ def cmd_create(json_str, token, json_mode=False):
             eid = a["target"]["entity_id"]
             if not entity_exists(eid, token):
                 if json_mode:
-                    emit_json({"success": False, "error": f"Entity '{eid}' in target does not exist"})
+                    emit_json({"success": False, "error": f"Entidade '{eid}' no target nao existe"})
                 else:
                     print(f"ERROR: Entity '{eid}' in target does not exist.")
                 return
@@ -429,15 +432,15 @@ def cmd_create(json_str, token, json_mode=False):
 
     if len(automations) >= MAX_AUTOMATIONS:
         if json_mode:
-            emit_json({"success": False, "error": f"max {MAX_AUTOMATIONS} automations reached"})
+            emit_json({"success": False, "error": f"Limite de {MAX_AUTOMATIONS} automacoes atingido"})
         else:
-            print(f"ERROR: Maximum {MAX_AUTOMATIONS} automations reached.")
+            print(f"ERROR: Maximum {MAX_AUTOMATIONS} automations reached. Remove one first.")
         return
 
     for a in automations:
         if a.get("alias", "").lower() == alias.lower():
             if json_mode:
-                emit_json({"success": False, "error": f"automation with alias '{alias}' already exists"})
+                emit_json({"success": False, "error": f"Automacao com alias '{alias}' ja existe"})
             else:
                 print(f"ERROR: Automation with alias '{alias}' already exists.")
             return
@@ -456,7 +459,7 @@ def cmd_create(json_str, token, json_mode=False):
         automations.pop()
         save_automations(automations)
         if json_mode:
-            emit_json({"success": False, "error": "invalid YAML after write. Automation not created."})
+            emit_json({"success": False, "error": "YAML invalido apos escrita. Automacao nao criada."})
         else:
             print("ERROR: YAML validation failed. Automation not created.")
         return
@@ -464,13 +467,12 @@ def cmd_create(json_str, token, json_mode=False):
     # v7.3-C — Pre-reload validation via Supervisor API
     config_ok, config_err = validate_ha_config(token)
     if not config_ok:
-        # Automatic rollback
         automations.pop()
         save_automations(automations)
         if json_mode:
-            emit_json({"success": False, "error": f"HA config invalid after add: {config_err}"})
+            emit_json({"success": False, "error": f"HA config invalida apos adicionar: {config_err}"})
         else:
-            print(f"ERROR: HA config check failed: {config_err}. Automation rolled back.")
+            print(f"ERROR: HA config check falhou: {config_err}. Automacao revertida.")
         return
 
     reloaded = reload_automations(token)
@@ -478,18 +480,19 @@ def cmd_create(json_str, token, json_mode=False):
         emit_json({"success": True, "alias": alias, "id": auto_id, "reloaded": reloaded})
     else:
         if reloaded:
-            print(f"Automation created: '{alias}' (id: {auto_id}). Active immediately.")
+            print(f"Automacao criada: '{alias}' (id: {auto_id}). Ativa imediatamente.")
         else:
-            print(f"Automation created: '{alias}' (id: {auto_id}). Reload failed, active on next HA restart.")
+            print(f"Automacao criada: '{alias}' (id: {auto_id}). Reload falhou, ativa no proximo reinicio do HA.")
 
 
 def cmd_create_from_file(token, json_mode=False):
+    """Cria automacao a partir de pending_auto_spec.json."""
     try:
         with open(PENDING_SPEC_PATH, 'r') as f:
             json_str = f.read().strip()
     except FileNotFoundError:
         if json_mode:
-            emit_json({"success": False, "error": "pending spec file not found"})
+            emit_json({"success": False, "error": "Arquivo de spec pendente nao encontrado"})
         else:
             print("ERROR: No pending spec file found.")
         return
@@ -497,81 +500,92 @@ def cmd_create_from_file(token, json_mode=False):
 
 
 def cmd_remove(identifier, token, json_mode=False):
+    """Remove automacao por alias ou id."""
     automations = load_yaml(AGENT_YAML, default=[])
     identifier_lower = identifier.strip().lower()
-    found_idx = None
+    found = None
     for i, a in enumerate(automations):
         if a.get("id", "").lower() == identifier_lower or \
            a.get("alias", "").lower() == identifier_lower:
-            found_idx = i
+            found = i
             break
-    if found_idx is None:
+    if found is None:
         if json_mode:
-            emit_json({"success": False, "error": f"automation '{identifier}' not found"})
+            emit_json({"success": False, "error": f"Automacao '{identifier}' nao encontrada"})
         else:
             print(f"ERROR: No automation found matching '{identifier}'.")
         return
-    removed = automations.pop(found_idx)
-    save_automations(automations)
+    removed = automations.pop(found)
 
-    # v7.3-C — Pre-reload validation; if invalid, reinsert the removed automation
-    config_ok, config_err = validate_ha_config(token)
-    if not config_ok:
-        automations.insert(found_idx, removed)
+    if not save_automations(automations):
+        automations.insert(found, removed)
         save_automations(automations)
         if json_mode:
-            emit_json({"success": False, "error": f"HA config invalid after remove: {config_err}"})
+            emit_json({"success": False, "error": "YAML invalido apos remocao. Automacao restaurada."})
         else:
-            print(f"ERROR: HA config check failed: {config_err}. Automation restored.")
+            print("ERROR: YAML validation failed after remove. Automation restored.")
+        return
+
+    # v7.3-C — Pre-reload validation com rollback
+    config_ok, config_err = validate_ha_config(token)
+    if not config_ok:
+        automations.insert(found, removed)
+        save_automations(automations)
+        if json_mode:
+            emit_json({"success": False, "error": f"HA config invalida apos remover: {config_err}"})
+        else:
+            print(f"ERROR: HA config check falhou: {config_err}. Automacao restaurada.")
         return
 
     reload_automations(token)
     if json_mode:
         emit_json({"success": True, "alias": removed.get("alias", "")})
     else:
-        print(f"Automation removed: '{removed.get('alias')}'")
+        print(f"Automacao removida: '{removed.get('alias')}'")
 
 
 # ==============================================================================
-# Commands - disable / enable
+# Comandos — disable / enable
 # ==============================================================================
 
 def cmd_disable(identifier, json_mode=False):
+    """Desativa automacao sem remover."""
     automations = load_yaml(AGENT_YAML, default=[])
     auto = _find_automation(automations, identifier)
     if not auto:
         if json_mode:
-            emit_json({"success": False, "error": f"automation '{identifier}' not found"})
+            emit_json({"success": False, "error": f"Automacao '{identifier}' nao encontrada"})
         else:
-            print(f"Automation '{identifier}' not found.")
+            print(f"Automacao '{identifier}' nao encontrada.")
         return
     auto["initial_state"] = "off"
     save_yaml(AGENT_YAML, automations)
     if json_mode:
         emit_json({"success": True, "alias": auto.get("alias", ""), "enabled": False})
     else:
-        print(f"Automation '{auto.get('alias', identifier)}' disabled.")
+        print(f"Automacao '{auto.get('alias', identifier)}' desativada.")
 
 
 def cmd_enable(identifier, json_mode=False):
+    """Reativa automacao previamente desativada."""
     automations = load_yaml(AGENT_YAML, default=[])
     auto = _find_automation(automations, identifier)
     if not auto:
         if json_mode:
-            emit_json({"success": False, "error": f"automation '{identifier}' not found"})
+            emit_json({"success": False, "error": f"Automacao '{identifier}' nao encontrada"})
         else:
-            print(f"Automation '{identifier}' not found.")
+            print(f"Automacao '{identifier}' nao encontrada.")
         return
     auto["initial_state"] = "on"
     save_yaml(AGENT_YAML, automations)
     if json_mode:
         emit_json({"success": True, "alias": auto.get("alias", ""), "enabled": True})
     else:
-        print(f"Automation '{auto.get('alias', identifier)}' re-enabled.")
+        print(f"Automacao '{auto.get('alias', identifier)}' reativada.")
 
 
 # ==============================================================================
-# Main dispatch
+# Dispatch principal
 # ==============================================================================
 
 def main():
@@ -586,52 +600,60 @@ def main():
 
     if command == "list":
         cmd_list(json_mode=json_mode)
+
     elif command == "create":
         if not args:
             if json_mode:
-                emit_json({"success": False, "error": "create requires JSON spec"})
+                emit_json({"success": False, "error": "create requer spec JSON como argumento"})
             else:
                 print("ERROR: JSON spec required.")
             sys.exit(1)
         cmd_create(" ".join(args), token, json_mode=json_mode)
+
     elif command == "create_from_file":
         cmd_create_from_file(token, json_mode=json_mode)
+
     elif command == "remove":
         if not args:
             if json_mode:
-                emit_json({"success": False, "error": "remove requires alias or id"})
+                emit_json({"success": False, "error": "remove requer alias ou id"})
             else:
-                print("ERROR: alias or id required.")
+                print("ERROR: Automation id or alias required.")
             sys.exit(1)
         cmd_remove(args[0], token, json_mode=json_mode)
+
     elif command == "details":
         if not args:
             if json_mode:
-                emit_json({"success": False, "error": "details requires alias or id"})
+                emit_json({"success": False, "error": "details requer alias ou id"})
             else:
-                print("ERROR: alias or id required")
+                print("ERROR: details requer alias ou id")
             sys.exit(1)
         cmd_details(args[0], json_mode=json_mode)
+
     elif command == "disable":
         if not args:
             if json_mode:
-                emit_json({"success": False, "error": "disable requires alias or id"})
+                emit_json({"success": False, "error": "disable requer alias ou id"})
             else:
-                print("ERROR: alias or id required")
+                print("ERROR: disable requer alias ou id")
             sys.exit(1)
         cmd_disable(args[0], json_mode=json_mode)
+
     elif command == "enable":
         if not args:
             if json_mode:
-                emit_json({"success": False, "error": "enable requires alias or id"})
+                emit_json({"success": False, "error": "enable requer alias ou id"})
             else:
-                print("ERROR: alias or id required")
+                print("ERROR: enable requer alias ou id")
             sys.exit(1)
         cmd_enable(args[0], json_mode=json_mode)
+
     elif command == "stats":
         cmd_stats(json_mode=json_mode)
+
     else:
-        print(f"ERROR: Unknown command '{command}'.")
+        print(f"ERROR: Unknown command '{command}'. Use: list, create, create_from_file, remove, details, disable, enable, stats.")
         sys.exit(1)
 
 
