@@ -123,34 +123,3 @@ memory.py           ← legacy helpers (load_json, save_json, locked_update)
 logs.py             ← log helpers + NOISY_COMPONENTS filter
 agent.py            ← HA REST API helpers
 ```
-
----
-
-## Not published (gitignored)
-
-```
-configuration.yaml           ← household HA config (user's own)
-secrets.yaml                 ← credentials and tokens
-automations/base.yaml        ← household automations: window alerts, AC,
-                                household maintenance (TTS/Z2M/HA log cleanup)
-automations/terrabot.yaml    ← separate project
-scripts/seed_memory_test.py  ← PM convenience script, not a feature
-memory/permear_memory.db     ← Organic Memory (what the system learned)
-memory/guidelines.json       ← residents + action_items
-memory/monitored_entities.json
-memory/                      ← all runtime state files
-backups/
-CLAUDE.md                    ← internal AI agent instructions
-AUDIT_PLAN.md                ← internal planning document
-audit_reports/               ← internal audit work logs
-```
-
----
-
-## Note on household shell_commands in packages/permear.yaml
-
-`clear_tts_cache`, `clear_z2m_logs`, and `clear_ha_log` are defined in
-`packages/permear.yaml` but called only by household automations in
-`base.yaml` (gitignored). They are harmless for users who don't have
-TTS or Zigbee2MQTT — the underlying `find`/`rm -f` commands silently
-find nothing and exit cleanly.
