@@ -285,7 +285,7 @@ and any household-specific automation files.
 
 ## Status
 
-Current release: **v8.2.0** (June 2026). Production-validated on a
+Current release: **v8.3.0** (June 2026). Production-validated on a
 Raspberry Pi 4 (2 GB) running Home Assistant OS. SQLite memory, dynamic
 threshold, four-slot provider architecture, English codebase.
 

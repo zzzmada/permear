@@ -18,7 +18,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from permear_config import NOISY_COMPONENTS, SELF_COMPONENTS
 
 ARCHIVE_SCRIPT = "/config/scripts/manage_archived.py"
-CIRCUIT_SCRIPT = "/config/scripts/circuit_breaker.py"
 
 
 TRANSIENT_MSG_KEYWORDS = [
@@ -99,13 +98,6 @@ def process_event(component, message):
 
     # Filter 3: provider 503/UNAVAILABLE — transient, retry resolves it
     if is_provider_transient(component, message):
-        try:
-            subprocess.run(
-                ["python3", CIRCUIT_SCRIPT, "log_503"],
-                capture_output=True, timeout=3
-            )
-        except Exception:
-            pass
         emit(True, hash_val=err_hash, reason="gemini_transient")
         return
 

@@ -11,7 +11,7 @@ def main():
         print("SKIP: empty content"); return
     init_db()
     _id, was_new, via = add_or_reinforce(
-        content.strip(), kind="observation", source="interaction",
+        content.strip(), kind="interaction", source="interaction",
         metadata={"canal": canal}
     )
     print(f"OK id={_id} new={was_new} via={via} canal={canal}")

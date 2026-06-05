@@ -13,7 +13,6 @@ Usage:
 """
 import json
 import re
-import subprocess
 import sys
 import os
 import time
@@ -332,16 +331,6 @@ def cmd_create(json_str, token, json_mode=False):
         else:
             print("ERROR: Invalid JSON and could not auto-correct.")
         return
-    if needed_repair:
-        # JSON malformado do modelo — registra como sinal de degradacao
-        try:
-            subprocess.run(
-                ["python3", "/config/scripts/circuit_breaker.py", "log_503"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3
-            )
-        except Exception:
-            pass
-
     alias = spec.get("alias", "").strip()
     if not alias:
         if json_mode:

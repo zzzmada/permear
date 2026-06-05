@@ -37,14 +37,6 @@ knowledge of patterns the system has already consolidated. Injecting
 suppress redundant alerts more intelligently. Pairs naturally with
 cross-dimensional patterns above.
 
-### Final removal of `circuit_breaker.py`
-
-The file is marked INACTIVE in the codebase but still has six live
-`shell_command` entries pointing to it from a prior architecture. Removing
-those entries cleanly, then deleting the file, is housekeeping deferred
-from the v8 audit (which confirmed the dependencies but did not remove
-them).
-
 ---
 
 ## v9 — HACS preparation

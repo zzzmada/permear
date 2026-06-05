@@ -37,7 +37,7 @@ CYCLES_SYSTEMS_TIME    = _cycles.get("systems_time",     "04:00")
 
 # Paths
 MEMORY_DIR = "/config/memory"
-AGENT_YAML = "/config/automations/permear_agent.yaml"  # agent-managed automations (CRUD via manage_agent_automations.py)
+AGENT_YAML = "/config/automations/permear_agent.yaml"
 AUTOMATIONS_YAML = "/config/automations/events.yaml"
 TOKEN_PATH = "/config/.permear_token"
 HA_URL = "http://localhost:8123"

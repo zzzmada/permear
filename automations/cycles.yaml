@@ -16,6 +16,10 @@
     - action: shell_command.build_sleep_prompt
       response_variable: prompt_result
 
+    # v8.3: suppress when the day has no events / interactions / pending items
+    - condition: template
+      value_template: "{{ (prompt_result.stdout | default('') | trim) != 'SUPPRESS' }}"
+
     # === AI Task with standard fallback ===
     - choose:
         - conditions:
@@ -92,19 +96,11 @@
         - condition: template
           value_template: "{{ briefing_success }}"
       then:
-        - action: shell_command.agent_daily_summary
-          response_variable: summary_result
-        - variables:
-            summary_text: "{{ summary_result.stdout | default('') | trim }}"
-            final_message: >
-              {{ briefing_speech }}{% if summary_text %}
-
-              {{ summary_text }}{% endif %}
         - action: telegram_bot.send_message
           data:
             chat_id: !secret telegram_chat_id
             parse_mode: plain_text
-            message: "{{ final_message }}"
+            message: "{{ briefing_speech }}"
         - action: input_text.set_value
           target:
             entity_id: input_text.permear_last_message
@@ -172,6 +168,19 @@
                   relevant memories (not trivialities). Short, factual phrases
                   that make sense to re-read days later, in Brazilian Portuguese.
 
+                  EXCLUDE: framework errors, LLM/provider failures, Telegram
+                  commands, test messages, and any PERMEAR system operational
+                  issues. Only real household behavior counts.
+
+                  SYNTHESIZE: prefer synthesis over repeating individual entity
+                  events already captured by the hourly heartbeat — those are
+                  already stored with entity keys and don't need to be re-listed.
+
+                  For each memory about a specific HA entity, append
+                  [entity:<entity_id>] at the end of the memory text
+                  (e.g. "Cortina fechada automaticamente à noite [entity:cover.cortina_da_direita]").
+                  Only for single-entity memories — not for general summaries.
+
                   Today's events: {{ state_attr('sensor.permear_daily_memory', 'eventos') | default([]) | tojson }}
                   Interactions: {{ state_attr('sensor.permear_daily_memory', 'interacoes') | default([]) | tojson }}
 
@@ -194,6 +203,15 @@
               Analyze today's events and interactions and extract up to 5
               relevant memories (not trivialities). Short, factual phrases
               that make sense to re-read days later, in Brazilian Portuguese.
+
+              EXCLUDE: framework errors, LLM/provider failures, Telegram
+              commands, test messages, and any PERMEAR system operational
+              issues. Only real household behavior counts.
+
+              For each memory about a specific HA entity, append
+              [entity:<entity_id>] at the end of the memory text
+              (e.g. "Cortina fechada automaticamente à noite [entity:cover.cortina_da_direita]").
+              Only for single-entity memories — not for general summaries.
 
               Today's events: {{ state_attr('sensor.permear_daily_memory', 'eventos') | default([]) | tojson }}
               Interactions: {{ state_attr('sensor.permear_daily_memory', 'interacoes') | default([]) | tojson }}
@@ -225,6 +243,19 @@
                   Analyze today's events and interactions and extract up to 5
                   relevant memories (not trivialities). Short, factual phrases
                   that make sense to re-read days later, in Brazilian Portuguese.
+
+                  EXCLUDE: framework errors, LLM/provider failures, Telegram
+                  commands, test messages, and any PERMEAR system operational
+                  issues. Only real household behavior counts.
+
+                  SYNTHESIZE: prefer synthesis over repeating individual entity
+                  events already captured by the hourly heartbeat — those are
+                  already stored with entity keys and don't need to be re-listed.
+
+                  For each memory about a specific HA entity, append
+                  [entity:<entity_id>] at the end of the memory text
+                  (e.g. "Cortina fechada automaticamente à noite [entity:cover.cortina_da_direita]").
+                  Only for single-entity memories — not for general summaries.
 
                   Today's events: {{ state_attr('sensor.permear_daily_memory', 'eventos') | default([]) | tojson }}
                   Interactions: {{ state_attr('sensor.permear_daily_memory', 'interacoes') | default([]) | tojson }}
