@@ -23,6 +23,15 @@
         {% set is_answer = text in ['sim', 'yes', 'ok', 'confirmo', 'approve', 'não', 'nao', 'cancel', 'cancelar', 'no', 'reject'] %}
         {{ not (spec not in ['', 'unknown'] and is_answer) }}
   action:
+    # v8.3: dedup — skip if this message_id was already processed today
+    - action: shell_command.telegram_dedup_check
+      data:
+        message_id: "{{ trigger.event.data.message_id | default('0') }}"
+      response_variable: _dedup
+      continue_on_error: true
+    - condition: template
+      value_template: "{{ _dedup.stdout | default('NEW') | trim != 'DUP' }}"
+
     - action: shell_command.record_interaction
       data:
         canal: telegram

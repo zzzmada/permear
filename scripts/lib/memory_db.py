@@ -194,8 +194,11 @@ def run_tier_maintenance():
             if silence >= MEMORY_EPHEMERAL_FADE_DAYS:
                 new_tier = "faded"
                 counts["faded"] += 1
-            # promote only if not fading and reinforced enough within window
-            elif mentions >= MEMORY_ACTIVE_PROMOTE_MENTIONS and age_since_first <= MEMORY_ACTIVE_PROMOTE_WINDOW:
+            # promote only if not fading, reinforced enough, and not an interaction record
+            # (interactions are context, never promotable — they decay normally)
+            elif (item["source"] != "interaction"
+                  and mentions >= MEMORY_ACTIVE_PROMOTE_MENTIONS
+                  and age_since_first <= MEMORY_ACTIVE_PROMOTE_WINDOW):
                 new_tier = "active"
                 counts["promoted_active"] += 1
 

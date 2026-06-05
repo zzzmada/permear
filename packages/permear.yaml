@@ -19,8 +19,6 @@ shell_command:
   run_memory_maintenance: 'python3 /config/scripts/run_memory_maintenance.py'
   cleanup_event_buffer: 'python3 -c "import sys; sys.path.insert(0,\"/config/scripts\"); from lib.memory_db import init_db, cleanup_old_events, reset_daily_flags; init_db(); e=cleanup_old_events(); f=reset_daily_flags(); print(f\"cleanup: {e} events, {f} flags removed\")"'
   init_memory_db: 'python3 /config/scripts/init_memory_db.py'
-  seed_memory_test: 'python3 /config/scripts/seed_memory_test.py'
-  clear_memory_seeds: 'python3 /config/scripts/seed_memory_test.py clear'
 
   # Sleep Consolidation cycle
   build_sleep_prompt: "python3 /config/scripts/build_sleep_prompt.py"
@@ -49,13 +47,9 @@ shell_command:
 
   # Fallback and health tracking
   agent_log_fallback: 'python3 /config/scripts/log_fallback.py'
-  # circuit_breaker.py: inactive since v7.7 ai_task migration (kept for rollback)
-  agent_circuit_check: 'python3 /config/scripts/circuit_breaker.py check'
-  agent_circuit_fail: 'python3 /config/scripts/circuit_breaker.py fail'
-  agent_circuit_success: 'python3 /config/scripts/circuit_breaker.py success'
-  agent_log_retry_success: 'python3 /config/scripts/circuit_breaker.py log_retry_success'
-  agent_log_3fail: 'python3 /config/scripts/circuit_breaker.py log_3fail'
-  agent_daily_summary: 'python3 /config/scripts/circuit_breaker.py daily_summary'
+
+  # Telegram dedup guard
+  telegram_dedup_check: "python3 /config/scripts/telegram_dedup.py '{{ message_id | default(\"0\") }}'"
 
   # Error monitoring and archiving
   process_log_event: "python3 /config/scripts/process_log_event.py '{{ component }}' '{{ message }}'"

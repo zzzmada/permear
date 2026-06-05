@@ -6,6 +6,35 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [8.3.0] - 2026-06-05
+
+### Added
+
+- Telegram message deduplication guard (`telegram_dedup.py`): the conversation
+  handler ignores a `message_id` already processed, preventing duplicate replies
+  and duplicate device control on repeated delivery.
+- Sleep Consolidation memories now carry a validated canonical `key` when the
+  extraction identifies a single entity, enabling deterministic reinforcement
+  (previously only Heartbeat memories had keys; most of the store relied on FTS).
+
+### Changed
+
+- Heartbeat now emits human-readable text for buffer events instead of the raw
+  internal trigger id.
+- Empty-day Sleep Consolidation is suppressed: when there are no events, memories,
+  or pending items, no message is sent (silence is the default state).
+- Interactions (`source=interaction`) no longer promote to `pattern` — raw
+  commands are recorded for context but never become household patterns.
+- Sleep extraction now excludes infrastructure/framework errors (aligned with
+  Systems Consolidation).
+
+### Removed
+
+- `circuit_breaker.py` and its six `shell_command` entries (inactive since v7.7;
+  live fallback detection is handled by `sensor.permear_health`).
+
+---
+
 ## [8.2.0] - 2026-06-02
 
 ### Added

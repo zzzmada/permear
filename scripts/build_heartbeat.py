@@ -175,12 +175,38 @@ def scan_silent_entities(states_dict):
     return candidates
 
 
+_HUMANIZE_VERBS = frozenset({
+    "ligou", "desligou", "chegou", "saiu", "abriu", "fechou",
+    "aberta", "fechada", "mudou", "ativo", "inativo",
+})
+
+
+def _humanize_event(detalhe, entity_id, states_dict):
+    """Convert a raw trigger ID to a human-readable PT string.
+    Prefers friendly_name + verb suffix; falls back to prettified trigger ID.
+    """
+    if " " in detalhe:
+        return detalhe  # already human-readable
+    fname = ""
+    if entity_id and states_dict:
+        s = states_dict.get(entity_id, {})
+        fname = s.get("attributes", {}).get("friendly_name", "")
+    if fname:
+        # Extract last segment as verb hint (e.g. "tv_sala_ligou" → "ligou")
+        suffix = detalhe.rsplit("_", 1)[-1]
+        if suffix in _HUMANIZE_VERBS:
+            return f"{fname}: {suffix}"
+        return fname
+    return detalhe.replace("_", " ").capitalize()
+
+
 def build_candidates(health_summary, monitored, states_dict=None):
     """
     Builds the candidate list from the current state.
     Each candidate: {type, content, entity_id, timestamp}
     v7.5-B: today's events + health errors.
     v7.6: battery below threshold + circuit-breaker health.
+    v8.3: human-readable content for buffer events.
     """
     candidates = []
     now_iso = datetime.now().isoformat()
@@ -190,10 +216,12 @@ def build_candidates(health_summary, monitored, states_dict=None):
         detalhe = ev.get("detalhe", "")
         if detalhe.startswith("erro:"):  # errors go through monitor, not ARAS (CLAUDE.md)
             continue
+        entity_id = ev.get("entity_id")
+        content = _humanize_event(detalhe, entity_id, states_dict)
         candidates.append({
             "type": "event",
-            "content": detalhe,
-            "entity_id": ev.get("entity_id"),
+            "content": content,
+            "entity_id": entity_id,
             "timestamp": ev.get("ts", now_iso),
         })
 
