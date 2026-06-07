@@ -144,6 +144,9 @@ def cmd_check_backup():
 
 
 def cmd_execute(entity_id):
+    if not entity_id or entity_id == "{{ entity_id }}":
+        print(f"Entidade invalida: '{entity_id}'. Argumento nao renderizado ou vazio.")
+        return
     token = load_token()
     domain, _, service_name = entity_id.partition(".")
     if domain != "update":

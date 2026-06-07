@@ -70,6 +70,8 @@
     - platform: state
       entity_id: cover.cortina_da_direita
       id: "cortina_direita_mudou"
+      for:
+        seconds: 3
     - platform: state
       entity_id: cover.cortina_da_esquerda
       id: "cortina_esquerda_mudou"
@@ -83,10 +85,22 @@
       id: "tv_sala_desligou"
     # [END buffer_eventos triggers — generated]
   action:
+    - variables:
+        metadata: |
+          {% set ns = namespace(attrs={}) %}
+          {% if trigger.to_state and trigger.to_state.domain == 'media_player' %}
+            {% set ns.attrs = {'title': (trigger.to_state.attributes.media_title | default('') | string)} %}
+          {% elif trigger.to_state and trigger.to_state.domain == 'cover' %}
+            {% set ns.attrs = {'position': trigger.to_state.attributes.current_position | default(-1) | int} %}
+          {% elif trigger.to_state and trigger.to_state.domain == 'climate' %}
+            {% set ns.attrs = {'temp': (trigger.to_state.attributes.current_temperature | default(0) | float), 'setpoint': (trigger.to_state.attributes.temperature | default(0) | float)} %}
+          {% endif %}
+          {{ ns.attrs | to_json }}
     - action: shell_command.record_event
       data:
         detalhe: "{{ trigger.id }}"
         entity_id: "{{ trigger.entity_id | default('') }}"
+        metadata: "{{ metadata | trim }}"
   mode: queued
   max: 20
 

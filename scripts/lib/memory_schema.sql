@@ -40,9 +40,20 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     tipo       TEXT NOT NULL,
     detalhe    TEXT NOT NULL,
     entity_id  TEXT,
-    canal      TEXT
+    canal      TEXT,
+    metadata   TEXT DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_event_buffer_ts ON event_buffer(ts);
+
+-- v8.5-eventlog: insert-only log for temporal correlation (30 day retention)
+CREATE TABLE IF NOT EXISTS event_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    entity_id  TEXT,
+    detalhe    TEXT NOT NULL,
+    metadata   TEXT DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_event_log_ts ON event_log(ts);
 
 -- Triggers to keep FTS in sync
 CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_items BEGIN

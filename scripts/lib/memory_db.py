@@ -38,11 +38,14 @@ def _connect():
 
 
 def init_db():
-    """Create schema if not exists. Idempotent."""
+    """Create schema if not exists. Idempotent. Migrates event_buffer.metadata if missing."""
     conn = _connect()
     with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
-    conn.commit()
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(event_buffer)")}
+    if 'metadata' not in cols:
+        conn.execute("ALTER TABLE event_buffer ADD COLUMN metadata TEXT DEFAULT '{}'")
+        conn.commit()
     conn.close()
 
 
@@ -328,13 +331,27 @@ def reset_daily_flags() -> int:
 
 
 def record_event(tipo: str, detalhe: str, entity_id: str = None,
-                 canal: str = 'evento') -> int:
-    """Insere evento no event_buffer. Retorna id."""
-    now = datetime.now().isoformat()
+                 canal: str = 'evento', metadata: str = '{}', ts: str = None) -> int:
+    """Insere evento no event_buffer. metadata: JSON string com atributos por tipo. Retorna id.
+    ts opcional — se omitido, gera LOCAL agora (datetime.now().isoformat())."""
+    now = ts or datetime.now().isoformat()
     conn = _connect()
     cur = conn.execute(
-        "INSERT INTO event_buffer (ts, tipo, detalhe, entity_id, canal) VALUES (?,?,?,?,?)",
-        (now, tipo, detalhe, entity_id or None, canal)
+        "INSERT INTO event_buffer (ts, tipo, detalhe, entity_id, canal, metadata) VALUES (?,?,?,?,?,?)",
+        (now, tipo, detalhe, entity_id or None, canal, metadata)
+    )
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+    return row_id
+
+
+def append_event_log(ts: str, entity_id: str, detalhe: str, metadata: str = '{}') -> int:
+    """Insere no event_log (insert-only histórico). Mesmo ts do event_buffer. Retorna id."""
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO event_log (ts, entity_id, detalhe, metadata) VALUES (?,?,?,?)",
+        (ts, entity_id or None, detalhe, metadata)
     )
     conn.commit()
     row_id = cur.lastrowid
@@ -343,29 +360,43 @@ def record_event(tipo: str, detalhe: str, entity_id: str = None,
 
 
 def get_today_events() -> list:
-    """Eventos de HOJE do event_buffer. Retorna dicts com {id,ts,tipo,detalhe,entity_id,canal}."""
+    """Eventos de HOJE do event_buffer (timezone local). Retorna dicts com {id,ts,tipo,detalhe,entity_id,canal,metadata}."""
     conn = _connect()
+    hoje = datetime.now().strftime("%Y-%m-%d")
     rows = conn.execute(
-        "SELECT * FROM event_buffer WHERE date(ts) = date('now') ORDER BY ts"
+        "SELECT * FROM event_buffer WHERE date(ts) = ? ORDER BY ts", (hoje,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def count_today_events() -> int:
-    """Contagem rápida de eventos de hoje."""
+    """Contagem rápida de eventos de hoje (timezone local)."""
     conn = _connect()
+    hoje = datetime.now().strftime("%Y-%m-%d")
     n = conn.execute(
-        "SELECT COUNT(*) FROM event_buffer WHERE date(ts) = date('now')"
+        "SELECT COUNT(*) FROM event_buffer WHERE date(ts) = ?", (hoje,)
     ).fetchone()[0]
     conn.close()
     return n
 
 
 def cleanup_old_events() -> int:
-    """DELETE eventos de dias anteriores. Retorna rows afetadas."""
+    """DELETE eventos de dias anteriores (timezone local). Retorna rows afetadas."""
     conn = _connect()
-    cur = conn.execute("DELETE FROM event_buffer WHERE date(ts) < date('now')")
+    hoje = datetime.now().strftime("%Y-%m-%d")
+    cur = conn.execute("DELETE FROM event_buffer WHERE date(ts) < ?", (hoje,))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def cleanup_event_log(days: int = 30) -> int:
+    """DELETE do event_log linhas mais antigas que days dias (timezone local). Retorna rows deletadas."""
+    conn = _connect()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cur = conn.execute("DELETE FROM event_log WHERE date(ts) < ?", (cutoff,))
     conn.commit()
     n = cur.rowcount
     conn.close()
@@ -410,11 +441,13 @@ def update_metadata(item_id, patch: dict) -> bool:
 
 
 def get_today_emitted_keys() -> list:
-    """Keys emitidas hoje pelo ARAS (source='heartbeat') — para novelty check."""
+    """Keys emitidas hoje pelo ARAS (source='heartbeat') — para novelty check (timezone local)."""
     conn = _connect()
+    hoje = datetime.now().strftime("%Y-%m-%d")
     rows = conn.execute(
         "SELECT key FROM memory_items "
-        "WHERE source='heartbeat' AND date(last_seen) = date('now') AND key IS NOT NULL"
+        "WHERE source='heartbeat' AND date(last_seen) = ? AND key IS NOT NULL",
+        (hoje,)
     ).fetchall()
     conn.close()
     return [r["key"] for r in rows]

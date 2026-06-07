@@ -10,14 +10,15 @@
 # ---------------------------------------------------------------------------
 shell_command:
   # Organic Memory — event/interaction/flag recording
-  record_event: 'python3 /config/scripts/record_event.py "{{ detalhe }}" "{{ entity_id | default("") }}"'
+  record_event: 'python3 /config/scripts/record_event.py "{{ detalhe }}" "{{ entity_id | default("") }}" "{{ metadata | default("{}") }}"'
   record_flag: 'python3 /config/scripts/record_flag.py "{{ name }}" "{{ value | default(''true'') }}"'
   record_interaction: 'python3 /config/scripts/record_interaction.py "{{ canal }}" "{{ content }}"'
   mark_reaction: 'python3 /config/scripts/mark_reaction.py'
   memory_record_emit: >-
-    python3 /config/scripts/memory_record_emit.py "{{ content }}" "{{ key }}"
+    python3 /config/scripts/memory_record_emit.py "{{ content }}" "{{ key }}" "{{ metadata | default('{}') }}"
   run_memory_maintenance: 'python3 /config/scripts/run_memory_maintenance.py'
   cleanup_event_buffer: 'python3 -c "import sys; sys.path.insert(0,\"/config/scripts\"); from lib.memory_db import init_db, cleanup_old_events, reset_daily_flags; init_db(); e=cleanup_old_events(); f=reset_daily_flags(); print(f\"cleanup: {e} events, {f} flags removed\")"'
+  cleanup_event_log: 'python3 -c "import sys; sys.path.insert(0,\"/config/scripts\"); from lib.memory_db import init_db, cleanup_event_log; init_db(); n=cleanup_event_log(); print(f\"event_log cleanup: {n} rows removed\")"'
   init_memory_db: 'python3 /config/scripts/init_memory_db.py'
 
   # Sleep Consolidation cycle
@@ -83,9 +84,6 @@ shell_command:
 
   # Housekeeping
   clear_old_logs: "find /config/logs/ -name '*.log' -mtime +7 -delete 2>/dev/null || true"
-  clear_tts_cache: "find /config/tts/ -name '*.flac' -o -name '*.mp3' -mtime +7 -delete"
-  clear_z2m_logs: "find /config/zigbee2mqtt/log/ -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +"
-  clear_ha_log: "rm -f /config/home-assistant.log.1"
 
 # ---------------------------------------------------------------------------
 # PERMEAR input entities

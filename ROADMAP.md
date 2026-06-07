@@ -4,6 +4,16 @@ What's ahead. For what's done, see `CHANGELOG.md`.
 
 ---
 
+## v8.6 — temporal correlation → automation suggestions
+
+The `event_log` (added in v8.5) accumulates per-occurrence history. v8.6 reads it
+to detect entities that change together or in sequence, groups consolidated patterns
+by entity, and feeds a lightweight structured prompt to Systems Consolidation so it
+can propose real automations — the project's primary intended outcome. Gated on
+enough accumulated history showing genuine co-occurrence.
+
+---
+
 ## v8.x — incremental refinements (post v8.2)
 
 Small optional improvements that may land between v8.2 and v9.0 based on
