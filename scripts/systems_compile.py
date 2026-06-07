@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-v7.1-G — Systems Consolidation result processor (weekly compile).
+v8.4-syscompile — Systems Consolidation result processor (weekly compile).
 Receives the insights_json already parsed (no fence-strip).
 
-The soul/users inputs were retired (auto-evolution abandoned in v8-S3/S4).
-The caller still passes them as empty "{}" for arg-compatibility; they are
-ignored. The full signature simplification happens with the cycles.yaml
-caller (audit Phase 6).
+soul/users retired in v8-S3/S4; signature simplified to 1 arg in v8.4-syscompile.
 
 Usage:
-  systems_compile.py '<soul_json>' '<users_json>' '<insights_json>'
-  (soul_json, users_json accepted but ignored)
+  systems_compile.py '<insights_json>'
 
 insights_json = {"novos_padroes": [...], "remover_padroes": [...],
                  "novas_pendencias": [...], "remover_pendencias": [...],
@@ -254,14 +250,13 @@ def parse_arg(arg, name):
 
 
 def main():
-    # argv[1]=soul, argv[2]=users are retired (accepted for caller arg-compat,
-    # ignored); argv[3]=insights is the only live input. Full signature
-    # simplification is coordinated with the cycles.yaml caller (audit Phase 6).
-    if len(sys.argv) < 4:
-        print("Usage: systems_compile.py '<soul_json>' '<users_json>' '<insights_json>'")
+    # v8.4-syscompile: signature simplified — sys.argv[1] = insights.
+    # soul/users (former argv[1]/argv[2]) were retired in v8-S3/S4.
+    if len(sys.argv) < 2:
+        print("Usage: systems_compile.py '<insights_json>'")
         sys.exit(1)
 
-    insights_arg = sys.argv[3]
+    insights_arg = sys.argv[1]
     insights_changes = parse_arg(insights_arg, "insights_json")
 
     guidelines_path = GUIDELINES_PATH

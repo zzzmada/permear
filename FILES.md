@@ -123,3 +123,23 @@ memory.py           ← legacy helpers (load_json, save_json, locked_update)
 logs.py             ← log helpers + NOISY_COMPONENTS filter
 agent.py            ← HA REST API helpers
 ```
+
+---
+
+## Not published (gitignored)
+
+```
+configuration.yaml           ← household HA config (user's own)
+secrets.yaml                 ← credentials and tokens
+automations/base.yaml        ← user's own household automations
+automations/terrabot.yaml    ← separate project
+scripts/seed_memory_test.py  ← PM convenience script, not a feature
+memory/permear_memory.db     ← Organic Memory (what the system learned)
+memory/guidelines.json       ← residents + action_items
+memory/monitored_entities.json
+memory/                      ← all runtime state files
+backups/
+CLAUDE.md                    ← internal AI agent instructions
+AUDIT_PLAN.md                ← internal planning document
+audit_reports/               ← internal audit work logs
+```

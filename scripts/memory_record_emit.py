@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""v7.9-B — grava um evento EMITIDO no Organic Memory DB (kind=observation)."""
-import sys, os
+"""v8.4-B — grava um evento EMITIDO no Organic Memory DB (kind=observation).
+Aceita metadata como 3º argumento opcional (JSON string).
+"""
+import json, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib.memory_db import init_db, add_or_reinforce
 
 def main():
     content = sys.argv[1] if len(sys.argv) > 1 else ""
     key = sys.argv[2] if len(sys.argv) > 2 else None
+    metadata_str = sys.argv[3] if len(sys.argv) > 3 else ""
     if not content.strip():
         print("SKIP: empty content"); return
+    meta = None
+    if metadata_str.strip():
+        try:
+            meta = json.loads(metadata_str)
+        except json.JSONDecodeError:
+            meta = None
     init_db()
     _id, was_new, via = add_or_reinforce(
         content.strip(), kind="observation", source="heartbeat",
-        key=(key.strip() or None) if key else None
+        key=(key.strip() or None) if key else None,
+        metadata=meta,
     )
     print(f"OK id={_id} new={was_new} via={via}")
 

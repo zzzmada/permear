@@ -21,3 +21,18 @@
     - service: shell_command.cleanup_event_buffer
       continue_on_error: true
   mode: single
+
+# v8.5-eventlog: clean event_log rows older than 30 days (weekly on Sunday)
+- alias: "Maintenance - Cleanup event log"
+  id: permear_maintenance_cleanup_event_log
+  trigger:
+    - platform: time
+      at: "04:15:00"
+  condition:
+    - condition: time
+      weekday:
+        - sun
+  action:
+    - service: shell_command.cleanup_event_log
+      continue_on_error: true
+  mode: single

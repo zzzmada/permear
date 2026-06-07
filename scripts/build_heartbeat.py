@@ -223,6 +223,7 @@ def build_candidates(health_summary, monitored, states_dict=None):
             "content": content,
             "entity_id": entity_id,
             "timestamp": ev.get("ts", now_iso),
+            "metadata": ev.get("metadata", "{}"),
         })
 
     if "SELF_ERRORS" in health_summary or "ERRORS" in health_summary:
@@ -366,7 +367,7 @@ def main():
             suppressed += 1
 
     output = {
-        "emits": [{"content": c["content"], "key": c["key"]} for c, r in emits],
+        "emits": [{"content": c["content"], "key": c["key"], "metadata": c.get("metadata", "{}")} for c, r in emits],
         "gray_prompt": build_gray_prompt(grays, users, states_dict) if grays else "",
         "stats": {
             "total": len(candidates),
