@@ -1,0 +1,74 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "PERMEAR",
+        "description": "Set up PERMEAR, the cognitive memory and salience layer. Choose the AI providers the cycles will use. Sensitivity and schedules can be adjusted later in the integration options.",
+        "data": {
+          "conversation": "Conversation provider (primary)",
+          "data": "Data provider (primary)",
+          "conversation_fallback": "Conversation provider (fallback)",
+          "data_fallback": "Data provider (fallback)",
+          "telegram_chat_id": "Telegram chat ID"
+        },
+        "data_description": {
+          "conversation": "Conversation agent used for dialogue (with tools).",
+          "data": "AI Task entity used by the cycles (gray zone, briefing, weekly compile).",
+          "conversation_fallback": "Takes over with tools when the primary conversation provider fails.",
+          "data_fallback": "Takes over when the primary data provider fails.",
+          "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot."
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "This entity was not found in Home Assistant.",
+      "invalid_chat_id": "The chat ID must be a number (e.g. 123456789)."
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured. Only a single instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PERMEAR options",
+        "description": "Attention and cycle settings. Saving reloads the integration — no restart needed.",
+        "data": {
+          "sensitivity": "ARAS sensitivity",
+          "primary_resident": "Primary resident",
+          "heartbeat_start": "Heartbeat start",
+          "heartbeat_end": "Heartbeat end",
+          "sleep_time": "Sleep Consolidation time",
+          "systems_time": "Systems Consolidation time (Sundays)",
+          "agent_name": "Agent name",
+          "voice_script": "Voice hook (optional)"
+        },
+        "data_description": {
+          "sensitivity": "The only attention knob: how easily events reach you. The emit threshold self-regulates within this band.",
+          "primary_resident": "The resident PERMEAR centers on. Pick a person from Home Assistant, or type a name for a resident without a person entry.",
+          "heartbeat_start": "Hourly attention cycle runs from this time…",
+          "heartbeat_end": "…until this time. Outside the window the house stays silent.",
+          "sleep_time": "Nightly briefing and memory extraction.",
+          "systems_time": "Weekly compile: patterns, suggestions and pending items.",
+          "agent_name": "What the assistant calls itself in conversation. Leave empty to use the neutral name (PERMEAR).",
+          "voice_script": "Optional. A service PERMEAR speaks through, e.g. script.minha_voz, called with a message variable. Leave empty for no voice — PERMEAR never decides on its own when to speak."
+        }
+      }
+    }
+  },
+  "selector": {
+    "sensitivity": {
+      "options": {
+        "sensitive": "Sensitive — more alerts, less filtering",
+        "balanced": "Balanced (default)",
+        "quiet": "Quiet — fewer alerts, more selective"
+      }
+    }
+  },
+  "issues": {
+    "system_log_fire_event": {
+      "title": "PERMEAR error monitor is inactive",
+      "description": "The error monitor needs the system_log integration to fire events. Add the following to configuration.yaml and restart:\n\n```yaml\nsystem_log:\n  fire_event: true\n```\n\nWithout it, no error cards will be sent to Telegram."
+    }
+  }
+}
