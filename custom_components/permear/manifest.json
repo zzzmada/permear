@@ -1,0 +1,15 @@
+{
+  "domain": "permear",
+  "name": "PERMEAR",
+  "after_dependencies": ["telegram_bot", "ai_task", "conversation", "automation"],
+  "codeowners": ["@zzzmada"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/zzzmada/permear",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/zzzmada/permear/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "9.0.3"
+}
