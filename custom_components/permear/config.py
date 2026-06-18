@@ -92,7 +92,15 @@ def config_from_entry(entry: ConfigEntry) -> PermearConfig:
     """Config entry → typed snapshot. options override data; missing fields
     fall back to const.py defaults. threshold_min/max stay DERIVED from
     sensitivity (never stored, never user-tunable)."""
-    merged = {**entry.data, **entry.options}
+    data = entry.data
+    options = entry.options
+    merged = {**data, **options}
+
+    # RODADA E: providers are reconfigurable in the options flow. options wins,
+    # but an EMPTY options value falls back to data — a blank field means
+    # "keep", never "clear" (must never zero a configured provider).
+    def _provider(key: str) -> str | None:
+        return (options.get(key) or data.get(key)) or None
 
     sensitivity = merged.get(CONF_SENSITIVITY, DEFAULT_SENSITIVITY)
     if sensitivity not in SENSITIVITY_MAP:
@@ -104,10 +112,10 @@ def config_from_entry(entry: ConfigEntry) -> PermearConfig:
     threshold_min, threshold_max = SENSITIVITY_MAP[sensitivity]
 
     return PermearConfig(
-        conversation=merged.get(CONF_CONVERSATION) or None,
-        data=merged.get(CONF_DATA) or None,
-        conversation_fallback=merged.get(CONF_CONVERSATION_FALLBACK) or None,
-        data_fallback=merged.get(CONF_DATA_FALLBACK) or None,
+        conversation=_provider(CONF_CONVERSATION),
+        data=_provider(CONF_DATA),
+        conversation_fallback=_provider(CONF_CONVERSATION_FALLBACK),
+        data_fallback=_provider(CONF_DATA_FALLBACK),
         primary_resident=str(merged.get(CONF_PRIMARY_RESIDENT) or "").strip(),
         sensitivity=sensitivity,
         threshold_min=threshold_min,

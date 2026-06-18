@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING
 
 from .const import (
     SCHEMA_VERSION,
+    DRY_BOOST_EXCLUDED_DOMAINS,
+    NOISE_BINARY_DEVICE_CLASSES,
     ENGAGEMENT_DOWN_RATE,
     ENGAGEMENT_MIN_ALERTS,
     ENGAGEMENT_UP_RATE,
@@ -706,12 +708,21 @@ class PermearStorage:
 
     async def async_run_maintenance(self) -> dict:
         """Cleanup + tier transitions + tiers→priority loop. One executor job."""
-        return await self._hass.async_add_executor_job(self._run_maintenance)
+        # device_class snapshot built on the loop (thread-safe, mirrors Wake)
+        # so the priority loop can separate noise binary_sensors from signal
+        # ones without reading the state machine from the executor.
+        binary_device_classes = {
+            s.entity_id: (s.attributes.get("device_class") or "")
+            for s in self._hass.states.async_all("binary_sensor")
+        }
+        return await self._hass.async_add_executor_job(
+            self._run_maintenance, binary_device_classes
+        )
 
-    def _run_maintenance(self) -> dict:
+    def _run_maintenance(self, binary_device_classes: dict | None = None) -> dict:
         cleanup = self._clean_invalid_items()
         counts = self._tier_maintenance()
-        changes = self._update_priority_from_memory()
+        changes = self._update_priority_from_memory(binary_device_classes or {})
         report = {"cleanup": cleanup, "tiers": counts, "priority_changes": changes}
         _LOGGER.info("Memory maintenance: %s", report)
         return report
@@ -787,7 +798,7 @@ class PermearStorage:
             self._conn.commit()
         return counts
 
-    def _update_priority_from_memory(self) -> list:
+    def _update_priority_from_memory(self, binary_device_classes=None) -> list:
         """Loop tiers→priority with bidirectional decay (v8.8-fix).
 
         active → priority ≥ 1, stable → priority ≥ 2 (source='memory');
@@ -800,6 +811,18 @@ class PermearStorage:
                 "SELECT key, tier FROM memory_items"
                 " WHERE tier IN ('active','stable') AND key IS NOT NULL"
             ).fetchall()
+            # RODADA B: a light is "rich" (dimmer) only if it EVER recorded a
+            # brightness — a single consolidated row reflects just the last
+            # event, so an "off" reinforcement would hide a real dimmer. Stable
+            # signal: any historical row carrying brightness.
+            rich_light_ids = {
+                r["key"].split(":", 1)[1]
+                for r in self._conn.execute(
+                    "SELECT key, metadata FROM memory_items"
+                    " WHERE key LIKE '%:light.%' AND metadata LIKE '%brightness%'"
+                )
+                if r["metadata"] and "brightness" in (json.loads(r["metadata"]) or {})
+            }
 
         entity_map: dict = {}
         for r in rows:
@@ -812,6 +835,23 @@ class PermearStorage:
             if entity_map.get(entity_id) != "stable":
                 entity_map[entity_id] = r["tier"]
 
+        dc_map = binary_device_classes or {}
+
+        def _earns_memory_boost(eid: str) -> bool:
+            """Dry binary-state entities don't earn the consolidation boost.
+            switch is always dry; a light is dry unless it's a dimmer
+            (brightness ever recorded); a binary_sensor of a noise class
+            (occupancy/motion/presence) is dry — signal classes and classless
+            binary_sensors keep the boost. Rich domains keep the boost."""
+            domain = eid.split(".")[0]
+            if domain in DRY_BOOST_EXCLUDED_DOMAINS:
+                return False
+            if domain == "light":
+                return eid in rich_light_ids
+            if domain == "binary_sensor":
+                return dc_map.get(eid, "") not in NOISE_BINARY_DEVICE_CLASSES
+            return True
+
         changes = []
         path = self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH)
         with locked_json_update(path, {"entities": []}) as data:
@@ -821,6 +861,18 @@ class PermearStorage:
                 if eid not in entity_map or not ent.get("monitor", False):
                     continue
                 if ent.get("priority_source", "") in ("user", "learned"):
+                    continue
+                if not _earns_memory_boost(eid):
+                    # Dry binary-state: never grant the boost, and strip any
+                    # stale memory boost from an entity that earned it before
+                    # this rule (converges to neutral, idempotent).
+                    if (ent.get("priority_source") == "memory"
+                            and int(ent.get("priority", 0)) > 0):
+                        current = int(ent.get("priority", 0))
+                        changes.append({"entity": eid, "from": current,
+                                        "to": 0, "tier": "dry-noboost"})
+                        ent["priority"] = 0
+                        ent.pop("priority_source", None)
                     continue
                 target = 2 if entity_map[eid] == "stable" else 1
                 current = int(ent.get("priority", 0))

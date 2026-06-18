@@ -42,10 +42,16 @@ class AiTaskClient:
         self._config = config
 
     async def async_generate(
-        self, task_name: str, instructions: str, structure: dict
+        self, task_name: str, instructions: str, structure: dict,
+        required_field: str | None = None,
     ) -> dict | None:
         """ONE logical LLM call. Returns the response data dict, or None when
-        no provider answered (honest failure — callers decide the fallback)."""
+        no provider answered (honest failure — callers decide the fallback).
+
+        required_field (RODADA F): when set, a response dict whose field is
+        empty/missing counts as empty → triggers the fallback (and logs it),
+        exactly like the Heartbeat's former inline gray-zone copy. Default None
+        keeps the dict-non-empty rule that Sleep/Systems rely on."""
         if not self._config.data and not self._config.data_fallback:
             _LOGGER.error(
                 "No data provider configured in permear.yaml — %s skipped",
@@ -62,12 +68,14 @@ class AiTaskClient:
                 f"{task_name} [skip-primary]",
                 instructions,
                 structure,
+                required_field,
             )
 
         data = None
         if self._config.data:
             data = await self._call(
-                self._config.data, task_name, instructions, structure
+                self._config.data, task_name, instructions, structure,
+                required_field,
             )
         if data is None and self._config.data_fallback:
             await self._hass.async_add_executor_job(self._log_fallback)
@@ -76,11 +84,13 @@ class AiTaskClient:
                 f"{task_name} [fallback]",
                 instructions,
                 structure,
+                required_field,
             )
         return data
 
     async def _call(
-        self, entity_id: str, task_name: str, instructions: str, structure: dict
+        self, entity_id: str, task_name: str, instructions: str, structure: dict,
+        required_field: str | None = None,
     ) -> dict | None:
         try:
             resp = await self._hass.services.async_call(
@@ -101,6 +111,11 @@ class AiTaskClient:
         data = (resp or {}).get("data")
         if not isinstance(data, dict) or not data:
             return None
+        # required_field set: a present-but-textless response is "empty" too,
+        # so the choreography falls back (Heartbeat gray-zone parity).
+        if required_field is not None:
+            if not str(data.get(required_field) or "").strip():
+                return None
         return data
 
     async def async_log_fallback(self) -> None:

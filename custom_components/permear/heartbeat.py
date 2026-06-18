@@ -48,7 +48,6 @@ from .const import (
     BATTERY_DEVICE_CLASSES,
     BATTERY_ENTITY_PATTERNS,
     BATTERY_THRESHOLD,
-    FALLBACK_SKIP_PRIMARY_SECONDS,
     HEARTBEAT_INTERVAL_MINUTES,
     HEARTBEAT_JITTER_SECONDS,
     HEARTBEAT_WINDOW_MINUTES,
@@ -56,6 +55,7 @@ from .const import (
     SILENT_IGNORE_DOMAINS,
     SILENT_STATES,
 )
+from .llm import AiTaskClient
 from .notify import async_send_telegram, async_set_last_message
 from .storage import PermearStorage, load_json, locked_json_update
 
@@ -136,6 +136,9 @@ class PermearHeartbeat:
         self._hass = hass
         self._storage = storage
         self._config = config
+        # RODADA F: single source of truth for the ai_task fallback
+        # choreography — same client Sleep/Systems use (no more inline copy).
+        self._ai = AiTaskClient(hass, config)
         self._unsub = None
         self._task: asyncio.Task | None = None
         self._running = False
@@ -618,86 +621,16 @@ merecem aviso, em mensagens curtas (max 2 frases cada). Se nenhum merece,
 responda EXATAMENTE: SILENCIO."""
 
     async def _gray_zone_llm(self, prompt: str) -> str | None:
-        """Choreography from cycles.yaml: skip primary if a fallback was logged
-        in the last hour; otherwise primary → fallback on empty response."""
-        if not self._config.data and not self._config.data_fallback:
-            _LOGGER.error("No data provider configured in permear.yaml — "
-                          "gray zone skipped")
-            return None
-
-        recent_fb = await self._hass.async_add_executor_job(self._recent_fallback)
-
-        if recent_fb and self._config.data_fallback:
-            await self._hass.async_add_executor_job(self._log_fallback)
-            return await self._call_ai_task(
-                self._config.data_fallback, "ARAS gray zone [skip-primary]", prompt
-            )
-
-        resposta = None
-        if self._config.data:
-            resposta = await self._call_ai_task(
-                self._config.data, "ARAS gray zone", prompt
-            )
-        if not resposta and self._config.data_fallback:
-            await self._hass.async_add_executor_job(self._log_fallback)
-            resposta = await self._call_ai_task(
-                self._config.data_fallback, "ARAS gray zone [fallback]", prompt
-            )
-        return resposta
-
-    async def _call_ai_task(
-        self, entity_id: str, task_name: str, prompt: str
-    ) -> str | None:
-        try:
-            resp = await self._hass.services.async_call(
-                "ai_task",
-                "generate_data",
-                {
-                    "task_name": task_name,
-                    "entity_id": entity_id,
-                    "instructions": prompt,
-                    "structure": GRAY_STRUCTURE,
-                },
-                blocking=True,
-                return_response=True,
-            )
-        except Exception as exc:  # noqa: BLE001 — 429/Timeout still propagate
-            _LOGGER.warning("ai_task %s via %s failed: %s", task_name, entity_id, exc)
-            return None
-        data = (resp or {}).get("data") or {}
-        resposta = str(data.get("resposta") or "").strip()
-        return resposta or None
-
-    def _recent_fallback(self) -> bool:
-        circuit = load_json(
-            self._hass.config.path(AGENT_CIRCUIT_RELATIVE_PATH), {}
+        """Gray-zone data-LLM call via the shared AiTaskClient (RODADA F).
+        The fallback choreography (1h guard, primary→fallback, log) now lives
+        ONLY in llm.py. required_field='resposta' preserves the former inline
+        behavior: a present-but-empty response counts as empty and triggers
+        the fallback."""
+        data = await self._ai.async_generate(
+            "ARAS gray zone", prompt, GRAY_STRUCTURE, required_field="resposta"
         )
-        raw = circuit.get("last_fallback_at")
-        if not raw:
-            return False
-        try:
-            last_fb = datetime.fromisoformat(raw)
-        except (ValueError, TypeError):
-            return False
-        delta = (datetime.now() - last_fb).total_seconds()
-        return 0 <= delta < FALLBACK_SKIP_PRIMARY_SECONDS
-
-    def _log_fallback(self) -> None:
-        """Port of log_fallback.py — same agent_circuit.json shape, flock-shared
-        with the shell during coexistence."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        path = self._hass.config.path(AGENT_CIRCUIT_RELATIVE_PATH)
-        with locked_json_update(path, {}) as circuit:
-            stats = circuit.get("daily_stats") or {}
-            if stats.get("date") != today:
-                stats = {"date": today, "errors_503_seen": 0,
-                         "retries_recovered": 0, "failures_3x": 0,
-                         "circuit_opens": 0, "fallbacks": 0}
-            stats["fallbacks"] = stats.get("fallbacks", 0) + 1
-            circuit["daily_stats"] = stats
-            circuit["last_fallback_at"] = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        resposta = str((data or {}).get("resposta") or "").strip()
+        return resposta or None
 
     # ------------------------------------------------------------------
     # Delivery + stats

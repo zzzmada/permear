@@ -36,28 +36,28 @@ configuration file.
 
 ---
 
-## Privacy notice — please read before installing
+## Where your data goes
 
-PERMEAR sends data to the Large Language Model (LLM) providers you
-configure. Depending on your setup, those providers may be **cloud
-services**. Specifically, the following can be sent to your configured LLM:
+PERMEAR sends data only to the LLM providers **you** configure in Home
+Assistant — and only for the small fraction of cases that need a language
+model. You choose those providers, so you control where the data goes.
 
-- **Event descriptions** during the gray-zone judgment and the nightly
-  consolidation (e.g. which entities changed, when, and humanized state
-  text such as a media title or a room name).
-- **Media titles** captured from media players (e.g. what is playing).
-- **Your chat messages** to the agent over Telegram, and the agent's
-  replies.
+- If you point PERMEAR at **local** providers (for example a model served by
+  Ollama), nothing leaves your network.
+- If you point it at **cloud** providers, then for the ambiguous cases the
+  following can be sent to them: short event descriptions (which entities
+  changed, when, humanized state text such as a room name), media titles from
+  media players, and your chat messages to the agent.
 
-The deterministic core of PERMEAR (capture, the ARAS filter, tier
-maintenance, correlation) runs **entirely on your device** and sends
-nothing externally. Only the ambiguous cases — the gray zone, the nightly
-memory extraction, the weekly suggestion, and direct conversation — involve
-an LLM call.
+The deterministic core — capture, the ARAS filter, tier maintenance,
+correlation — runs **entirely on your device** and sends nothing externally.
+A language model is only involved in the gray-zone judgment, the nightly
+memory extraction, the weekly suggestion, and direct conversation. Everything
+else is local arithmetic.
 
-If you configure **local** LLM providers, no data leaves your network. If
-you configure cloud providers (e.g. a hosted model), the data above is sent
-to them under their terms. Choose your providers accordingly.
+In short: the privacy profile is whatever your chosen providers are. Pick
+local providers for a fully on-device setup, or cloud providers if you prefer
+their quality — PERMEAR is agnostic to the choice.
 
 ---
 
@@ -65,11 +65,13 @@ to them under their terms. Choose your providers accordingly.
 
 - **Home Assistant 2025.7 or newer.**
 - A **conversation** provider and an **ai_task** provider configured in Home
-  Assistant (e.g. any integration that exposes a `conversation.*` entity and
-  one that exposes an `ai_task.*` entity). PERMEAR asks for four during
-  setup: a primary and a fallback for each.
+  Assistant (any integration that exposes a `conversation.*` entity and one
+  that exposes an `ai_task.*` entity, cloud or local). PERMEAR asks for four
+  during setup: a primary and a fallback for each.
 - The **Telegram** integration (`telegram_bot`) configured — it is the
-  primary output surface. PERMEAR will warn you if it is missing.
+  primary output surface. PERMEAR will warn you if it is missing. See the
+  Home Assistant docs to set it up:
+  https://www.home-assistant.io/integrations/telegram_bot/
 - Optionally, for the error monitor to see Home Assistant errors, enable
   event firing in your `configuration.yaml`:
 
@@ -151,6 +153,11 @@ has learned the house. It scales to any household size with no seeding and
 no day-one configuration. Sensitivity (`sensitive` / `balanced` / `quiet`)
 is the only ARAS knob, set in the options.
 
+Trivial state changes (a plain switch toggling, repeated room occupancy) do
+not earn an attention boost on their own — they still consolidate as memory,
+but they don't claim your attention unless they're genuinely anomalous (an
+odd hour) or you mark them as a priority yourself.
+
 ---
 
 ## Organic Memory
@@ -187,8 +194,10 @@ All configuration is in the UI.
 - Telegram chat ID (optional — leave blank to use the bot's first permitted
   chat).
 
-**Anytime (options):**
+**Anytime (options → Configure):**
 
+- The four LLM providers and the chat ID — reconfigurable without
+  reinstalling, so you can switch models or accounts from the UI.
 - ARAS sensitivity: `sensitive` / `balanced` / `quiet`.
 - Primary resident (chosen from your `person.*` entities).
 - Cycle times: Heartbeat window start/end, Sleep time, Systems time.
@@ -198,7 +207,9 @@ All configuration is in the UI.
   own).
 
 Residents and rooms are read directly from Home Assistant (the `person`
-registry and the area registry) — you do not maintain a separate list.
+registry and the area registry) — you do not maintain a separate list. The
+conversation agent receives household context at runtime, so you do not need
+to write a system prompt for it.
 
 ---
 

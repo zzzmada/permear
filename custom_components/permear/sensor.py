@@ -30,6 +30,7 @@ from .const import (
     ARAS_STATS_RELATIVE_PATH,
     ARCHIVED_ERRORS_RELATIVE_PATH,
     DOMAIN,
+    HEALTH_FALLBACK_WINDOW_MINUTES,
 )
 from .household import get_residents
 from .storage import PermearStorage, load_json
@@ -123,14 +124,24 @@ class PermearHealthSensor(PermearSensorBase):
 
     async def async_update(self) -> None:
         circuit, archived = await self._hass.async_add_executor_job(self._read)
-        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
         raw_stats = circuit.get("daily_stats") or {}
         stats = raw_stats if raw_stats.get("date") == today else {}
         # "fallbacks_gemini" is the pre-v9.0 key — read both during transition
         fallbacks = stats.get("fallbacks", stats.get("fallbacks_gemini", 0))
-        if fallbacks >= 1:
+        # RODADA D: state reflects the CURRENT situation, not "any fallback
+        # today". fallback_ativo only while the last fallback is recent (we're
+        # still on the secondary); once the window passes the primary is back.
+        # fallbacks_hoje keeps being daily history (attribute only).
+        last_fb = self._parse_local(circuit.get("last_fallback_at"))
+        recent = (
+            last_fb is not None
+            and now - last_fb <= timedelta(minutes=HEALTH_FALLBACK_WINDOW_MINUTES)
+        )
+        if recent:
             state = "fallback_ativo"
-            resumo = "Operando com provedor secundario hoje."
+            resumo = "Operando com provedor secundario agora."
         else:
             state = "tudo_ok"
             resumo = "Funcionando normalmente"
@@ -141,6 +152,17 @@ class PermearHealthSensor(PermearSensorBase):
             "ultimo_fallback_em": circuit.get("last_fallback_at"),
             "erros_silenciados_ativos": len(archived.get("errors", {})),
         }
+
+    @staticmethod
+    def _parse_local(value) -> datetime | None:
+        """Parse last_fallback_at (LOCAL, naive). Accepts both the space form
+        '2026-06-15 09:26:28' and ISO 'T' with microseconds. Never raises."""
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except (ValueError, TypeError):
+            return None
 
     def _read(self) -> tuple:
         circuit = load_json(

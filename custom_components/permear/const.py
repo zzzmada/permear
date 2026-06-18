@@ -72,6 +72,24 @@ CAPTURE_DOMAINS = frozenset({
     "binary_sensor", "lock", "switch", "fan", "vacuum",
 })
 
+# Domains whose emit is a bare on/off state with no informative metadata.
+# RODADA B: these consolidate as memory normally (Sleep/Systems/correlation)
+# but do NOT earn the tiers->priority boost — that +1 is exactly what pushes a
+# dry switch (novelty 2 + 1 = threshold 3) to claim emission on its own. light
+# is conditional: a dimmer (brightness ever recorded) is informative and KEEPS
+# the boost; a relay light (never any brightness) is dry. Rich domains
+# (climate/cover/media_player) and user/learned priority are never affected.
+DRY_BOOST_EXCLUDED_DOMAINS = frozenset({"switch"})
+
+# RODADA C: binary_sensor is heterogeneous. Noise classes (occupancy/motion/
+# presence) toggle continuously and consolidate the same way switches did —
+# they must NOT earn the boost (occupancy duration is already handled in
+# v9.0.3; emitting the bare toggle is redundant). Signal classes (door,
+# window, smoke, gas, moisture, safety...) and binary_sensors with NO
+# device_class KEEP the boost — they are attention events. Deliberately the
+# 3 noise classes only; when in doubt, keep the boost (don't blind a sensor).
+NOISE_BINARY_DEVICE_CLASSES = frozenset({"occupancy", "motion", "presence"})
+
 # Per-domain metadata contract: source attribute name -> metadata key.
 # Closed list — deliberately NOT "everything HA exposes".
 METADATA_ATTRIBUTES = {
@@ -128,6 +146,12 @@ SILENT_IGNORE_DOMAINS = (
 # Window after a logged fallback during which the primary data provider is
 # skipped (mirrors the 1h template guard in cycles.yaml).
 FALLBACK_SKIP_PRIMARY_SECONDS = 3600
+
+# RODADA D: sensor.permear_health reads CURRENT state, not "any fallback today".
+# A fallback logged within this window means we are still running on the
+# secondary; past it, the primary is assumed back and the state returns to
+# tudo_ok. fallbacks_hoje stays as a daily-history attribute only.
+HEALTH_FALLBACK_WINDOW_MINUTES = 20
 
 # =============================================================================
 # v8.10 — Sleep + Systems + Wake (ported from scripts/permear_config.py)

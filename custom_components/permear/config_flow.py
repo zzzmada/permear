@@ -79,9 +79,17 @@ USER_SCHEMA = vol.Schema(
 
 def _options_schema(resident_options: list[str]) -> vol.Schema:
     """Options schema — primary_resident is a dropdown of the HA person
-    entities (custom_value allows a free-text resident without a person)."""
+    entities (custom_value allows a free-text resident without a person).
+    RODADA E: the 4 AI providers + Telegram chat_id are reconfigurable here
+    (suggested with the current value); providers stay Required so a blank can
+    never zero them, and config.py also falls back to entry.data defensively."""
     return vol.Schema(
         {
+            **{
+                vol.Required(field): EntitySelector(EntitySelectorConfig(domain=domain))
+                for field, domain in _PROVIDER_FIELDS
+            },
+            vol.Optional(CONF_CHAT_ID, default=""): TextSelector(),
             vol.Required(CONF_SENSITIVITY, default=DEFAULT_SENSITIVITY): SelectSelector(
                 SelectSelectorConfig(
                     options=sorted(SENSITIVITY_MAP),
@@ -174,14 +182,34 @@ class PermearOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(data=_normalize_times(user_input))
+            # RODADA E: validate the (now editable) providers + chat_id, reusing
+            # the same error keys as the install flow.
+            for field, _domain in _PROVIDER_FIELDS:
+                if self.hass.states.get(user_input.get(field, "")) is None:
+                    errors[field] = "entity_not_found"
+            chat_id = (user_input.get(CONF_CHAT_ID) or "").strip()
+            if chat_id and not _CHAT_ID_RE.match(chat_id):
+                errors[CONF_CHAT_ID] = "invalid_chat_id"
+            if not errors:
+                user_input[CONF_CHAT_ID] = chat_id
+                return self.async_create_entry(data=_normalize_times(user_input))
 
         residents = get_resident_names(self.hass)
         current = {**DEFAULT_OPTIONS, **self.config_entry.options}
+        # Seed the provider + chat_id suggestions from entry.data when options
+        # has not stored them yet (first time the flow is opened).
+        for key in (CONF_CONVERSATION, CONF_DATA, CONF_CONVERSATION_FALLBACK,
+                    CONF_DATA_FALLBACK, CONF_CHAT_ID):
+            if not current.get(key):
+                current[key] = self.config_entry.data.get(key, "")
         # Default: first person.* when nothing is configured yet
         if not current.get(CONF_PRIMARY_RESIDENT) and residents:
             current[CONF_PRIMARY_RESIDENT] = residents[0]
+        # Keep the user's failed attempt visible on error
+        if user_input is not None:
+            current = {**current, **user_input}
         # Keep a stored free-text resident selectable in the dropdown
         stored = current.get(CONF_PRIMARY_RESIDENT, "")
         options = residents + ([stored] if stored and stored not in residents else [])
@@ -190,4 +218,5 @@ class PermearOptionsFlow(OptionsFlow):
             data_schema=self.add_suggested_values_to_schema(
                 _options_schema(options), current
             ),
+            errors=errors,
         )

@@ -34,6 +34,11 @@
         "title": "PERMEAR options",
         "description": "Attention and cycle settings. Saving reloads the integration — no restart needed.",
         "data": {
+          "conversation": "Conversation provider (primary)",
+          "data": "Data provider (primary)",
+          "conversation_fallback": "Conversation provider (fallback)",
+          "data_fallback": "Data provider (fallback)",
+          "telegram_chat_id": "Telegram chat ID",
           "sensitivity": "ARAS sensitivity",
           "primary_resident": "Primary resident",
           "heartbeat_start": "Heartbeat start",
@@ -44,6 +49,11 @@
           "voice_script": "Voice hook (optional)"
         },
         "data_description": {
+          "conversation": "Conversation agent used for dialogue (with tools).",
+          "data": "AI Task entity used by the cycles (gray zone, briefing, weekly compile).",
+          "conversation_fallback": "Takes over with tools when the primary conversation provider fails.",
+          "data_fallback": "Takes over when the primary data provider fails.",
+          "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot.",
           "sensitivity": "The only attention knob: how easily events reach you. The emit threshold self-regulates within this band.",
           "primary_resident": "The resident PERMEAR centers on. Pick a person from Home Assistant, or type a name for a resident without a person entry.",
           "heartbeat_start": "Hourly attention cycle runs from this time…",
@@ -54,6 +64,10 @@
           "voice_script": "Optional. A service PERMEAR speaks through, e.g. script.minha_voz, called with a message variable. Leave empty for no voice — PERMEAR never decides on its own when to speak."
         }
       }
+    },
+    "error": {
+      "entity_not_found": "This entity was not found in Home Assistant.",
+      "invalid_chat_id": "The chat ID must be a number (e.g. 123456789)."
     }
   },
   "selector": {
