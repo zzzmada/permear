@@ -6,6 +6,16 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.1.1] — June 2026
+
+Patch release. Two fixes so the system honors what you tell it to ignore.
+
+### Fixed
+
+- **Device-offline messages no longer notify**: when a device stops responding (a TV losing network overnight, for example), PERMEAR no longer sends a Telegram message about it. Availability is now treated purely as a health signal — reflected in `permear_health` and consultable when you want it — rather than an event that interrupts you. This also means a device's connectivity dropping is no longer something the filter can surface on its own.
+- **Declined suggestions stop reappearing**: when you decline an automation suggestion tied to a specific device (for example, "I don't want the curtains closed automatically"), that suggestion is now marked declined and stops showing up in the daily briefing, instead of being re-presented every day.
+
+---
 ## [9.1.0] — June 2026
 
 Quality and noise-reduction release. Refines what earns your attention, makes configuration easier, and removes the last internal code duplication.

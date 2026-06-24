@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -121,6 +122,26 @@ def _fts_query(content: str) -> str:
     """Sanitize content into a safe FTS MATCH query (OR of significant tokens)."""
     tokens = [t for t in re.findall(r"\w+", content.lower()) if len(t) > 3]
     return " OR ".join(tokens[:10]) if tokens else content[:20]
+
+
+# Entity-id tokens that name a place/direction, not the device subject. Removed
+# from restriction matching so a refusal on one room's device cannot suppress
+# an unrelated insight that merely shares the room (RODADA G / Q10).
+_RESTRICTION_FILLER_TOKENS = frozenset({
+    "sala", "quarto", "cozinha", "casa", "banheiro", "corredor", "varanda",
+    "escritorio", "esquerda", "direita", "frente", "fundo", "lado", "principal",
+})
+
+
+def _norm_token(word: str) -> str:
+    """Lowercase, strip accents, crude singular (drop trailing 's')."""
+    w = "".join(
+        c for c in unicodedata.normalize("NFD", word.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    if len(w) > 3 and w.endswith("s"):
+        w = w[:-1]
+    return w
 
 # Schema matches the production layout the shell-side cycle scripts read
 # (scripts/lib/memory_schema.sql). event_buffer keeps the tipo/canal columns
@@ -549,8 +570,46 @@ class PermearStorage:
         """System insights from memory_items source='systems' (v8.7 contract)."""
         return await self._hass.async_add_executor_job(self._system_insights)
 
+    def _active_restriction_tokens(self) -> set:
+        """Device-noun tokens of ACTIVE (non-faded) restriction behavior_rules.
+
+        Used to suppress Systems insights the resident already refused (RODADA
+        G / Q10). Only ENTITY-ANCHORED restrictions contribute (entity_id from
+        metadata or the 'restriction:<eid>' key); keyless vague refusals do not
+        drive suppression — that keeps false positives near zero. Place/short
+        tokens are dropped (filler list + len>=4), so e.g. the TV refusal
+        (media_player.tv_da_sala) yields no token and cannot hide any insight,
+        while a curtain refusal (cover.cortina_*) yields {'cortina'}."""
+        assert self._conn is not None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, metadata FROM memory_items"
+                " WHERE kind = 'behavior_rule' AND tier != 'faded'"
+            ).fetchall()
+        tokens: set = set()
+        for r in rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if not meta.get("restriction"):
+                continue
+            eid = meta.get("entity_id")
+            if not eid and r["key"] and r["key"].startswith("restriction:"):
+                eid = r["key"].split(":", 1)[1]
+            if not eid or "." not in eid:
+                continue
+            for raw in re.split(r"[._]", eid.split(".", 1)[1]):
+                tok = _norm_token(raw)
+                if len(tok) >= 4 and tok not in _RESTRICTION_FILLER_TOKENS:
+                    tokens.add(tok)
+        return tokens
+
+    @staticmethod
+    def _insight_matches_tokens(content: str, tokens: set) -> bool:
+        words = {_norm_token(w) for w in re.findall(r"\w+", content)}
+        return bool(words & tokens)
+
     def _system_insights(self) -> dict:
         assert self._conn is not None
+        reject_tokens = self._active_restriction_tokens()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, content, metadata, last_seen FROM memory_items"
@@ -561,6 +620,23 @@ class PermearStorage:
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
             insight_type = meta.get("insight_type", "")
             if insight_type not in ("suggestion", "pending"):
+                continue
+            # Refused before → stays refused. Durable + idempotent: the flag
+            # survives the weekly Systems reinforce (which only bumps
+            # mention_count/last_seen, never metadata).
+            if meta.get("rejected"):
+                continue
+            # The resident refused this subject (an active restriction names
+            # the entity). Mark rejected so it stops reappearing — biological:
+            # we mark, never delete; tier decay still ages the row.
+            if reject_tokens and self._insight_matches_tokens(
+                r["content"], reject_tokens
+            ):
+                self._update_metadata(r["id"], {"rejected": True})
+                _LOGGER.info(
+                    "Systems insight %s suppressed from briefing — subject "
+                    "matches an active restriction", r["id"],
+                )
                 continue
             bucket = "suggestions" if insight_type == "suggestion" else "pending"
             result[bucket].append(
