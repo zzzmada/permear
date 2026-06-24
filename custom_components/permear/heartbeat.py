@@ -372,8 +372,10 @@ class PermearHeartbeat:
         }
         candidates.extend(self._scan_battery_signals(states, all_file_ids))
 
-        # Connectivity: global by design (events=exposed, health=global)
-        candidates.extend(self._scan_silent_entities(states))
+        # Connectivity: availability is GLOBAL HEALTH, not an emission event
+        # (rule #8). Refresh the snapshot for the health signal, but DO NOT
+        # turn silent transitions into ARAS candidates (v9.1.1 / Q7, Opção A).
+        self._refresh_availability_snapshot(states)
 
         seen: set = set()
         deduped = []
@@ -509,11 +511,17 @@ class PermearHeartbeat:
                 })
         return candidates
 
-    def _scan_silent_entities(self, states) -> list:
-        """Available → silent transitions. Global by design. flock-shared with
-        the shell heartbeat during coexistence (same snapshot file)."""
+    def _refresh_availability_snapshot(self, states) -> None:
+        """Maintain the availability snapshot (health signal only).
+
+        v9.1.1 (RODADA G / Q7, Opção A): availability is GLOBAL HEALTH, not an
+        emission event (rule #8). This refreshes availability_snapshot.json so
+        health stays current, but NEVER produces emission candidates — the
+        resident asked twice to ignore "TV offline" and a per-device silent
+        candidate could never match a restriction by entity_id/words. The
+        snapshot is consultable via health; it is not sent to Telegram.
+        Kept flock-compatible with any legacy snapshot reader."""
         now_iso = datetime.now().isoformat()
-        candidates = []
         path = self._hass.config.path(AVAILABILITY_RELATIVE_PATH)
 
         with locked_json_update(path, {}) as snapshot:
@@ -527,20 +535,10 @@ class PermearHeartbeat:
                 new_snapshot[eid] = {"last_state": cur_label, "since": now_iso}
 
                 prev = snapshot.get(eid)
-                if prev:
-                    if prev.get("last_state") == cur_label:
-                        new_snapshot[eid]["since"] = prev.get("since", now_iso)
-                    if prev.get("last_state") == "available" and is_silent:
-                        friendly = state.attributes.get("friendly_name", eid)
-                        candidates.append({
-                            "type": "entity_silent",
-                            "content": f"Dispositivo parou de responder: {friendly}",
-                            "entity_id": eid,
-                            "timestamp": now_iso,
-                        })
+                if prev and prev.get("last_state") == cur_label:
+                    new_snapshot[eid]["since"] = prev.get("since", now_iso)
             snapshot.clear()
             snapshot.update(new_snapshot)
-        return candidates
 
     # ------------------------------------------------------------------
     # User state / ARAS context
