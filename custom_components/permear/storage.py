@@ -577,9 +577,9 @@ class PermearStorage:
         G / Q10). Only ENTITY-ANCHORED restrictions contribute (entity_id from
         metadata or the 'restriction:<eid>' key); keyless vague refusals do not
         drive suppression — that keeps false positives near zero. Place/short
-        tokens are dropped (filler list + len>=4), so e.g. the TV refusal
-        (media_player.tv_da_sala) yields no token and cannot hide any insight,
-        while a curtain refusal (cover.cortina_*) yields {'cortina'}."""
+        tokens are dropped (filler list + len>=4), so e.g. a short-named TV
+        refusal yields no usable token and cannot hide an unrelated insight,
+        while a curtain refusal (cover.curtain_*) yields {'curtain'}."""
         assert self._conn is not None
         with self._lock:
             rows = self._conn.execute(

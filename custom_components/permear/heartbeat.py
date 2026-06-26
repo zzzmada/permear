@@ -52,6 +52,7 @@ from .const import (
     HEARTBEAT_JITTER_SECONDS,
     HEARTBEAT_WINDOW_MINUTES,
     MONITORED_ENTITIES_RELATIVE_PATH,
+    REVERTIBLE_STATE_DOMAINS,
     SILENT_IGNORE_DOMAINS,
     SILENT_STATES,
 )
@@ -335,6 +336,16 @@ class PermearHeartbeat:
             if detalhe.startswith("erro:"):  # errors never go through ARAS
                 continue
             entity_id = ev.get("entity_id")
+            # RODADA H (Camada 2): drop events that already reverted inside the
+            # window — the captured state no longer matches reality, so it is no
+            # longer news. This is the primary barrier against the webOS TV flap
+            # (emit "TV ligada" while the TV is off now).
+            if self._event_reverted(entity_id, detalhe, states):
+                _LOGGER.debug(
+                    "Heartbeat: dropping reverted event %s (%s) — current state "
+                    "no longer matches", entity_id, detalhe,
+                )
+                continue
             meta_str = ev.get("metadata", "{}")
             meta_dict = {}
             if meta_str and meta_str.strip() not in ("", "{}"):
@@ -385,6 +396,42 @@ class PermearHeartbeat:
                 seen.add(c["key"])
                 deduped.append(c)
         return deduped
+
+    @staticmethod
+    def _event_reverted(entity_id, detalhe, states) -> bool:
+        """RODADA H (Camada 2). True when a buffered state-change has already
+        reverted within the 90-min window — the state it captured no longer
+        matches the entity's CURRENT state — so it must be suppressed.
+
+        - Applies ONLY to REVERTIBLE_STATE_DOMAINS (persistent states). Pulse
+          domains (binary_sensor/vacuum) are exempt: their event IS the pulse,
+          and "now off" is normal and expected — blinding them would lose real
+          events (motion, door).
+        - current state unavailable/unknown -> suppress (indeterminate; rule #8).
+        - detalhe without the '<object_id>_' prefix (already-humanized text, or a
+          format we don't recognise) -> cannot extract the captured state, so we
+          do NOT suppress (fail open; never blind on a parse we are unsure of).
+          NB: the in-process capture always writes '<object_id>_<real_state>', so
+          captured_state is a real HA state and the comparison is exact. Legacy
+          shell verb forms ('tv_sala_ligou') would parse to a non-state token and
+          thus always look reverted — harmless, as the shell capture is gone
+          (v8.8) and any such event is long outside the 90-min window.
+        """
+        if not entity_id or "." not in entity_id:
+            return False
+        domain = entity_id.split(".", 1)[0]
+        if domain not in REVERTIBLE_STATE_DOMAINS:
+            return False
+        prefix = entity_id.split(".", 1)[1] + "_"
+        if not detalhe.startswith(prefix):
+            return False  # legacy/verb form — cannot compare safely
+        captured_state = detalhe[len(prefix):]
+        state = states.get(entity_id)
+        if state is None:
+            return False  # entity gone — leave to existing handling, don't guess
+        if state.state in SILENT_STATES:
+            return True  # current state indeterminate — do not emit
+        return state.state != captured_state
 
     @staticmethod
     def _candidate_key(cand) -> str:

@@ -6,6 +6,15 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.1.2] — June 2026
+
+Patch release. Robustness against unstable devices.
+
+### Fixed
+
+- **Flapping devices no longer trigger false notifications**: a device that briefly reports a wrong state and reverts (for example a network TV that blinks "on" for a moment while actually off) no longer produces a notification. Before emitting a state change, the Heartbeat now checks the entity's current state and suppresses the event if it has already reverted. A short debounce on media players also drops rapid on/off flickers before they're recorded. Pulse-like sensors (motion, door, window) are unaffected — for those, a brief on/off is the real event.
+
+---
 ## [9.1.1] — June 2026
 
 Patch release. Two fixes so the system honors what you tell it to ignore.

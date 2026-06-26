@@ -46,6 +46,24 @@ ARCHIVED_ERRORS_RELATIVE_PATH = "memory/archived_errors.json"
 # Capture contract (v8.8) — fixed, closed lists. Not user-configurable.
 COVER_DEBOUNCE_SECONDS = 3.0
 
+# RODADA H — media_player flaps (webOS device on->off in seconds) must not enter
+# the buffer. A genuine TV/cast session lasts minutes, so a sub-window on->off is
+# a flap. 10s mirrors OCCUPANCY_DEBOUNCE_SECONDS. NB: this only catches fast
+# flickers; a longer flap (e.g. 81s) is caught by the Heartbeat's current-state
+# check (REVERTIBLE_STATE_DOMAINS), not here — do not raise this to "cover" a
+# long flap, it would blind short real use.
+MEDIA_PLAYER_DEBOUNCE_SECONDS = 10.0
+
+# RODADA H — domains whose state PERSISTS (an 'on' stays on until something turns
+# it off). For these, a buffered event whose captured state no longer matches the
+# entity's CURRENT state has reverted inside the 90-min window and is no longer
+# news — the Heartbeat suppresses it. Deliberately EXCLUDES binary_sensor and
+# vacuum: motion/door/etc. are pulse-like (the event is the pulse; "now off" is
+# normal and expected), so they must not be blinded by a current-state check.
+REVERTIBLE_STATE_DOMAINS = frozenset({
+    "media_player", "switch", "light", "climate", "cover", "lock", "fan",
+})
+
 # Occupancy/motion/presence binary_sensors flood the event_log with on/off
 # toggles and fake co-occurrence pairs. Instead of recording every toggle, the
 # capture records ONE event when occupancy CLEARS, carrying how long it lasted
