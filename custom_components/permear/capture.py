@@ -52,6 +52,7 @@ from .const import (
     COVER_DEBOUNCE_SECONDS,
     IGNORED_STATES,
     INVALID_ENTITY_IDS,
+    MEDIA_PLAYER_DEBOUNCE_SECONDS,
     METADATA_ATTRIBUTES,
     MONITORED_ENTITIES_RELATIVE_PATH,
     OCCUPANCY_DEBOUNCE_SECONDS,
@@ -80,6 +81,8 @@ class PermearCapture:
         self._light_on_since: dict[str, float] = {}
         # Presence arrival timers awaiting debounce confirmation, by entity_id.
         self._pending_arrival: dict[str, Callable[[], None]] = {}
+        # RODADA H: media_player 'on' timers awaiting debounce confirmation.
+        self._pending_media: dict[str, Callable[[], None]] = {}
 
     async def async_start(self) -> None:
         """Read the monitored-entity list and register the listener."""
@@ -154,6 +157,14 @@ class PermearCapture:
         if (domain == "binary_sensor"
                 and self._is_presence(new_state, old_state)):
             self._handle_presence(entity_id, old_state, new_state)
+            return
+
+        # RODADA H: media_player on->off flaps (webOS device flicker) must not
+        # enter the buffer. Returns True when the event was consumed (scheduled
+        # or dropped) and the normal write must be skipped.
+        if domain == "media_player" and self._handle_media_player(
+            entity_id, new_state, now_mono
+        ):
             return
 
         if domain == "cover":
@@ -262,6 +273,59 @@ class PermearCapture:
         if pending is not None:
             pending()
 
+    def _handle_media_player(self, entity_id: str, new_state, now_mono) -> bool:
+        """RODADA H (Camada 1) — debounce media_player on->off flaps.
+
+        Mirrors the presence arrival debounce: a bare 'on' is recorded only once
+        it sustains past MEDIA_PLAYER_DEBOUNCE_SECONDS, because a real session
+        lasts minutes while a webOS device flicker is gone in seconds.
+
+        - 'on'  : (re-)arm a confirmation timer; record nothing yet. -> True
+        - 'off' with an arming timer still pending: the 'on' never sustained —
+          flap; cancel the timer and DROP the off (zero events). -> True
+        - any other transition (playing/paused/off-after-sustained-on): cancel
+          any pending 'on' (superseded) and fall through to normal recording,
+          so the richer/real event is still captured. -> False
+
+        Only on/off flicker is debounced; playing/paused and a real sustained on
+        are untouched. unknown/unavailable transitions are filtered upstream, so
+        a long on->unavailable flap is not caught here — the Heartbeat's
+        current-state check (Camada 2) is the net for that.
+        """
+        object_id = entity_id.split(".", 1)[1]
+        if new_state.state == "on":
+            self._cancel_pending_media(entity_id)
+            self._pending_media[entity_id] = async_call_later(
+                self._hass,
+                MEDIA_PLAYER_DEBOUNCE_SECONDS,
+                partial(self._confirm_media_on, entity_id, object_id),
+            )
+            return True
+
+        pending = self._pending_media.pop(entity_id, None)
+        if pending is not None:
+            pending()  # cancel the arming timer
+            if new_state.state == "off":
+                return True  # on->off within debounce: flap, drop both
+        return False  # real event — record normally (off, playing, paused, ...)
+
+    @callback
+    def _confirm_media_on(self, entity_id: str, object_id: str, _now) -> None:
+        """Timer fired — the 'on' sustained past the debounce. Record it.
+        Metadata is {} (a bare 'on' carries no media_title)."""
+        self._pending_media.pop(entity_id, None)
+        ts = datetime.now().isoformat()  # LOCAL time — never UTC
+        detalhe = f"{object_id}_on"
+        self._hass.async_create_task(
+            self._async_write(ts, entity_id, detalhe, json.dumps({}))
+        )
+
+    @callback
+    def _cancel_pending_media(self, entity_id: str) -> None:
+        pending = self._pending_media.pop(entity_id, None)
+        if pending is not None:
+            pending()
+
     @staticmethod
     def _exit_metadata(old_state) -> dict:
         """occupied_for_s for the clearing event, from the 'on' span length."""
@@ -292,3 +356,6 @@ class PermearCapture:
         for cancel in self._pending_arrival.values():
             cancel()
         self._pending_arrival.clear()
+        for cancel in self._pending_media.values():
+            cancel()
+        self._pending_media.clear()

@@ -282,7 +282,7 @@ already stored with entity keys and don't need to be re-listed.
 
 For each memory about a specific HA entity, append
 [entity:<entity_id>] at the end of the memory text
-(e.g. "Cortina fechada automaticamente à noite [entity:cover.cortina_da_direita]").
+(e.g. "Cortina fechada automaticamente à noite [entity:cover.curtain_example]").
 Only for single-entity memories — not for general summaries.
 
 RESTRICTIONS (separate field 'restricoes'): when an interaction shows the
