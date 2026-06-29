@@ -39,11 +39,37 @@ def _novelty(candidate, user_state):
 
 
 def _anomaly(candidate, user_state):
-    """0-1. Simple heuristic: small hours (0-6h) = +1 for any entity."""
-    hour = user_state.get("current_hour", datetime.now().hour)
-    if 0 <= hour < 6:
-        return 1
-    return 0
+    """0-1. Circadian heuristic on the EVENT's hour (when it actually happened),
+    not the evaluation time. A 2am event stays anomalous even when first seen at
+    the 08:30 cycle — using datetime.now() made anomaly permanently 0, since the
+    Heartbeat only runs in the daytime window, so the spike could never fire.
+
+    Pure: reads the hour from the candidate's own timestamp (LOCAL ISO
+    'YYYY-MM-DDThh:mm:ss…'); falls back to the caller's evaluation hour only when
+    the event carries no parseable timestamp.
+
+    v9.2.2 — narrowed by habituation: an entity that REGULARLY acts at night is
+    not anomalous at night for itself. The caller injects the set of habitually
+    nocturnal entities (deterministic, from event_log); this only READS it, the
+    filter stays pure. No history (a new entity) → not in the set → still
+    anomalous (conservative; the unproven night event earns a look). A learned
+    baseline replacing the whole circadian rule is a later reform — out of scope."""
+    hour = _event_hour(candidate, user_state)
+    if not 0 <= hour < 6:
+        return 0
+    entity = candidate.get("entity_id")
+    if entity and entity in user_state.get("nocturnal_habitual", ()):
+        return 0  # habituated — night is this entity's normal pattern
+    return 1
+
+
+def _event_hour(candidate, user_state) -> int:
+    """Hour the event occurred, from candidate['timestamp'] (LOCAL ISO). Falls
+    back to the evaluation hour (current_hour / now) when absent or malformed."""
+    ts = candidate.get("timestamp") or ""
+    if len(ts) >= 13 and ts[10] == "T" and ts[11:13].isdigit():
+        return int(ts[11:13])
+    return user_state.get("current_hour", datetime.now().hour)
 
 
 def _priority(candidate, user_state):

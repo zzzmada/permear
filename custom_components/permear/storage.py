@@ -42,6 +42,8 @@ from .const import (
     MEMORY_ACTIVE_PROMOTE_MENTIONS,
     MEMORY_ACTIVE_PROMOTE_WINDOW,
     MEMORY_EPHEMERAL_FADE_DAYS,
+    NOCTURNAL_HABIT_MIN_DAYS,
+    NOCTURNAL_LOOKBACK_DAYS,
     MEMORY_FTS_MIN_SCORE,
     MEMORY_STABLE_DEMOTE_DAYS,
     MEMORY_STABLE_PROMOTE_MENTIONS,
@@ -370,14 +372,20 @@ class PermearStorage:
     # One executor hop fetches the whole DB context for a cycle.
     # ------------------------------------------------------------------
 
-    async def async_heartbeat_context(self, window_start_iso: str) -> dict:
+    async def async_heartbeat_context(
+        self, window_start_iso: str, first_cycle: bool = False
+    ) -> dict:
         """Window events + today's emitted keys + consolidated count + active
-        restriction memories (v9.0.2), one executor job."""
+        restriction memories (v9.0.2), one executor job. On the first cycle of
+        the day (the only one that evaluates the night) also returns the set of
+        entities habitually active in the small hours (v9.2.2)."""
         return await self._hass.async_add_executor_job(
-            self._heartbeat_context, window_start_iso
+            self._heartbeat_context, window_start_iso, first_cycle
         )
 
-    def _heartbeat_context(self, window_start_iso: str) -> dict:
+    def _heartbeat_context(
+        self, window_start_iso: str, first_cycle: bool = False
+    ) -> dict:
         assert self._conn is not None
         today = _today_local()
         with self._lock:
@@ -406,6 +414,28 @@ class PermearStorage:
                 "SELECT content, key, metadata FROM memory_items"
                 " WHERE kind = 'behavior_rule' AND tier != 'faded'"
             ).fetchall()
+            # Nocturnal habituation (v9.2.2) — only needed on the first cycle
+            # (the one whose window reaches the night). ONE deterministic query
+            # over the existing event_log: entities with small-hours activity on
+            # >= MIN_DAYS distinct days within the lookback are "habitually
+            # nocturnal" → night is normal for them → not anomalous. substr on
+            # the LOCAL ISO ts (never date('now')/UTC, rule #41).
+            nocturnal_habitual: set = set()
+            if first_cycle:
+                cutoff = (
+                    datetime.now() - timedelta(days=NOCTURNAL_LOOKBACK_DAYS)
+                ).strftime("%Y-%m-%dT%H:%M:%S")
+                nocturnal_habitual = {
+                    r["entity_id"]
+                    for r in self._conn.execute(
+                        "SELECT entity_id FROM event_log"
+                        " WHERE ts >= ? AND CAST(substr(ts, 12, 2) AS INT) < 6"
+                        " AND entity_id IS NOT NULL"
+                        " GROUP BY entity_id"
+                        " HAVING COUNT(DISTINCT substr(ts, 1, 10)) >= ?",
+                        (cutoff, NOCTURNAL_HABIT_MIN_DAYS),
+                    )
+                }
         restrictions = []
         for r in restr_rows:
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
@@ -422,6 +452,7 @@ class PermearStorage:
             "recent_keys": recent_keys,
             "consolidated_count": consolidated,
             "restrictions": restrictions,
+            "nocturnal_habitual": nocturnal_habitual,
         }
 
     async def async_record_emit(
