@@ -10,14 +10,18 @@ Best-effort: delivery failures are logged, never raised into a cycle.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import DOMAIN, PENDING_MESSAGE_PATH
+from .storage import load_json, locked_json_update
 
 _LOGGER = logging.getLogger(__name__)
 
 LAST_MESSAGE_ENTITY = "input_text.permear_last_message"
+# Stable drain order (Sleep before Systems when both are pending the same day).
+_PENDING_KEYS = ("sleep", "systems")
 
 
 def _configured_chat_id(hass: HomeAssistant) -> str:
@@ -31,7 +35,10 @@ def _configured_chat_id(hass: HomeAssistant) -> str:
 
 async def async_send_telegram(
     hass: HomeAssistant, message: str, inline_keyboard: list[str] | None = None
-) -> None:
+) -> bool:
+    """Send a Telegram message. Returns True on success, False on failure —
+    callers that don't care ignore it; the deferred-message drain relies on it
+    to keep an entry that failed to deliver."""
     data: dict = {"message": message, "parse_mode": "plain_text"}
     chat_id = _configured_chat_id(hass)
     if chat_id:
@@ -47,6 +54,55 @@ async def async_send_telegram(
         )
     except Exception as exc:  # noqa: BLE001
         _LOGGER.warning("Telegram delivery failed: %s", exc)
+        return False
+    return True
+
+
+async def async_defer_message(hass: HomeAssistant, key: str, text: str) -> None:
+    """Persist a cycle's Telegram message for deferred delivery (v9.2.2). The
+    night cycles (Sleep ~23:30, Systems weekly) write here instead of sending;
+    the morning drain (async_drain_pending) delivers it. JSON in memory/ so a
+    restart before 08:00 keeps the pending message (an in-memory timer wouldn't)."""
+    text = str(text or "").strip()
+    if not text:
+        return
+    path = hass.config.path(PENDING_MESSAGE_PATH)
+
+    def _write() -> None:
+        with locked_json_update(path, {}) as data:
+            data[key] = {"text": text, "generated_at": datetime.now().isoformat()}
+
+    await hass.async_add_executor_job(_write)
+
+
+async def async_drain_pending(hass: HomeAssistant) -> None:
+    """Deliver any deferred cycle messages and remove the ones that went out.
+    A send that fails keeps its entry for the next drain (idempotent, no loss).
+    Missing/empty file → no-op."""
+    path = hass.config.path(PENDING_MESSAGE_PATH)
+    pending = await hass.async_add_executor_job(load_json, path, {})
+    if not isinstance(pending, dict) or not pending:
+        return
+    drained: list[str] = []
+    for key in _PENDING_KEYS:
+        entry = pending.get(key)
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            drained.append(key)  # malformed entry → drop, never retry forever
+            continue
+        if await async_send_telegram(hass, text):
+            drained.append(key)
+    if not drained:
+        return
+
+    def _remove() -> None:
+        with locked_json_update(path, {}) as data:
+            for k in drained:
+                data.pop(k, None)
+
+    await hass.async_add_executor_job(_remove)
 
 
 async def async_answer_callback(

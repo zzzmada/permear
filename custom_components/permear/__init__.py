@@ -31,12 +31,15 @@ from .config import config_from_entry
 from .const import (
     DAILY_CLEANUP_TIME,
     DB_RELATIVE_PATH,
+    DEFERRED_SEND_HOUR,
+    DEFERRED_SEND_MINUTE,
     DOMAIN,
     MONITORED_ENTITIES_RELATIVE_PATH,
 )
 from .error_monitor import PermearErrorMonitor
 from .heartbeat import PermearHeartbeat
 from .llm import AiTaskClient
+from .notify import async_drain_pending
 from .sleep import PermearSleep
 from .storage import PermearStorage
 from .systems import PermearSystems
@@ -104,6 +107,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(
         async_track_time_change(
             hass, _daily_cleanup, hour=hour, minute=minute, second=0
+        )
+    )
+
+    # Deferred message drain (v9.2.2) — the night cycles (Sleep ~23:30, Systems
+    # weekly) persist their Telegram message; deliver it at 08:00 local. Robust
+    # to a restart between midnight and 08:00 (the pending JSON survives).
+    async def _drain_deferred(_now) -> None:
+        try:
+            await async_drain_pending(hass)
+        except Exception:  # noqa: BLE001 — delivery must never crash HA
+            _LOGGER.exception("Deferred message drain failed")
+
+    entry.async_on_unload(
+        async_track_time_change(
+            hass, _drain_deferred,
+            hour=DEFERRED_SEND_HOUR, minute=DEFERRED_SEND_MINUTE, second=0,
         )
     )
 

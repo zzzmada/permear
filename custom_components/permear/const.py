@@ -42,6 +42,10 @@ AVAILABILITY_RELATIVE_PATH = "memory/availability_snapshot.json"
 ARAS_STATS_RELATIVE_PATH = "memory/aras_stats.json"
 AGENT_CIRCUIT_RELATIVE_PATH = "memory/agent_circuit.json"
 ARCHIVED_ERRORS_RELATIVE_PATH = "memory/archived_errors.json"
+# Append-only daily ARAS rollup (v9.2) — the series aras_stats.json (overwritten
+# per day) cannot keep. One line per COMPLETED day; lets the PM validate spike
+# rarity over weeks. Never a table — a light JSONL, flock-free (single writer).
+ARAS_STATS_HISTORY_RELATIVE_PATH = "memory/aras_stats_history.jsonl"
 
 # Capture contract (v8.8) — fixed, closed lists. Not user-configurable.
 COVER_DEBOUNCE_SECONDS = 3.0
@@ -136,6 +140,30 @@ ARAS_MATURITY_FULL_RATIO = 0.5
 ARAS_MATURITY_MIN_ENTITIES = 5
 ARAS_SUPPRESS_THRESHOLD = 1
 
+# Orienting reflex (v9.2 — the spike path). A spike RECLASSIFIES an event that
+# would ALREADY emit — it never adds volume. An emit candidate whose ARAS axes
+# show anomaly (broke the expected pattern) AND high priority is the "unexpected
+# AND relevant": it gets active attention (the LLM contextualizes + asks ONCE)
+# instead of a dry line. Rare by construction — priority>=2 is the TOP of the
+# 0-2 scale (today only the 2 most consolidated entities reach it) and
+# anomaly>=1 is the off-pattern signal. If it ever fires daily, the bar is wrong
+# and rises. Determinism owns salience; the LLM owns only language. Design
+# constants — never exposed in the UI (like the heartbeat interval).
+SPIKE_MIN_PRIORITY = 2
+SPIKE_MIN_ANOMALY = 1
+
+# Nocturnal habituation (v9.2.2) — the circadian anomaly (event 0-6h → +1) is
+# narrowed by the SAME habituation that already governs salience: an entity that
+# REGULARLY acts at night is not anomalous at night FOR ITSELF. Deterministic,
+# one query over the existing event_log — NOT the vetoed statistical baseline
+# (no buckets, no share, no per-entity maturity, no new table). An entity counts
+# as habitually nocturnal when it has events in the small hours on at least
+# MIN_DAYS distinct days within the lookback (the "≥3 distinct days" mirrors the
+# co-occurrence rule). Below that — or with no history (a new entity) — night
+# stays anomalous (conservative: the unproven night event still earns a look).
+NOCTURNAL_HABIT_MIN_DAYS = 3
+NOCTURNAL_LOOKBACK_DAYS = 30
+
 HEARTBEAT_WINDOW_MINUTES = 90
 HEARTBEAT_INTERVAL_MINUTES = 60
 HEARTBEAT_JITTER_SECONDS = (60, 300)
@@ -207,6 +235,15 @@ EVENT_LOG_CORRELATION_DAYS = 7
 DAILY_CLEANUP_TIME = "00:05"
 EVENT_LOG_RETENTION_DAYS = 30
 
+# Deferred cycle messages (v9.2.2) — Sleep (~23:30) and Systems (weekly) keep
+# running at their times, but their Telegram message is PERSISTED here and only
+# delivered at DEFERRED_SEND_HOUR:DEFERRED_SEND_MINUTE the next morning. A JSON
+# file (not an in-memory timer) so a restart between midnight and 08:00 does not
+# lose the pending message. Keys: "sleep", "systems".
+PENDING_MESSAGE_PATH = "memory/pending_message.json"
+DEFERRED_SEND_HOUR = 8
+DEFERRED_SEND_MINUTE = 0
+
 # Wake — entity discovery. Fixed time (the shell automation hardcoded 09:00).
 WAKE_TIME = "09:00"
 SENSITIVE_DEVICE_CLASSES = frozenset({
@@ -242,6 +279,21 @@ TRANSIENT_MSG_KEYWORDS = (
     "clientconnectionreseterror",
     "cannot write to closing transport",
     "connectionreseterror",
+)
+# Gemini content-policy blocks (the integration logs e.g. "Error in Google
+# Generative AI response: FinishReason.SAFETY, see: ..."). These are EXTERNAL
+# provider decisions resolved by the fallback choreography — never a PERMEAR
+# bug. Matched ONLY inside the google_generative_ai branch of
+# is_provider_transient (never globally — the bare word "safety" in another
+# component's error must not be swallowed). MAX_TOKENS / OTHER /
+# MALFORMED_FUNCTION_CALL are deliberately excluded: those can signal a real
+# config or code problem, not an external content block.
+GOOGLE_BLOCK_FINISH_REASONS = (
+    "finishreason.safety",
+    "finishreason.recitation",
+    "finishreason.blocklist",
+    "finishreason.prohibited_content",
+    "finishreason.spii",
 )
 ERROR_ARCHIVE_EXPIRATION_HOURS = 24
 # Flood guard — ports the shell's queued(max 5) + 10-min tail delay.

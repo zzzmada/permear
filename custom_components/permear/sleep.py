@@ -40,7 +40,7 @@ from .const import (
     SLEEP_EXTRACTION_MAX_EVENTS,
 )
 from .llm import AiTaskClient, circuit_health_summary
-from .notify import async_send_telegram, async_set_last_message
+from .notify import async_defer_message, async_set_last_message
 from .storage import PermearStorage, load_json
 
 _LOGGER = logging.getLogger(__name__)
@@ -156,12 +156,14 @@ class PermearSleep:
             # sleep_simple contract: short deterministic PT summary, NO persist
             fallback = self._simple_briefing(len(daily["eventos"]),
                                              len(interacoes), pendencias)
-            await async_send_telegram(self._hass, fallback)
+            # v9.2.2 — defer delivery to 08:00 (the cycle still runs at ~23:30).
+            await async_defer_message(self._hass, "sleep", fallback)
             _LOGGER.warning("Sleep briefing failed on both providers — "
-                            "simple fallback sent, nothing persisted")
+                            "simple fallback deferred, nothing persisted")
             return {"suppressed": False, "briefing": False}
 
-        await async_send_telegram(self._hass, briefing)
+        # v9.2.2 — persist the briefing for the 08:00 drain instead of sending now.
+        await async_defer_message(self._hass, "sleep", briefing)
         await async_set_last_message(self._hass, briefing)
 
         # Brief pause between the two LLM calls (provider courtesy, as shell)

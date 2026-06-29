@@ -41,6 +41,7 @@ from .const import (
     AGENT_CIRCUIT_RELATIVE_PATH,
     ARAS_MATURITY_FULL_RATIO,
     ARAS_MATURITY_MIN_ENTITIES,
+    ARAS_STATS_HISTORY_RELATIVE_PATH,
     ARAS_STATS_RELATIVE_PATH,
     ARAS_SUPPRESS_THRESHOLD,
     ARCHIVED_ERRORS_RELATIVE_PATH,
@@ -55,6 +56,8 @@ from .const import (
     REVERTIBLE_STATE_DOMAINS,
     SILENT_IGNORE_DOMAINS,
     SILENT_STATES,
+    SPIKE_MIN_ANOMALY,
+    SPIKE_MIN_PRIORITY,
 )
 from .llm import AiTaskClient
 from .notify import async_send_telegram, async_set_last_message
@@ -71,6 +74,25 @@ GRAY_STRUCTURE = {
         "selector": {"text": {"multiline": True}},
     }
 }
+
+
+def is_spike(decision: str, scores: dict) -> bool:
+    """Orienting-reflex gate (v9.2) — PURE, deterministic. True ONLY for the
+    'unexpected AND relevant' emit: anomaly (the event broke the expected
+    pattern) AND high priority. It reads the axes ARAS already produced —
+    never recomputes salience, so the filter stays pure (determinism owns
+    salience; the LLM owns only language).
+
+    By contract the caller invokes this only for candidates already decided
+    'emit', so the reflex can never promote a suppressed/gray event — it merely
+    changes the TREATMENT of an event that already passes (no volume increase).
+    The `decision == 'emit'` guard makes that invariant explicit and testable.
+    """
+    return (
+        decision == "emit"
+        and scores.get("anomaly", 0) >= SPIKE_MIN_ANOMALY
+        and scores.get("priority", 0) >= SPIKE_MIN_PRIORITY
+    )
 
 # Legacy curated trigger-id suffixes ("tv_sala_ligou") — kept for events
 # recorded by the old shell capture during coexistence.
@@ -143,6 +165,13 @@ class PermearHeartbeat:
         self._unsub = None
         self._task: asyncio.Task | None = None
         self._running = False
+        # v9.2.1 — date ("YYYY-MM-DD") of the day whose first cycle already ran
+        # the extended (since-midnight) scan. The first cycle of each day widens
+        # the window to cover the night's events (no daytime 90-min window
+        # reaches them); the rest use the normal 90-min window. In-memory is
+        # safe: a mid-day restart that re-fires the extended scan re-emits
+        # nothing, because already-emitted night keys are deduped by recent_keys.
+        self._extended_scan_date: str | None = None
 
     # ------------------------------------------------------------------
     # Scheduling
@@ -210,12 +239,30 @@ class PermearHeartbeat:
     # The cycle
     # ------------------------------------------------------------------
 
+    def _window_start(self, now: datetime) -> tuple[str, bool]:
+        """Candidate-window start (LOCAL ISO) + whether this is the day's FIRST
+        cycle. The first cycle widens the window back to local midnight so the
+        night's events (0-6h, still in today's event_buffer) are evaluated ONCE —
+        no daytime 90-min window reaches them, which is why the circadian anomaly
+        (and the spike) could never fire (v9.2.1). Every other cycle uses the
+        normal 90-min window. The first-cycle flag also gates the nocturnal-habit
+        query (v9.2.2 — only the night-reaching cycle needs it).
+
+        The day marker is in-memory: a mid-day restart that re-widens the window
+        re-emits nothing, because already-emitted night keys are deduped by the
+        canonical recent_keys (novelty 0). No persistent flag, no storage change."""
+        today = now.strftime("%Y-%m-%d")
+        if self._extended_scan_date != today:
+            self._extended_scan_date = today
+            return f"{today}T00:00:00", True
+        return (now - timedelta(minutes=HEARTBEAT_WINDOW_MINUTES)).isoformat(), False
+
     async def async_run(self, health_summary: str = "HEALTH: OK") -> dict:
         """One full Heartbeat. Returns the stats dict (for tests/services)."""
-        window_start = (
-            datetime.now() - timedelta(minutes=HEARTBEAT_WINDOW_MINUTES)
-        ).isoformat()  # LOCAL time
-        db_ctx = await self._storage.async_heartbeat_context(window_start)
+        window_start, first_cycle = self._window_start(datetime.now())  # LOCAL
+        db_ctx = await self._storage.async_heartbeat_context(
+            window_start, first_cycle
+        )
         monitored, circuit_health = await self._hass.async_add_executor_job(
             self._load_cycle_files
         )
@@ -238,17 +285,25 @@ class PermearHeartbeat:
             else:
                 suppressed += 1
 
+        spikes = 0
         for cand, result in emits:
             content = cand["content"]
+            # Orienting reflex (v9.2): a spike RECLASSIFIES this already-passing
+            # emit — same single delivery, richer treatment. Determinism (ARAS)
+            # decided it is salient; here the LLM only chooses the tone.
+            if is_spike(result["decision"], result["scores"]):
+                spikes += 1
+                content = await self._orient_or_narrate(cand, content)
             await self._deliver(content)
             await self._storage.async_record_emit(
                 content, cand.get("key"),
                 self._emit_metadata(cand.get("metadata"), result["salience"]),
             )
 
-        llm_called = 0
+        # Each spike orientation is one ai_task call (rare by construction).
+        llm_called = spikes
         if grays:
-            llm_called = 1
+            llm_called += 1
             prompt = self._build_gray_prompt(grays, states)
             resposta = await self._gray_zone_llm(prompt)
             if (
@@ -268,6 +323,7 @@ class PermearHeartbeat:
             "emit": len(emits),
             "gray": len(grays),
             "suppress": suppressed,
+            "spike": spikes,
             "llm_calls": llm_called,
             "emit_threshold": user_state["emit_threshold"],
         }
@@ -614,6 +670,10 @@ class PermearHeartbeat:
             "restrictions": db_ctx.get("restrictions", []),
             "recent_alerts": db_ctx["recent_keys"],
             "entity_priorities": priorities,
+            # v9.2.2 — entities habitually active at night; the circadian anomaly
+            # is suppressed for them (night is normal FOR THEM). Empty on
+            # non-first cycles (no night candidate to evaluate then).
+            "nocturnal_habitual": db_ctx.get("nocturnal_habitual", set()),
             "current_hour": datetime.now().hour,
             "emit_threshold": emit_threshold,
             "suppress_threshold": ARAS_SUPPRESS_THRESHOLD,
@@ -642,7 +702,13 @@ class PermearHeartbeat:
         """PT prompt ending with the SILENCIO sentinel. Do not translate."""
         itens_parts = []
         for c, r in grays:
-            line = f"  - {c['content']} (saliencia {r['salience']})"
+            # The salience score is INTERNAL telemetry — never put it in a prompt
+            # that generates user-facing text (the LLM echoes it verbatim, e.g.
+            # "(saliencia 2)" leaking into a Telegram message). The context block
+            # below is also internal and must not be parroted (guarded in the
+            # instructions). All gray items sit in the same narrow band anyway,
+            # so the number carries no signal for the decision.
+            line = f"  - {c['content']}"
             eid = c.get("entity_id")
             state = states.get(eid) if eid else None
             if state is not None:
@@ -658,11 +724,13 @@ class PermearHeartbeat:
 
         return f"""Avalie quais destes eventos merecem avisar o morador AGORA.
 
-EVENTOS A AVALIAR (zona cinzenta do filtro de saliencia):
+EVENTOS A AVALIAR:
 {itens}
 
 Para CADA evento, decida emitir ou silenciar. Responda so com os eventos que
-merecem aviso, em mensagens curtas (max 2 frases cada). Se nenhum merece,
+merecem aviso, em mensagens curtas (max 2 frases cada). Escreva APENAS a mensagem
+ao morador, em linguagem natural — NAO inclua numeros de saliencia, ids, tipos,
+horarios de atualizacao, nem qualquer dado interno do sistema. Se nenhum merece,
 responda EXATAMENTE: SILENCIO."""
 
     async def _gray_zone_llm(self, prompt: str) -> str | None:
@@ -678,6 +746,73 @@ responda EXATAMENTE: SILENCIO."""
         return resposta or None
 
     # ------------------------------------------------------------------
+    # Orienting reflex — the spike path (v9.2). REUSES the gray-zone ai_task
+    # call (llm.py, same fallback choreography) with an orientation prompt.
+    # NO parallel pathway; it is a "kind of gray" with a different prompt.
+    # ------------------------------------------------------------------
+
+    async def _orient_or_narrate(self, cand: dict, dry: str) -> str:
+        """A spike already cleared the deterministic gate (is_spike) — salience
+        is settled. Here the LLM owns only the TONE: when the event is
+        actionable it contextualizes and asks ONE question; otherwise it returns
+        the NARRAR sentinel and we fall back to the dry line. Any failure (both
+        providers) also degrades to the dry line — the reflex must never break
+        the emission. Fires once, no follow-up, no conversation state."""
+        prompt = self._build_orient_prompt(cand, dry)
+        data = await self._ai.async_generate(
+            "orienting reflex", prompt, GRAY_STRUCTURE, required_field="resposta"
+        )
+        resposta = str((data or {}).get("resposta") or "").strip()
+        if not resposta or resposta.upper().startswith("NARRAR"):
+            return dry  # not actionable, or providers down → current behavior
+        return resposta
+
+    @staticmethod
+    def _build_orient_prompt(cand: dict, dry: str) -> str:
+        """PT orientation prompt. The event is ALREADY salient (anomaly + high
+        priority — unexpected and relevant); the LLM decides tone, not whether
+        it matters. One question maximum; silence is a complete answer.
+
+        Crucial constraint (constitution: attentional, not actuator cognition):
+        the reflex ORIENTS — it brings the fact to attention and may ask whether
+        the RESIDENT wants to look/act. It must NEVER promise that the system
+        will perform an action ("quer que eu desligue?"): the spike fires once
+        and returns to rest (no follow-up, no conversation state), so an offer
+        to act would write a check the design deliberately does not cash. A bare
+        reply would land in the generic conversation agent with no referent.
+        Drawing attention is the product; acting on devices is not.
+
+        The device is named only by the already-humanized `dry` line (it carries
+        the friendly_name). The entity_id is NOT passed in — there is nothing
+        internal to echo, so layer-1 protection stands on its own (same logic
+        that removed the leaked salience score)."""
+        ts = cand.get("timestamp", "") or ""
+        hora = ts[11:16] if len(ts) >= 16 else "agora"
+        return f"""Um evento INCOMUM e RELEVANTE acabou de acontecer na casa:
+
+  {dry}
+  (horario: {hora})
+
+Ele e incomum (fora do padrao de horario) E de uma entidade importante. Isso ja
+foi decidido pelo sistema — voce NAO decide se importa, decide apenas o TOM.
+
+Seu papel e CHAMAR A ATENCAO do morador, nao agir. Voce NAO executa nada e NAO
+controla dispositivos — apenas traz o fato a atencao para que ELE decida.
+
+1. Vale trazer isso a atencao do morador agora? (ex.: algo ficou ligado/aberto
+   fora de hora, um dispositivo se comportou de forma inesperada.)
+2. Se SIM: contextualize em 1-2 frases curtas e faca UMA pergunta que deixe a
+   decisao com o morador (ex.: "quer dar uma olhada?", "esta tudo bem assim?").
+   NUNCA se ofereca para desligar/ligar/fechar/executar nada — voce so avisa.
+   Fale do dispositivo pelo nome natural que ja aparece acima.
+   Calmo, sem alarme, sem cobranca — o morador pode ignorar e esta tudo bem.
+   NUNCA mais de uma pergunta.
+3. Se NAO vale o aviso: responda EXATAMENTE a palavra NARRAR e nada mais — o
+   sistema usara a linha seca padrao.
+
+Responda em portugues no campo 'resposta'."""
+
+    # ------------------------------------------------------------------
     # Delivery + stats
     # ------------------------------------------------------------------
 
@@ -689,16 +824,44 @@ responda EXATAMENTE: SILENCIO."""
 
     def _log_stats(self, stats: dict) -> None:
         """Accumulate the day's ARAS stats (ports aras_log_stats.py) —
-        flock-shared file, same format the shell sensor reads."""
+        flock-shared file, same format the shell sensor reads. When the day
+        rolls, flush the previous day's final totals to the append-only history
+        (v9.2) so spike rarity stays measurable over weeks."""
         today = datetime.now().strftime("%Y-%m-%d")
         path = self._hass.config.path(ARAS_STATS_RELATIVE_PATH)
+        rolled = None
         with locked_json_update(path, {}) as s:
             if s.get("data") != today:
+                if s.get("data"):  # a completed previous day to retain
+                    rolled = dict(s)
                 s.clear()
-                s.update({"data": today, "total": 0, "emit": 0,
-                          "gray": 0, "suppress": 0, "llm_calls": 0})
+                s.update({"data": today, "total": 0, "emit": 0, "gray": 0,
+                          "suppress": 0, "spike": 0, "llm_calls": 0})
             # .get(k, 0): the file is external/editable — a missing key must
             # not abort the end of a cycle whose emissions already went out
-            for k in ("total", "emit", "gray", "suppress", "llm_calls"):
+            for k in ("total", "emit", "gray", "suppress", "spike", "llm_calls"):
                 s[k] = s.get(k, 0) + stats[k]
             s["emit_threshold"] = stats["emit_threshold"]  # last seen, not summed
+        if rolled:
+            self._append_stats_history(rolled)
+
+    def _append_stats_history(self, day_stats: dict) -> None:
+        """One JSON line per COMPLETED day (append-only). aras_stats.json is
+        overwritten daily and cannot hold a series; this lets the PM see
+        spikes-per-week and validate the rarity law. Best-effort — a telemetry
+        write must never break the cycle. Single writer (the Heartbeat), no lock."""
+        path = self._hass.config.path(ARAS_STATS_HISTORY_RELATIVE_PATH)
+        line = json.dumps({
+            "date": day_stats.get("data"),
+            "total": day_stats.get("total", 0),
+            "emit": day_stats.get("emit", 0),
+            "gray": day_stats.get("gray", 0),
+            "suppress": day_stats.get("suppress", 0),
+            "spike": day_stats.get("spike", 0),
+            "emit_threshold": day_stats.get("emit_threshold"),
+        }, ensure_ascii=False)
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError as exc:  # noqa: BLE001 — telemetry must not crash the cycle
+            _LOGGER.debug("stats history append failed: %s", exc)

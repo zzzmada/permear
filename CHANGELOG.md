@@ -6,6 +6,26 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.2.0] — June 2026
+
+The orienting reflex. A small, deliberate evolution: most events stay a quiet line, but the rare event that is both genuinely unusual and actionable now gets active attention instead of a dry log line.
+
+### Added
+
+- **The orienting reflex (rare, bounded)**: when an event is both unexpected for that entity *and* of high importance, PERMEAR no longer just prints a line — it contextualizes and asks once, calmly, then returns to silence. It fires rarely by design (a few times a week at most, never daily), adds no extra messages (it only changes how one already-passing event is treated), asks at most one question, and treats your silence as a complete answer. It never offers to act — it brings the rare, relevant thing to your attention and leaves the decision to you.
+- **"Unusual" now respects each entity's own habit**: an event in the small hours only counts as unusual if that entity does not *normally* act then. A device that routinely changes overnight is treated as routine, not flagged — habituation applied to time, the same way the filter already habituates to repetition.
+- **Retained telemetry**: a daily append-only stats history, so the filter's behavior over time can actually be observed.
+
+### Changed
+
+- **Nightly briefing and weekly summary now arrive in the morning (08:00)**: the cycles still run overnight, but their Telegram message is delivered at a reasonable hour instead of in the middle of the night.
+
+### Fixed
+
+- **Internal data never leaks into messages**: salience scores and raw entity IDs are no longer present in the prompts that generate your messages — removed at the source, not just instructed against.
+- **Provider content-safety blocks no longer surface as errors**: a Gemini safety/policy block is treated as the external, transient event it is, not as a PERMEAR error.
+
+---
 ## [9.1.2] — June 2026
 
 Patch release. Robustness against unstable devices.

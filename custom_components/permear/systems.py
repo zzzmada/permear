@@ -41,7 +41,7 @@ from .const import (
 from .correlate import compute_pairs
 from .household import get_residents
 from .llm import AiTaskClient
-from .notify import async_send_telegram
+from .notify import async_defer_message
 from .storage import PermearStorage
 
 _LOGGER = logging.getLogger(__name__)
@@ -171,7 +171,8 @@ class PermearSystems:
 
         applied = await self._compile(data or {})
         summary = self._format_summary(applied, len(agent_autos))
-        await async_send_telegram(self._hass, summary)
+        # v9.2.2 — defer delivery to 08:00 (the weekly cycle still runs now).
+        await async_defer_message(self._hass, "systems", summary)
         _LOGGER.info("Systems Consolidation done: %s", applied)
         return applied
 

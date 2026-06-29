@@ -34,6 +34,7 @@ from .const import (
     ERROR_ARCHIVE_EXPIRATION_HOURS,
     ERROR_CARD_MAX_PER_WINDOW,
     ERROR_CARD_WINDOW_SECONDS,
+    GOOGLE_BLOCK_FINISH_REASONS,
     NOISY_COMPONENTS,
     SELF_COMPONENTS,
     TRANSIENT_MSG_KEYWORDS,
@@ -68,12 +69,20 @@ def redact_secrets(message: str) -> str:
 
 
 def is_provider_transient(component: str, message: str) -> bool:
-    """Expected transient errors — LLM 503/429 quota and device connections."""
+    """Expected transient errors — LLM 503/429 quota, Gemini content-policy
+    blocks (FinishReason.*), and device connection resets.
+
+    The FinishReason.* tokens are matched ONLY inside the google branch: a
+    Gemini SAFETY/RECITATION/etc. block is an EXTERNAL provider decision the
+    fallback choreography handles, not a PERMEAR bug — so it must not surface
+    as an "ERRO PROPRIO" card. Keeping the match scoped to the google component
+    avoids swallowing the bare word "safety" in an unrelated error."""
     comp = component.lower()
     msg = message.lower()
     if "google_generative_ai" in comp and (
         "503" in msg or "unavailable" in msg
         or "429" in msg or "resource_exhausted" in msg
+        or any(fr in msg for fr in GOOGLE_BLOCK_FINISH_REASONS)
     ):
         return True
     return any(kw in msg for kw in TRANSIENT_MSG_KEYWORDS)
