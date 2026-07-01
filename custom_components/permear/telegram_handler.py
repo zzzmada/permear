@@ -342,6 +342,17 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
         if self._config.conversation:
             speech = await self._converse(self._config.conversation, prompt, conv_id)
         if speech is None and self._config.conversation_fallback:
+            try:
+                from homeassistant.components.conversation.chat_log import DATA_CHAT_LOGS
+                chat_logs = self._hass.data.get(DATA_CHAT_LOGS)
+                if chat_logs and conv_id in chat_logs:
+                    chat_log = chat_logs[conv_id]
+                    if chat_log.content and type(chat_log.content[-1]).__name__ == "UserContent":
+                        _LOGGER.info("Cleaning up invalid conversation state (dangling UserContent) for ID %s before fallback", conv_id)
+                        chat_log.content.pop()
+            except Exception as e:
+                _LOGGER.error("Failed to clean up chat log state: %s", e)
+
             speech = await self._converse(
                 self._config.conversation_fallback, prompt, conv_id
             )

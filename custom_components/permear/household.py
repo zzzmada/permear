@@ -51,38 +51,37 @@ def get_rooms(hass: HomeAssistant) -> list[str]:
 
 @callback
 def agent_preamble(hass: HomeAssistant, config: PermearConfig) -> str:
-    """PT context block for the conversation agent (runtime injection).
+    """PT context block for the conversation agent (runtime injection, v9.3).
 
     Injected once per daily conversation, INSIDE the same block as the
     user's turn — never as a fake user turn or a fabricated assistant turn,
-    which would corrupt the HA chat-log alternation. Kept minimal: identity,
-    residents, rooms, and what the agent can do.
+    which would corrupt the HA chat-log alternation.
+
+    Deliberately does NOT enumerate residents/rooms: that — with live states
+    — already arrives via the Assist Live Context (llm_hass_api ["assist"]).
+    Duplicating it competed with that context. The preamble POINTS to it and
+    injects only universal behavior (real-state grounding, conversational
+    context, how the agent learns) so the right conduct ships zero-config,
+    independent of any prompt hand-pasted in the HA agent UI.
     """
-    residents = get_residents(hass)
-    rooms = get_rooms(hass)
-    nomes = ", ".join(r["name"] for r in residents)
-    principal = config.primary_resident or (
-        residents[0]["name"] if residents else ""
-    )
     nome_agente = config.agent_name or DEFAULT_AGENT_NAME
 
     linhas = [
         "[CONTEXTO PERMEAR — instrucao de sistema, nao e fala do usuario:",
         f"Voce e {nome_agente}, a superficie de conversa do PERMEAR, a camada "
-        "de memoria cognitiva e saliencia desta casa (Home Assistant). "
-        "Responda em portugues do Brasil, curto e direto.",
+        "de memoria e atencao desta casa. O estado atual da casa — moradores "
+        "presentes, comodos e dispositivos com seus estados — esta no contexto "
+        "do sistema que acompanha esta conversa. Use SEMPRE esse estado real "
+        "para responder; nunca presuma o que nao esta la. Se algo nao aparece, "
+        "diga que nao consegue ver, em vez de adivinhar.",
+        "Interprete cada mensagem no contexto do que voce acabou de dizer: se "
+        "o morador responde curto ('desligue', 'sim', 'pode') logo apos uma "
+        "observacao ou pergunta sua, aja sobre o que voce mesmo mencionou — "
+        "nao pergunte 'o que?' nem repita uma confirmacao ja dada.",
+        "Voce aprende observando o que se repete, nao gravando ordens. Se "
+        "pedirem para lembrar ou associar algo, responda com honestidade "
+        "('vou prestar atencao a isso') — sem afirmar que criou uma regra. "
+        "Nunca mande o morador usar comandos tecnicos; isso nao e trabalho dele.",
+        "Fale curto, direto, em portugues. Diga o necessario e pare.]",
     ]
-    if nomes:
-        linha = f"Moradores: {nomes}."
-        if principal:
-            linha += f" Morador principal: {principal}."
-        linhas.append(linha)
-    if rooms:
-        linhas.append(f"Comodos da casa: {', '.join(rooms)}.")
-    linhas.append(
-        "Voce pode responder sobre a casa e gerenciar automacoes criadas "
-        "pelo agente: para listar, responda exatamente LIST_AUTOS; para "
-        "remover, responda exatamente REMOVE_AUTO: <nome>. Novas automacoes "
-        "sao criadas pelo comando /nova_automacao no Telegram.]"
-    )
     return "\n".join(linhas)
