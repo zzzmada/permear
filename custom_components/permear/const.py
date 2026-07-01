@@ -269,6 +269,7 @@ NOISY_COMPONENTS = (
     "speedtestdotnet", "msmart",
     "frontend.js",
     "webostv", "aiowebostv",  # LG TV emits a cosmetic error when it sleeps
+    "homeassistant.components.conversation",
 )
 SELF_COMPONENTS = (
     "telegram_bot", "telegram", "conversation",
@@ -306,7 +307,7 @@ TELEGRAM_CONFIRM_WORDS = frozenset({"sim", "yes", "ok", "confirmo", "approve"})
 TELEGRAM_REJECT_WORDS = frozenset(
     {"não", "nao", "cancel", "cancelar", "no", "reject"}
 )
-CONVERSATION_RETRY_DELAYS = (0, 15, 45)  # 3 attempts per provider
+CONVERSATION_RETRY_DELAYS = (0, 5, 15)  # 3 attempts per provider
 REACTION_WINDOW_MINUTES = 15  # user reply marks recent emits as reacted
 
 # Agent automations (CRUD over automations/permear_agent.yaml).

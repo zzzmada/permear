@@ -6,6 +6,23 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.3.0] — June 2026
+
+Sharper conversation. The conversational surface now grounds its answers in the home's real state and keeps the thread of what was just said — fewer wrong answers, fewer "what do you mean?" loops.
+
+### Changed
+
+- **The conversation agent now grounds in real device state by default.** The system-side context that accompanies each conversation points the agent at the live state of the house, so it answers from what is actually on/off/open rather than from what seems likely. When it cannot see something, it says so instead of guessing. This behavior now ships built-in, not only as user-configured prompt text.
+- **The agent follows the thread.** A short reply right after the agent's own observation or question ("turn it off", "yes", "go ahead") is now read in that context — it acts on what it just mentioned instead of asking "what?" or repeating a confirmation already given.
+- **Honest about how it learns.** When asked to remember or associate something, the agent now responds plainly that it pays attention to what repeats over time, rather than claiming it created a rule — consolidation happens by repetition, not by command. It no longer redirects residents to technical commands.
+
+### Fixed
+
+- **Faster failover on the conversation path.** When the primary conversation provider is briefly unavailable, the wait before switching to the fallback was shortened, so the chat no longer appears frozen for a long stretch.
+- **Provider errors no longer surface as PERMEAR errors.** Transient errors from Home Assistant's own conversation component are filtered out of PERMEAR's health reporting.
+- **The fallback recovers from an empty primary response.** When the primary provider returns nothing (e.g. a quota or high-demand response), the conversation state is cleaned before handing off, so the fallback answers instead of failing.
+
+---
 ## [9.2.0] — June 2026
 
 The orienting reflex. A small, deliberate evolution: most events stay a quiet line, but the rare event that is both genuinely unusual and actionable now gets active attention instead of a dry log line.
