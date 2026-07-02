@@ -312,11 +312,16 @@ class PermearHeartbeat:
                 and len(resposta) > 2
             ):
                 await self._deliver(resposta)
-                await self._storage.async_record_interaction(
-                    "heartbeat", resposta[:100]
-                )
-                # Gray-zone emission is keyless (LLM paraphrase — known limitation)
-                await self._storage.async_record_emit(resposta, None, None)
+                # Record the batch under each candidate's OWN key and dry
+                # content — deterministic, never parsed from the LLM text.
+                # The keys enter today's recent_keys (novelty dedup for the
+                # gray path), and bot text stays out of the interaction
+                # stream Sleep reads as resident speech.
+                for c, r in grays:
+                    await self._storage.async_record_emit(
+                        c["content"], c.get("key"),
+                        self._emit_metadata(c.get("metadata"), r["salience"]),
+                    )
 
         stats = {
             "total": len(candidates),

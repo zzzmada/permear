@@ -224,6 +224,7 @@ MEMORY_STABLE_DEMOTE_DAYS = 90        # stable without mention -> active
 ENGAGEMENT_MIN_ALERTS = 4       # minimum alerts to have confidence
 ENGAGEMENT_UP_RATE = 0.66       # reaction rate >= raises priority
 ENGAGEMENT_DOWN_RATE = 0.33     # reaction rate <= lowers priority
+EMIT_HISTORY_MAX = 30           # emission/reaction timestamps kept per item
 
 # Co-occurrence detection (v8.6 contract — deterministic, no LLM).
 COOCCURRENCE_WINDOW_SECONDS = 120

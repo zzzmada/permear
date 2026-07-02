@@ -6,6 +6,23 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.4.0] — July 2026
+
+Memory that truly lives. An audit of the Organic Memory lifecycle against real production data found and fixed several places where the "decays, reinforced by mention" promise was silently broken.
+
+### Fixed
+
+- **Faded memories can come back.** Reinforcing a faded memory now resurrects it as a fresh ephemeral entry (a new epoch). Previously a faded line could accumulate mentions forever without ever returning — including resident restrictions, which could be re-stated and silently swallowed. Decay is now real decay, never a black hole.
+- **Demoted memories can be promoted again.** Promotion ("3+ mentions in 30 days") was measured cumulatively from first sight, so an old demoted line could never re-qualify. Reinforcement past the window now restarts the epoch, so "decays both ways" finally has a way back up.
+- **The gray zone no longer repeats itself.** Items spoken through the gray zone are now recorded with their own canonical key, so the same subject no longer returns hour after hour as if new. A subject the filter has already handled stays quiet for the rest of the day — quieter, and truer to the thesis.
+- **The agent's own messages no longer count as resident interactions.** Bot output was being double-recorded and read back by the nightly consolidation as if the resident had said it. Removed.
+- **Engagement learning can actually fire.** The weekly engagement pass counted alerts per memory line, but reinforcement collapses a week into one line — so the learned-priority mechanism had never once triggered. Emission history is now tracked per memory (capped), and one reaction credits at most one emission.
+
+### Changed
+
+- **Lighter on the SD card.** The write-ahead log is now truncated during the nightly cleanup instead of growing unbounded. A long-obsolete data-repair pass was retired.
+
+---
 ## [9.3.0] — June 2026
 
 Sharper conversation. The conversational surface now grounds its answers in the home's real state and keeps the thread of what was just said — fewer wrong answers, fewer "what do you mean?" loops.

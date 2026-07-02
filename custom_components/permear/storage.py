@@ -34,6 +34,7 @@ from .const import (
     SCHEMA_VERSION,
     DRY_BOOST_EXCLUDED_DOMAINS,
     NOISE_BINARY_DEVICE_CLASSES,
+    EMIT_HISTORY_MAX,
     ENGAGEMENT_DOWN_RATE,
     ENGAGEMENT_MIN_ALERTS,
     ENGAGEMENT_UP_RATE,
@@ -464,14 +465,42 @@ class PermearStorage:
         )
 
     def _record_emit(self, content: str, key: str | None, metadata: dict | None):
+        clean_key = (key.strip() or None) if key else None
         item_id, was_new, via = self._add_or_reinforce(
             content.strip(), kind="observation", source="heartbeat",
-            key=(key.strip() or None) if key else None, metadata=metadata,
+            key=clean_key, metadata=metadata,
         )
         # Persist score on reinforce paths — _add_item stores it for new items
         if not was_new and metadata and "score" in metadata:
             self._update_metadata(item_id, {"score": metadata["score"]})
+        if clean_key:
+            self._note_emission(item_id)
         return item_id, was_new, via
+
+    def _note_emission(self, item_id: int) -> None:
+        """Append the emission timestamp to metadata.emits (bounded list).
+
+        Reinforcement collapses a week of alerts into a single row, so
+        engagement learning cannot count alerts by row (it never reached
+        ENGAGEMENT_MIN_ALERTS that way) — per-emission counting lives here.
+        """
+        assert self._conn is not None
+        now = datetime.now().isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata FROM memory_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            emits = meta.get("emits") or []
+            emits.append(now)
+            meta["emits"] = emits[-EMIT_HISTORY_MAX:]
+            self._conn.execute(
+                "UPDATE memory_items SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), item_id),
+            )
+            self._conn.commit()
 
     async def async_record_interaction(self, canal: str, content: str) -> None:
         """Persist a system→user interaction (ports record_interaction.py)."""
@@ -492,21 +521,18 @@ class PermearStorage:
         with self._lock:
             if key:
                 hit = self._conn.execute(
-                    "SELECT id FROM memory_items WHERE key = ?"
+                    "SELECT id, tier, first_seen FROM memory_items WHERE key = ?"
                     " ORDER BY last_seen DESC LIMIT 1",
                     (key,),
                 ).fetchone()
                 if hit:
-                    self._conn.execute(
-                        "UPDATE memory_items SET mention_count = mention_count + 1,"
-                        " last_seen = ? WHERE id = ?",
-                        (now, hit["id"]),
-                    )
+                    self._reinforce_row_locked(hit, now)
                     self._conn.commit()
                     return hit["id"], False, "key"
             try:
                 rows = self._conn.execute(
-                    "SELECT m.id, bm25(memory_fts) AS score"
+                    "SELECT m.id, m.tier, m.first_seen, m.key,"
+                    " bm25(memory_fts) AS score"
                     " FROM memory_fts JOIN memory_items m ON m.id = memory_fts.rowid"
                     " WHERE memory_fts MATCH ? AND m.kind = ?"
                     " ORDER BY score LIMIT 1",
@@ -515,11 +541,16 @@ class PermearStorage:
             except sqlite3.OperationalError:
                 rows = []  # FTS query parse issue -> treat as no match
             if rows and rows[0]["score"] <= MEMORY_FTS_MIN_SCORE:
-                self._conn.execute(
-                    "UPDATE memory_items SET mention_count = mention_count + 1,"
-                    " last_seen = ? WHERE id = ?",
-                    (now, rows[0]["id"]),
-                )
+                self._reinforce_row_locked(rows[0], now)
+                if key and not rows[0]["key"]:
+                    # Adopt the caller's canonical key on a keyless row — the
+                    # key lookup above already missed, so no other row owns it.
+                    # Without this the subject reinforces keyless forever and
+                    # never enters recent_keys (novelty dedup).
+                    self._conn.execute(
+                        "UPDATE memory_items SET key = ? WHERE id = ?",
+                        (key, rows[0]["id"]),
+                    )
                 self._conn.commit()
                 return rows[0]["id"], False, "fts"
             cur = self._conn.execute(
@@ -531,6 +562,41 @@ class PermearStorage:
             )
             self._conn.commit()
             return cur.lastrowid, True, "new"
+
+    def _reinforce_row_locked(self, row, now: str) -> None:
+        """Reinforce one matched row (caller holds the lock) with epoch rules.
+
+        - faded row → resurrect as a fresh ephemeral (new epoch). The key/FTS
+          lookups reach faded rows but tier maintenance skips them, so without
+          this a faded memory swallowed every future mention forever — and a
+          re-stated restriction (behavior_rule) could never re-apply.
+        - ephemeral row older than the promotion window → restart the epoch
+          (first_seen/mention_count reset). Promotion measures age from
+          first_seen, so a demoted or long-lived row otherwise sat below the
+          window forever no matter how often it was mentioned.
+        - anything else → plain reinforce (mention_count+1, last_seen).
+        """
+        stale_ephemeral = (
+            row["tier"] == "ephemeral"
+            and (datetime.now() - _parse_iso(row["first_seen"])).days
+            > MEMORY_ACTIVE_PROMOTE_WINDOW
+        )
+        if row["tier"] == "faded" or stale_ephemeral:
+            self._conn.execute(
+                "UPDATE memory_items SET tier = 'ephemeral', mention_count = 1,"
+                " first_seen = ?, last_seen = ? WHERE id = ?",
+                (now, now, row["id"]),
+            )
+            _LOGGER.debug(
+                "Memory %s re-learned (%s) — new ephemeral epoch",
+                row["id"], "resurrected" if row["tier"] == "faded" else "stale",
+            )
+        else:
+            self._conn.execute(
+                "UPDATE memory_items SET mention_count = mention_count + 1,"
+                " last_seen = ? WHERE id = ?",
+                (now, row["id"]),
+            )
 
     def _update_metadata(self, item_id: int, patch: dict) -> bool:
         assert self._conn is not None
@@ -608,9 +674,8 @@ class PermearStorage:
         G / Q10). Only ENTITY-ANCHORED restrictions contribute (entity_id from
         metadata or the 'restriction:<eid>' key); keyless vague refusals do not
         drive suppression — that keeps false positives near zero. Place/short
-        tokens are dropped (filler list + len>=4), so e.g. a short-named TV
-        refusal yields no usable token and cannot hide an unrelated insight,
-        while a curtain refusal (cover.curtain_*) yields {'curtain'}."""
+        tokens are dropped (filler list + len>=4), so e.g. the TV refusal
+        (media_player.tv_example) yields no token and cannot hide any insight,\n        while a curtain refusal (cover.curtain_*) yields {'curtain'}."""
         assert self._conn is not None
         with self._lock:
             rows = self._conn.execute(
@@ -786,7 +851,8 @@ class PermearStorage:
 
     def _mark_reactions(self, minutes: int) -> int:
         assert self._conn is not None
-        cutoff = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=minutes)).isoformat()
         marked = 0
         with self._lock:
             rows = self._conn.execute(
@@ -796,8 +862,17 @@ class PermearStorage:
             ).fetchall()
             for r in rows:
                 meta = json.loads(r["metadata"]) if r["metadata"] else {}
-                if meta.get("reacted"):
-                    continue
+                emits = meta.get("emits") or []
+                reactions = meta.get("reactions") or []
+                if emits:
+                    # one reaction per emission at most — a second reply inside
+                    # the window must not double-credit the same alert
+                    if reactions and reactions[-1] >= emits[-1]:
+                        continue
+                elif meta.get("reacted"):
+                    continue  # legacy row without emission history
+                reactions.append(now.isoformat())
+                meta["reactions"] = reactions[-EMIT_HISTORY_MAX:]
                 meta["reacted"] = True
                 self._conn.execute(
                     "UPDATE memory_items SET metadata = ? WHERE id = ?",
@@ -827,25 +902,11 @@ class PermearStorage:
         )
 
     def _run_maintenance(self, binary_device_classes: dict | None = None) -> dict:
-        cleanup = self._clean_invalid_items()
         counts = self._tier_maintenance()
         changes = self._update_priority_from_memory(binary_device_classes or {})
-        report = {"cleanup": cleanup, "tiers": counts, "priority_changes": changes}
+        report = {"tiers": counts, "priority_changes": changes}
         _LOGGER.info("Memory maintenance: %s", report)
         return report
-
-    def _clean_invalid_items(self) -> dict:
-        """Remove items from the pre-v7.9-F ARAS error-leak bug. Idempotent."""
-        assert self._conn is not None
-        with self._lock:
-            del_err = self._conn.execute(
-                "DELETE FROM memory_items WHERE key LIKE 'event:erro:%'"
-            ).rowcount
-            del_old = self._conn.execute(
-                "DELETE FROM memory_items WHERE key = 'event:to'"
-            ).rowcount
-            self._conn.commit()
-        return {"error_leak": del_err, "old_format": del_old}
 
     def _tier_maintenance(self) -> dict:
         """Tier transitions. Fade beats promotion (silence wins over count).
@@ -1013,13 +1074,21 @@ class PermearStorage:
         )
 
     def _adjust_priorities_by_engagement(self) -> list:
+        cutoff = (datetime.now() - timedelta(days=7)).isoformat()
         engagement: dict = {}
         for row in self._emits_for_engagement(days=7):
             meta = json.loads(row["metadata"]) if row.get("metadata") else {}
+            # Alerts are counted per EMISSION (metadata.emits), not per row —
+            # reinforcement collapses the week into one row, which kept alerts
+            # below ENGAGEMENT_MIN_ALERTS forever. Rows without history (from
+            # before emits tracking) carry no evidence and are skipped.
+            emits = [t for t in (meta.get("emits") or []) if t >= cutoff]
+            if not emits:
+                continue
+            reactions = [t for t in (meta.get("reactions") or []) if t >= cutoff]
             st = engagement.setdefault(row["key"], {"alerts": 0, "reacted": 0})
-            st["alerts"] += 1
-            if meta.get("reacted"):
-                st["reacted"] += 1
+            st["alerts"] += len(emits)
+            st["reacted"] += min(len(reactions), len(emits))
         if not engagement:
             return []
 
@@ -1080,6 +1149,9 @@ class PermearStorage:
                 "DELETE FROM system_flags WHERE name LIKE 'daily_%'"
             ).rowcount
             self._conn.commit()
+            # Bound the WAL on the Pi's SD card (it was growing to ~5× the DB);
+            # the nightly cleanup is the quiet moment for a full checkpoint.
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         report = {"event_buffer": buf, "event_log": log, "daily_flags": flags}
         _LOGGER.info("Daily DB cleanup: %s", report)
         return report
