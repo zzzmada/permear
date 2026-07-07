@@ -6,6 +6,22 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.5.0] — July 2026
+
+Your word is kept, and the silence is honest. This release closes three ways the system could quietly contradict itself: swallowing a re-stated instruction, announcing its own silence, and reporting a state that had already changed.
+
+### Added
+
+- **Presence-aware suggestions.** The hourly cycle now computes, deterministically, whether anyone has been home in the last two hours (from presence sensors already captured). When someone has, lights left on are not treated as "forgotten" — the system no longer suggests turning them off as waste. Determinism owns the fact; the language layer only phrases it.
+
+### Fixed
+
+- **Re-stated instructions are no longer swallowed.** Resident messages were deduplicated semantically, so re-stating an instruction in similar words could silently merge into an old memory and never reach nightly consolidation. Resident speech is now deduplicated only on exact repetition — every new phrasing reaches the extraction pass verbatim.
+- **The system no longer announces its own silence.** When the language pass concluded nothing was worth saying, a paraphrase of that conclusion ("no event worth reporting") could slip through as if it were an alert. Silence detection is now deterministic: short "nothing to report" responses are recognized and suppressed.
+- **Stale open/closed states are no longer reported.** Door and window contact sensors are persistent states, not pulses — they now participate in reverted-event suppression, so a window that opened and closed within the same scan window is not reported as still open. Motion and occupancy sensors remain exempt, as designed.
+
+---
+
 ## [9.4.0] — July 2026
 
 Memory that truly lives. An audit of the Organic Memory lifecycle against real production data found and fixed several places where the "decays, reinforced by mention" promise was silently broken.

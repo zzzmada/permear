@@ -53,6 +53,9 @@ from .const import (
     HEARTBEAT_JITTER_SECONDS,
     HEARTBEAT_WINDOW_MINUTES,
     MONITORED_ENTITIES_RELATIVE_PATH,
+    PRESENCE_DEVICE_CLASSES,
+    PRESENCE_RECENT_MINUTES,
+    REVERTIBLE_BINARY_DEVICE_CLASSES,
     REVERTIBLE_STATE_DOMAINS,
     SILENT_IGNORE_DOMAINS,
     SILENT_STATES,
@@ -74,6 +77,30 @@ GRAY_STRUCTURE = {
         "selector": {"text": {"multiline": True}},
     }
 }
+
+# The gray prompt asks for the EXACT sentinel "SILENCIO", but providers
+# paraphrase it in PT ("Nenhum evento merece aviso.", production 2026-07-06 —
+# delivered to Telegram as if it were an alert). Deterministic net: a SHORT
+# reply that only states "nothing to report" is silence. The length cap keeps
+# a real multi-event message safe even if it contained one of the phrases.
+_SILENCE_PARAPHRASES = (
+    "nenhum evento", "nenhum dos eventos", "nada merece",
+    "nao merece aviso", "não merece aviso", "nada a avisar", "nenhum aviso",
+)
+_SILENCE_MAX_LEN = 80
+
+
+def is_silence(resposta: str | None) -> bool:
+    """True when the gray-zone reply means 'emit nothing' — the sentinel or a
+    short PT paraphrase of it. Deliveries must never carry these to Telegram."""
+    if not resposta or len(resposta) <= 2:
+        return True
+    if "SILENCIO" in resposta.upper():
+        return True
+    low = resposta.lower()
+    return len(resposta) <= _SILENCE_MAX_LEN and any(
+        p in low for p in _SILENCE_PARAPHRASES
+    )
 
 
 def is_spike(decision: str, scores: dict) -> bool:
@@ -260,13 +287,20 @@ class PermearHeartbeat:
     async def async_run(self, health_summary: str = "HEALTH: OK") -> dict:
         """One full Heartbeat. Returns the stats dict (for tests/services)."""
         window_start, first_cycle = self._window_start(datetime.now())  # LOCAL
+        states = {s.entity_id: s for s in self._hass.states.async_all()}
+        # Presence sensors of the house (v9.4.3) — resolved from live states so
+        # the storage query stays pure SQL over event_log.
+        presence_ids = {
+            eid for eid, s in states.items()
+            if eid.startswith("binary_sensor.")
+            and s.attributes.get("device_class") in PRESENCE_DEVICE_CLASSES
+        }
         db_ctx = await self._storage.async_heartbeat_context(
-            window_start, first_cycle
+            window_start, first_cycle, presence_ids
         )
         monitored, circuit_health = await self._hass.async_add_executor_job(
             self._load_cycle_files
         )
-        states = {s.entity_id: s for s in self._hass.states.async_all()}
 
         # File I/O (availability snapshot) lives inside — executor.
         candidates = await self._hass.async_add_executor_job(
@@ -304,13 +338,11 @@ class PermearHeartbeat:
         llm_called = spikes
         if grays:
             llm_called += 1
-            prompt = self._build_gray_prompt(grays, states)
+            prompt = self._build_gray_prompt(
+                grays, states, db_ctx.get("presence_recent", False)
+            )
             resposta = await self._gray_zone_llm(prompt)
-            if (
-                resposta
-                and "SILENCIO" not in resposta.upper()
-                and len(resposta) > 2
-            ):
+            if not is_silence(resposta):
                 await self._deliver(resposta)
                 # Record the batch under each candidate's OWN key and dry
                 # content — deterministic, never parsed from the LLM text.
@@ -464,10 +496,13 @@ class PermearHeartbeat:
         reverted within the 90-min window — the state it captured no longer
         matches the entity's CURRENT state — so it must be suppressed.
 
-        - Applies ONLY to REVERTIBLE_STATE_DOMAINS (persistent states). Pulse
-          domains (binary_sensor/vacuum) are exempt: their event IS the pulse,
-          and "now off" is normal and expected — blinding them would lose real
-          events (motion, door).
+        - Applies to REVERTIBLE_STATE_DOMAINS (persistent states) and to
+          binary_sensors of a CONTACT device_class (door/window/opening/
+          garage_door — REVERTIBLE_BINARY_DEVICE_CLASSES): a contact holds a
+          persistent state like a cover does, so a captured "open" that already
+          closed is stale. All other binary_sensors and vacuum stay exempt:
+          their event IS the pulse, and "now off" is normal and expected —
+          blinding them would lose real events (motion, smoke).
         - current state unavailable/unknown -> suppress (indeterminate; rule #8).
         - detalhe without the '<object_id>_' prefix (already-humanized text, or a
           format we don't recognise) -> cannot extract the captured state, so we
@@ -481,7 +516,12 @@ class PermearHeartbeat:
         if not entity_id or "." not in entity_id:
             return False
         domain = entity_id.split(".", 1)[0]
-        if domain not in REVERTIBLE_STATE_DOMAINS:
+        if domain == "binary_sensor":
+            state = states.get(entity_id)
+            dc = state.attributes.get("device_class") if state else None
+            if dc not in REVERTIBLE_BINARY_DEVICE_CLASSES:
+                return False
+        elif domain not in REVERTIBLE_STATE_DOMAINS:
             return False
         prefix = entity_id.split(".", 1)[1] + "_"
         if not detalhe.startswith(prefix):
@@ -703,8 +743,15 @@ class PermearHeartbeat:
     # Gray zone — ONE ai_task call (data provider), fallback preserved
     # ------------------------------------------------------------------
 
-    def _build_gray_prompt(self, grays, states) -> str:
-        """PT prompt ending with the SILENCIO sentinel. Do not translate."""
+    def _build_gray_prompt(self, grays, states, presence_recent=False) -> str:
+        """PT prompt ending with the SILENCIO sentinel. Do not translate.
+
+        presence_recent (v9.4.3): deterministic house context computed by the
+        storage (event_log). True adds ONE context line telling the LLM that
+        lit lights are not "forgotten" while someone is home (resident's rule);
+        False leaves the prompt byte-identical. Language only — the ARAS
+        scores/decisions never see this flag.
+        """
         itens_parts = []
         for c, r in grays:
             # The salience score is INTERNAL telemetry — never put it in a prompt
@@ -727,16 +774,26 @@ class PermearHeartbeat:
             itens_parts.append(line)
         itens = "\n".join(itens_parts)
 
+        contexto_presenca = ""
+        if presence_recent:
+            contexto_presenca = (
+                f"\nCONTEXTO DA CASA: ha presenca de moradores na casa nos"
+                f" ultimos {PRESENCE_RECENT_MINUTES} minutos. Luzes acesas NAO"
+                f" sao esquecimento — NAO sugira desligar luzes por"
+                f" esquecimento ou desperdicio.\n"
+            )
+
         return f"""Avalie quais destes eventos merecem avisar o morador AGORA.
 
 EVENTOS A AVALIAR:
 {itens}
-
+{contexto_presenca}
 Para CADA evento, decida emitir ou silenciar. Responda so com os eventos que
 merecem aviso, em mensagens curtas (max 2 frases cada). Escreva APENAS a mensagem
 ao morador, em linguagem natural — NAO inclua numeros de saliencia, ids, tipos,
 horarios de atualizacao, nem qualquer dado interno do sistema. Se nenhum merece,
-responda EXATAMENTE: SILENCIO."""
+responda EXATAMENTE a palavra SILENCIO, sozinha — nunca frases como "nenhum
+evento merece aviso"."""
 
     async def _gray_zone_llm(self, prompt: str) -> str | None:
         """Gray-zone data-LLM call via the shared AiTaskClient (RODADA F).

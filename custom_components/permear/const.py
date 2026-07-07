@@ -68,6 +68,16 @@ REVERTIBLE_STATE_DOMAINS = frozenset({
     "media_player", "switch", "light", "climate", "cover", "lock", "fan",
 })
 
+# Contact-class binary_sensors hold a PERSISTENT state exactly like a cover
+# does — a window captured "open" that already closed inside the window is no
+# longer news (production 2026-07-06: "janela aberta" emitted 31 min after the
+# window closed). These device_classes JOIN the reverted-event check; every
+# other binary_sensor (motion/occupancy/presence/smoke/...) stays pulse-exempt,
+# because for those the event IS the pulse and "now off" is normal.
+REVERTIBLE_BINARY_DEVICE_CLASSES = frozenset({
+    "door", "window", "opening", "garage_door",
+})
+
 # Occupancy/motion/presence binary_sensors flood the event_log with on/off
 # toggles and fake co-occurrence pairs. Instead of recording every toggle, the
 # capture records ONE event when occupancy CLEARS, carrying how long it lasted
@@ -78,6 +88,12 @@ REVERTIBLE_STATE_DOMAINS = frozenset({
 # entity monitored (occupancy over time is valid data) without the noise.
 PRESENCE_DEVICE_CLASSES = frozenset({"occupancy", "motion", "presence"})
 OCCUPANCY_DEBOUNCE_SECONDS = 10.0
+
+# v9.4.3 — a lit light is only "forgotten" when the house shows no presence
+# event within this window (resident's rule: "2 hours"). Design constant, NOT
+# a UI option: it feeds a deterministic context line in the gray-zone prompt
+# (language only — ARAS scores and decisions never see it).
+PRESENCE_RECENT_MINUTES = 120
 
 # Entity IDs that must never be recorded (safety net, mirrors record_event.py).
 INVALID_ENTITY_IDS = frozenset({"", "-", "while", "mesmo", "None", "null"})
