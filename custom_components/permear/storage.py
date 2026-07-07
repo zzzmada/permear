@@ -45,6 +45,7 @@ from .const import (
     MEMORY_EPHEMERAL_FADE_DAYS,
     NOCTURNAL_HABIT_MIN_DAYS,
     NOCTURNAL_LOOKBACK_DAYS,
+    PRESENCE_RECENT_MINUTES,
     MEMORY_FTS_MIN_SCORE,
     MEMORY_STABLE_DEMOTE_DAYS,
     MEMORY_STABLE_PROMOTE_MENTIONS,
@@ -374,18 +375,23 @@ class PermearStorage:
     # ------------------------------------------------------------------
 
     async def async_heartbeat_context(
-        self, window_start_iso: str, first_cycle: bool = False
+        self, window_start_iso: str, first_cycle: bool = False,
+        presence_entity_ids: set | None = None,
     ) -> dict:
         """Window events + today's emitted keys + consolidated count + active
         restriction memories (v9.0.2), one executor job. On the first cycle of
         the day (the only one that evaluates the night) also returns the set of
-        entities habitually active in the small hours (v9.2.2)."""
+        entities habitually active in the small hours (v9.2.2). When the caller
+        passes the house's presence-sensor entity ids, also answers whether any
+        of them produced an event within PRESENCE_RECENT_MINUTES (v9.4.3)."""
         return await self._hass.async_add_executor_job(
-            self._heartbeat_context, window_start_iso, first_cycle
+            self._heartbeat_context, window_start_iso, first_cycle,
+            presence_entity_ids,
         )
 
     def _heartbeat_context(
-        self, window_start_iso: str, first_cycle: bool = False
+        self, window_start_iso: str, first_cycle: bool = False,
+        presence_entity_ids: set | None = None,
     ) -> dict:
         assert self._conn is not None
         today = _today_local()
@@ -437,6 +443,24 @@ class PermearStorage:
                         (cutoff, NOCTURNAL_HABIT_MIN_DAYS),
                     )
                 }
+            # Recent presence in the house (v9.4.3) — any event from a
+            # presence-class binary_sensor within the window. The capture
+            # records presence as the sustained-span event, so ANY row from
+            # these entities means someone was home. ONE query per cycle,
+            # LOCAL ts (never date('now')/UTC, rule #41). No presence
+            # sensors → False → the gray prompt stays untouched.
+            presence_recent = False
+            if presence_entity_ids:
+                ids = sorted(presence_entity_ids)
+                presence_cutoff = (
+                    datetime.now() - timedelta(minutes=PRESENCE_RECENT_MINUTES)
+                ).isoformat()
+                presence_recent = self._conn.execute(
+                    "SELECT 1 FROM event_log WHERE ts >= ?"
+                    f" AND entity_id IN ({','.join('?' * len(ids))})"
+                    " LIMIT 1",
+                    (presence_cutoff, *ids),
+                ).fetchone() is not None
         restrictions = []
         for r in restr_rows:
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
@@ -454,6 +478,7 @@ class PermearStorage:
             "consolidated_count": consolidated,
             "restrictions": restrictions,
             "nocturnal_habitual": nocturnal_habitual,
+            "presence_recent": presence_recent,
         }
 
     async def async_record_emit(
@@ -515,7 +540,15 @@ class PermearStorage:
         self, content: str, kind: str, source: str,
         key: str | None = None, metadata: dict | None = None,
     ) -> tuple:
-        """Two-layer reinforce-or-create: canonical key, then FTS (≤ -5.0)."""
+        """Two-layer reinforce-or-create: canonical key, then FTS (≤ -5.0).
+
+        kind='interaction' skips the FTS layer and dedups by EXACT content
+        instead: an interaction is the resident's literal words, read verbatim
+        by the Sleep extraction — a fuzzy merge replaces today's speech with an
+        old row's text, so a new restriction never reaches extraction (v9.4.1;
+        two real losses in production, both absorbed at score ≈ −5.2/−5.9).
+        Exact match is lossless (same words) and still folds plain repeats.
+        """
         assert self._conn is not None
         now = datetime.now().isoformat()
         with self._lock:
@@ -529,6 +562,26 @@ class PermearStorage:
                     self._reinforce_row_locked(hit, now)
                     self._conn.commit()
                     return hit["id"], False, "key"
+            if kind == "interaction":
+                hit = self._conn.execute(
+                    "SELECT id, tier, first_seen FROM memory_items"
+                    " WHERE kind = 'interaction' AND content = ?"
+                    " ORDER BY last_seen DESC LIMIT 1",
+                    (content,),
+                ).fetchone()
+                if hit:
+                    self._reinforce_row_locked(hit, now)
+                    self._conn.commit()
+                    return hit["id"], False, "exact"
+                cur = self._conn.execute(
+                    "INSERT INTO memory_items (content, kind, tier, subject, key,"
+                    " first_seen, last_seen, mention_count, source, metadata)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (content, kind, "ephemeral", None, key, now, now, 1, source,
+                     json.dumps(metadata) if metadata else None),
+                )
+                self._conn.commit()
+                return cur.lastrowid, True, "new"
             try:
                 rows = self._conn.execute(
                     "SELECT m.id, m.tier, m.first_seen, m.key,"
