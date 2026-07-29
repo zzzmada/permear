@@ -156,6 +156,18 @@ ARAS_MATURITY_FULL_RATIO = 0.5
 ARAS_MATURITY_MIN_ENTITIES = 5
 ARAS_SUPPRESS_THRESHOLD = 1
 
+# Two-way self-regulation (v9.5.1, PM decision 2026-07-26). Habituation must
+# decay like memory decays: with the threshold saturated at MAX for 30 days the
+# deterministic voice went mute for 15 straight days and the orienting reflex
+# (which reclassifies an emit) became structurally unreachable — the 30-day
+# report's central finding. After GRACE days without a single deterministic
+# emission, maturity's contribution erodes linearly, reaching newborn
+# sensitivity (threshold = MIN) at FULL days. One emission day resets the
+# count: the filter breathes instead of saturating. Same mechanism in reverse —
+# no new knob, not exposed to the user.
+ARAS_RELAX_GRACE_DAYS = 7
+ARAS_RELAX_FULL_DAYS = 21
+
 # Orienting reflex (v9.2 — the spike path). A spike RECLASSIFIES an event that
 # would ALREADY emit — it never adds volume. An emit candidate whose ARAS axes
 # show anomaly (broke the expected pattern) AND high priority is the "unexpected
@@ -196,6 +208,15 @@ MEMORY_FTS_MIN_SCORE = -5.0
 BATTERY_THRESHOLD = 20
 BATTERY_ENTITY_PATTERNS = ("_battery", "_battery_level")
 BATTERY_DEVICE_CLASSES = ("battery",)
+# A low battery is a STANDING CONDITION, not an event: the scanner re-creates
+# the candidate every heartbeat while the level stays low, and the daily
+# novelty reset (recent_keys covered only today) turned that into one delivered
+# alert per day for weeks (30-day report, 2026-07). battery_low keys therefore
+# stay in recent_keys for this many days after the last recorded alert —
+# habituation extended to a standing condition, no new mechanism. While the
+# condition persists the alert re-emerges naturally about once a week
+# (last_seen goes stale past the window → novelty returns).
+BATTERY_RENOTIFY_DAYS = 7
 SILENT_STATES = ("unavailable", "unknown")
 SILENT_IGNORE_DOMAINS = (
     "device_tracker", "person",   # presence, flicker constantly
@@ -214,6 +235,23 @@ FALLBACK_SKIP_PRIMARY_SECONDS = 3600
 # secondary; past it, the primary is assumed back and the state returns to
 # tudo_ok. fallbacks_hoje stays as a daily-history attribute only.
 HEALTH_FALLBACK_WINDOW_MINUTES = 20
+
+# Perception health (v9.5): availability is global health, never an event
+# (rule #8) — but health must actually SAY when the sensory periphery is gone.
+# In 2026-07 the Zigbee mesh was down for ~10 days and sensor.permear_health
+# read "tudo_ok" throughout (30-day report). When at least this share of the
+# monitored entities has been silent (unavailable/unknown) for longer than the
+# minimum below, the health state becomes "percepcao_reduzida". Deterministic,
+# read from availability_snapshot.json; nothing is emitted to the resident.
+# Honest limitation: this only sees blindness HA itself labels (unavailable/
+# unknown). A frozen mesh whose entities keep their last state looks
+# "available" — recorder data (2026-07-22) shows that mode is not separable
+# from a legitimately quiet house without per-entity baselines, which stay
+# refused. The min-hours floor also keeps restart flaps (mass unavailable for
+# minutes) from ever surfacing.
+PERCEPTION_SILENT_SHARE = 0.5
+PERCEPTION_SILENT_MIN_HOURS = 6
+PERCEPTION_MIN_ENTITIES = 5
 
 # =============================================================================
 # v8.10 — Sleep + Systems + Wake (ported from scripts/permear_config.py)
