@@ -10,7 +10,10 @@ Raspberry Pi 4 (2 GB).
 It is not an assistant, an automation pack, or a copilot. It is an
 attentional layer: most of what happens in a home is not worth a
 notification, and PERMEAR is built around that fact. Silence is its default
-state.
+state — and, rarely, an event that is both genuinely unusual and actionable
+receives active attention instead of a dry line. That is the **orienting
+reflex**: the system contextualizes, asks once, and treats your silence as a
+complete answer.
 
 ---
 
@@ -33,6 +36,19 @@ PERMEAR is installed as a **custom repository** in HACS.
 There is **no YAML configuration**. Everything is configured through the UI
 (config flow and options). PERMEAR does not use `secrets.yaml` or any
 configuration file.
+
+---
+
+## Expose your entities to Assist (important)
+
+The conversation agent can only see the devices **you expose to Assist**.
+If an entity is not exposed, the agent cannot read its state — and language
+models tend to guess plausibly instead of admitting blindness.
+
+In **Settings → Voice assistants → Expose**, expose the entities you want
+the agent to know about. Whatever you leave unexposed, the agent will
+honestly say it cannot see (PERMEAR instructs it to), but it can only be
+accurate about what it can reach.
 
 ---
 
@@ -95,23 +111,27 @@ household events
        ▼
   Heartbeat (hourly, within a configurable daytime window)
   build candidates → ARAS Filter → emit / suppress / gray zone
-       │                                   │
-       │                                   ▼  (gray only)
-       │                         one ai_task call (data provider)
-       │                                   │
-       ▼                                   ▼
-  Telegram (emit)                Telegram (after LLM judgment)
-       │
+       │                │                  │
+       │                │ (rare spike:     ▼  (gray only)
+       │                │  unusual AND     one ai_task call (data provider)
+       │                │  important)      │
+       │                ▼                  │
+       │        Orienting Reflex           │
+       │        contextualize + ask once   │
+       ▼                │                  ▼
+  Telegram (emit)       ▼          Telegram (after LLM judgment)
+       │           Telegram
        ▼
   Organic Memory (tiered SQLite)
        │
        ▼
-  Sleep Consolidation (nightly)
+  Sleep Consolidation (nightly; briefing delivered at 08:00)
   extract memories → write to DB → tier maintenance → priority loop
        │
        ▼
   Systems Consolidation (weekly)
   detect recurring co-occurrences → suggest an automation
+  learn from engagement → adjust priorities
 ```
 
 Everything runs **in-process** inside the integration. There are no shell
@@ -132,31 +152,47 @@ Each candidate event is scored on four axes:
 | Axis | Range | Description |
 |---|---|---|
 | novelty | 0–2 | Compared by canonical key (`type:entity_id`), not raw text |
-| anomaly | 0–1 | Deviation from the observed baseline |
-| priority | 0–2 | User-set or memory-learned weight |
+| anomaly | 0–1 | An event at an hour unusual *for that entity* — a device that routinely acts at night is not flagged for it (habituation applied to time) |
+| priority | 0–2 | User-set, engagement-learned, or memory-derived weight |
 | user_match | −2..0 | Penalty for events the resident asked not to hear about |
 
 - **Score ≤ 1** → suppressed silently
 - **Score ≥ dynamic threshold** → emitted to Telegram
 - **In between** → one `ai_task` call resolves the gray zone
 
-The threshold is **dynamic and relative to your entity park**:
+The threshold is **dynamic, relative to your entity park — and it breathes**:
 
 ```
 threshold = MIN + maturity × (MAX − MIN)
 maturity  = min((consolidated_items / exposed_entities) / 0.5, 1.0)
 ```
 
-The system is born curious (low threshold — novelty alone is enough),
-matures over weeks of observation, and becomes selectively attentive once it
-has learned the house. It scales to any household size with no seeding and
-no day-one configuration. Sensitivity (`sensitive` / `balanced` / `quiet`)
-is the only ARAS knob, set in the options.
+The system is born curious (low threshold — novelty alone is enough) and
+matures over weeks of observation into selective attention. Habituation also
+**recovers**: if weeks pass without a single direct emission, the threshold
+relaxes gradually — and a single emission restores it at once. A stimulus
+that stops being presented regains the power to draw attention, exactly as
+in biological habituation. It scales to any household size with no seeding
+and no day-one configuration. Sensitivity (`sensitive` / `balanced` /
+`quiet`) is the only ARAS knob, set in the options.
 
 Trivial state changes (a plain switch toggling, repeated room occupancy) do
 not earn an attention boost on their own — they still consolidate as memory,
-but they don't claim your attention unless they're genuinely anomalous (an
-odd hour) or you mark them as a priority yourself.
+but they don't claim your attention unless they're genuinely anomalous or
+you mark them as a priority yourself. Standing conditions (a low battery)
+are not treated as a new fact each morning: the reminder re-emerges roughly
+weekly while the condition lasts. And when someone has been home in the last
+two hours, lights left on are not treated as "forgotten".
+
+### The orienting reflex
+
+When an event is both **unexpected for that entity** and **of high
+importance**, PERMEAR does not just print a line — it contextualizes and
+asks once, calmly, then returns to silence. It fires rarely by design (a few
+times a week at most, never daily), adds no extra messages (it only changes
+how one already-passing event is treated), asks at most one question, never
+offers to act, and treats your silence as a complete answer. Salience is
+decided deterministically; the language model only chooses the phrasing.
 
 ---
 
@@ -173,10 +209,17 @@ each item moves between tiers based on reinforcement and silence.
 | faded | Decayed from disuse |
 
 Patterns emerge from **accumulation**, not from LLM detection. Memory that is
-reinforced rises; memory that goes unmentioned decays. Restrictions you
-express in conversation ("stop telling me about X") are learned as memory
-and gently lower the salience of those events — without silencing genuine
-anomalies.
+reinforced rises; memory that goes unmentioned decays — **in both
+directions**: a faded memory that is mentioned again comes back as a fresh
+entry, so decay is real decay, never a black hole. Your own words are never
+merged away: resident speech is deduplicated only on exact repetition, so a
+re-stated instruction always reaches the nightly consolidation verbatim.
+
+Restrictions you express in conversation ("stop telling me about X") are
+learned as memory and gently lower the salience of those events — without
+silencing genuine anomalies. The weekly cycle also learns from
+**engagement**: entities whose alerts you consistently ignore lose priority
+on their own.
 
 The database carries a schema version and migrates forward across updates,
 so your accumulated memory is preserved when you upgrade.
@@ -208,15 +251,35 @@ All configuration is in the UI.
 
 Residents and rooms are read directly from Home Assistant (the `person`
 registry and the area registry) — you do not maintain a separate list. The
-conversation agent receives household context at runtime, so you do not need
-to write a system prompt for it.
+conversation agent receives household context at runtime, including
+behavioral grounding (answer from real state; act on what was just said;
+be honest about how it learns), so you do not need to write a system prompt
+for it.
+
+The nightly briefing and the weekly summary are generated overnight but
+**delivered at 08:00** — the cycles run when the day is done; the message
+waits for a reasonable hour.
+
+---
+
+## Health
+
+`sensor.permear_health` reflects the **current** state of the system: all
+good, a recent provider fallback, or **reduced perception** — when most of
+your monitored entities have been unreachable for hours (a dead Zigbee mesh,
+a network outage), the sensor says so instead of reporting everything fine.
+Being blind is graver than being on a fallback, and the system tells you.
 
 ---
 
 ## What PERMEAR will not do
 
-- It will not talk to you unless something earns it.
-- It will not declare automations; it suggests, and you decide.
+- It will not talk to you unless something earns it — and it will not
+  message you to say it has nothing to say.
+- It will not act on your devices. Even the orienting reflex only brings the
+  rare, relevant thing to your attention and leaves the decision with you.
+- It will not declare automations; it suggests, and you decide. A suggestion
+  you never answer retires on its own — silence is treated as an answer.
 - It does not use embeddings, a vector database, or any always-on assistant
   loop.
 - It does not depend on the cloud for its core logic — only the configured
