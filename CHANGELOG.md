@@ -6,6 +6,22 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.6.0] — July 2026
+
+The filter breathes. A month of production telemetry showed the system habituating all the way into muteness — and repeating itself on the one channel habituation never reached. This release makes both directions work.
+
+### Added
+
+- **Habituation now recovers.** The salience threshold rose with maturity and never came back down: after weeks without a single direct emission, the deterministic voice had gone silent while the house was plainly active. Sustained muteness now relaxes the threshold gradually — after a week without an emission, and fully after three — and a single emission restores it immediately. Same mechanism, both directions, no new setting. This mirrors spontaneous recovery in habituation: a stimulus that stops being presented regains the power to draw attention.
+- **Health reports reduced perception.** When most monitored entities have been unreachable for hours, the health sensor now says so instead of reporting everything fine. A month of telemetry included ten days of a dead sensor mesh during which the system reported perfect health — it was blind, and said nothing.
+
+### Fixed
+
+- **Standing conditions stop repeating daily.** A low battery is not a new fact each morning. Persistent-condition alerts now stay deduplicated for a week, so the reminder re-emerges roughly weekly while the condition lasts instead of every single day — the loudest channel in the month of data.
+- **Unanswered suggestions retire.** An automation suggestion that received no reply kept reappearing in the nightly briefing indefinitely, even after the memory itself had decayed. Faded suggestions now leave the briefing; silence is treated as an answer, and the entry still returns if you mention it.
+
+---
+
 ## [9.5.0] — July 2026
 
 Your word is kept, and the silence is honest. This release closes three ways the system could quietly contradict itself: swallowing a re-stated instruction, announcing its own silence, and reporting a state that had already changed.

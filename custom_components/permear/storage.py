@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from .const import (
     SCHEMA_VERSION,
+    BATTERY_RENOTIFY_DAYS,
     DRY_BOOST_EXCLUDED_DOMAINS,
     NOISE_BINARY_DEVICE_CLASSES,
     EMIT_HISTORY_MAX,
@@ -403,12 +404,20 @@ class PermearStorage:
                     (window_start_iso,),
                 )
             ]
+            # battery_low keys keep novelty at 0 for BATTERY_RENOTIFY_DAYS, not
+            # just today: a low battery is a standing condition, and the daily
+            # reset made the scanner deliver the same alert every single day
+            # (30-day report, 2026-07). Local date arithmetic — never date('now').
+            battery_floor = (
+                datetime.now() - timedelta(days=BATTERY_RENOTIFY_DAYS)
+            ).strftime("%Y-%m-%d")
             recent_keys = [
                 r["key"]
                 for r in self._conn.execute(
                     "SELECT key FROM memory_items WHERE source='heartbeat'"
-                    " AND date(last_seen) = ? AND key IS NOT NULL",
-                    (today,),
+                    " AND key IS NOT NULL AND (date(last_seen) = ?"
+                    " OR (key LIKE 'battery_low:%' AND date(last_seen) >= ?))",
+                    (today, battery_floor),
                 )
             ]
             consolidated = self._conn.execute(
@@ -760,9 +769,16 @@ class PermearStorage:
         assert self._conn is not None
         reject_tokens = self._active_restriction_tokens()
         with self._lock:
+            # Faded suggestions leave the briefing: silence is an answer. An
+            # unanswered suggestion gets ~7 nights of exposure (ephemeral fade
+            # window), then tier decay retires it from the reader too — before
+            # this filter, one faded suggestion was repeated nightly for 14+
+            # days (30-day report, 2026-07). The row stays: mark/decay, never
+            # delete; a resident mention still resurrects it.
             rows = self._conn.execute(
                 "SELECT id, content, metadata, last_seen FROM memory_items"
-                " WHERE source = 'systems' ORDER BY last_seen DESC"
+                " WHERE source = 'systems' AND tier != 'faded'"
+                " ORDER BY last_seen DESC"
             ).fetchall()
         result = {"suggestions": [], "pending": []}
         for r in rows:

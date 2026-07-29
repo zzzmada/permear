@@ -4,7 +4,7 @@ Five entities, same object_ids, states and attributes as the shell versions
 (consumers in cycles.yaml/telegram.yaml read them via state_attr):
 
   sensor.permear_attention      — suppression rate % + ARAS daily stats
-  sensor.permear_health         — tudo_ok | fallback_ativo (PT, rules #22/#33)
+  sensor.permear_health         — tudo_ok | fallback_ativo | percepcao_reduzida (PT)
   sensor.permear_config         — providers + cycle schedules from permear.yaml
   sensor.permear_daily_memory   — today's events/interactions/flags from the DB
   sensor.permear_household_data — residents (HA persons) + action_items (DB)
@@ -29,8 +29,13 @@ from .const import (
     AGENT_CIRCUIT_RELATIVE_PATH,
     ARAS_STATS_RELATIVE_PATH,
     ARCHIVED_ERRORS_RELATIVE_PATH,
+    AVAILABILITY_RELATIVE_PATH,
     DOMAIN,
     HEALTH_FALLBACK_WINDOW_MINUTES,
+    MONITORED_ENTITIES_RELATIVE_PATH,
+    PERCEPTION_MIN_ENTITIES,
+    PERCEPTION_SILENT_MIN_HOURS,
+    PERCEPTION_SILENT_SHARE,
 )
 from .household import get_residents
 from .storage import PermearStorage, load_json
@@ -114,8 +119,15 @@ class PermearAttentionSensor(PermearSensorBase):
 
 
 class PermearHealthSensor(PermearSensorBase):
-    """Two states only — tudo_ok | fallback_ativo (user-facing PT, rule #33).
-    The live fallback signal stays agent_circuit.json.last_fallback_at."""
+    """tudo_ok | fallback_ativo | percepcao_reduzida (user-facing PT).
+    The live fallback signal stays agent_circuit.json.last_fallback_at.
+
+    percepcao_reduzida (v9.5): availability is global health, never an event
+    (rule #8) — in 2026-07 the sensory periphery was down for ~10 days and this
+    sensor read tudo_ok throughout. When most monitored entities have been
+    silent for hours, the gravest fact about the system is that it is blind,
+    so that state outranks fallback_ativo. Deterministic, from the existing
+    availability snapshot; nothing is emitted to the resident."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__("health", "Health")
@@ -123,7 +135,9 @@ class PermearHealthSensor(PermearSensorBase):
         self._hass = hass
 
     async def async_update(self) -> None:
-        circuit, archived = await self._hass.async_add_executor_job(self._read)
+        circuit, archived, perception = await self._hass.async_add_executor_job(
+            self._read
+        )
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         raw_stats = circuit.get("daily_stats") or {}
@@ -139,7 +153,18 @@ class PermearHealthSensor(PermearSensorBase):
             last_fb is not None
             and now - last_fb <= timedelta(minutes=HEALTH_FALLBACK_WINDOW_MINUTES)
         )
-        if recent:
+        silent_count, watched_count = perception
+        if (
+            watched_count >= PERCEPTION_MIN_ENTITIES
+            and silent_count / watched_count >= PERCEPTION_SILENT_SHARE
+        ):
+            state = "percepcao_reduzida"
+            resumo = (
+                f"Percepcao reduzida: {silent_count} de {watched_count} "
+                "entidades monitoradas sem responder ha mais de "
+                f"{PERCEPTION_SILENT_MIN_HOURS}h."
+            )
+        elif recent:
             state = "fallback_ativo"
             resumo = "Operando com provedor secundario agora."
         else:
@@ -151,6 +176,8 @@ class PermearHealthSensor(PermearSensorBase):
             "fallbacks_hoje": fallbacks,
             "ultimo_fallback_em": circuit.get("last_fallback_at"),
             "erros_silenciados_ativos": len(archived.get("errors", {})),
+            "entidades_silenciosas": silent_count,
+            "entidades_monitoradas": watched_count,
         }
 
     @staticmethod
@@ -171,7 +198,36 @@ class PermearHealthSensor(PermearSensorBase):
         archived = load_json(
             self._hass.config.path(ARCHIVED_ERRORS_RELATIVE_PATH), {"errors": {}}
         )
-        return circuit, archived
+        return circuit, archived, self._perception_counts()
+
+    def _perception_counts(self) -> tuple:
+        """(silent, watched) over monitor=true entities present in the
+        availability snapshot the Heartbeat already maintains. Silent = state
+        unavailable/unknown for over PERCEPTION_SILENT_MIN_HOURS (the 'since'
+        in the snapshot survives restarts). Entities the snapshot has never
+        seen don't count — the denominator is what the system can vouch for.
+        Gotcha: monitored entities live in the entities[] LIST, not dict keys."""
+        snapshot = load_json(
+            self._hass.config.path(AVAILABILITY_RELATIVE_PATH), {}
+        )
+        monitored = load_json(
+            self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH), {}
+        )
+        floor = datetime.now() - timedelta(hours=PERCEPTION_SILENT_MIN_HOURS)
+        silent = watched = 0
+        for ent in monitored.get("entities", []):
+            if not ent.get("monitor"):
+                continue
+            info = snapshot.get(ent.get("entity_id"))
+            if not isinstance(info, dict):
+                continue
+            watched += 1
+            if info.get("last_state") != "silent":
+                continue
+            since = self._parse_local(info.get("since"))
+            if since is not None and since <= floor:
+                silent += 1
+        return silent, watched
 
 
 class PermearConfigSensor(PermearSensorBase):

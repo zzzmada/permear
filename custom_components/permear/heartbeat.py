@@ -41,6 +41,8 @@ from .const import (
     AGENT_CIRCUIT_RELATIVE_PATH,
     ARAS_MATURITY_FULL_RATIO,
     ARAS_MATURITY_MIN_ENTITIES,
+    ARAS_RELAX_FULL_DAYS,
+    ARAS_RELAX_GRACE_DAYS,
     ARAS_STATS_HISTORY_RELATIVE_PATH,
     ARAS_STATS_RELATIVE_PATH,
     ARAS_SUPPRESS_THRESHOLD,
@@ -167,13 +169,29 @@ def _friendly(entity_id, states):
     return state.attributes.get("friendly_name") or entity_id
 
 
-def compute_dynamic_threshold(exposed_count, consolidated_count, t_min, t_max):
+def compute_dynamic_threshold(exposed_count, consolidated_count, t_min, t_max,
+                              mute_days=0):
     """Emit threshold relative to memory maturity. Pure arithmetic — no LLM,
-    never hand-tuned. maturity = consolidated/exposed, saturating at FULL_RATIO."""
+    never hand-tuned. maturity = consolidated/exposed, saturating at FULL_RATIO.
+
+    Two-way since v9.5.1: maturity RAISES the threshold as memory consolidates;
+    sustained silence of the deterministic emit path erodes it back down. After
+    ARAS_RELAX_GRACE_DAYS without one emission, relief grows linearly and at
+    ARAS_RELAX_FULL_DAYS the threshold is back at t_min (newborn sensitivity).
+    A single emission day resets mute_days → the threshold snaps back up on the
+    very next cycle, so a relaxation cycle buys at most one burst before full
+    inhibition re-arms. Self-regulation in BOTH directions, still no knob."""
     if not exposed_count or exposed_count < ARAS_MATURITY_MIN_ENTITIES:
         return t_min
     ratio = consolidated_count / exposed_count
     maturity = min(ratio / ARAS_MATURITY_FULL_RATIO, 1.0)
+    if mute_days > ARAS_RELAX_GRACE_DAYS:
+        relief = min(
+            (mute_days - ARAS_RELAX_GRACE_DAYS)
+            / (ARAS_RELAX_FULL_DAYS - ARAS_RELAX_GRACE_DAYS),
+            1.0,
+        )
+        maturity *= 1.0 - relief
     return round(t_min + maturity * (t_max - t_min))
 
 
@@ -301,13 +319,14 @@ class PermearHeartbeat:
         monitored, circuit_health = await self._hass.async_add_executor_job(
             self._load_cycle_files
         )
+        mute_days = await self._hass.async_add_executor_job(self._mute_days)
 
         # File I/O (availability snapshot) lives inside — executor.
         candidates = await self._hass.async_add_executor_job(
             self._build_candidates,
             health_summary, monitored, states, db_ctx["events"], circuit_health,
         )
-        user_state = self._build_user_state(monitored, db_ctx)
+        user_state = self._build_user_state(monitored, db_ctx, mute_days)
 
         emits, grays, suppressed = [], [], 0
         for cand in candidates:
@@ -692,7 +711,7 @@ class PermearHeartbeat:
     # User state / ARAS context
     # ------------------------------------------------------------------
 
-    def _build_user_state(self, monitored, db_ctx) -> dict:
+    def _build_user_state(self, monitored, db_ctx, mute_days=0) -> dict:
         priorities = {}
         exposed = []
         for e in monitored.get("entities", []):
@@ -706,6 +725,7 @@ class PermearHeartbeat:
         emit_threshold = compute_dynamic_threshold(
             len(exposed), db_ctx["consolidated_count"],
             self._config.threshold_min, self._config.threshold_max,
+            mute_days,
         )
         return {
             # v9.0.2: restrictions are LEARNED memories (kind='behavior_rule',
@@ -883,6 +903,43 @@ Responda em portugues no campo 'resposta'."""
         Best-effort each (notify.py logs failures, never raises)."""
         await async_send_telegram(self._hass, message)
         await async_set_last_message(self._hass, message)
+
+    def _mute_days(self) -> int:
+        """Calendar days since the last day with a deterministic emission
+        (emit>0), from today's running stats + the append-only history. Feeds
+        the two-way threshold (v9.5.1). Executor only — pure file reads.
+        Gray/cycle deliveries do NOT count as voice here: the relief re-arms
+        the DETERMINISTIC path specifically. No stats history yet (young
+        install) → 0, no relief — maturity keeps the threshold near MIN there
+        anyway. History present but no emission in it → capped at FULL_DAYS
+        (relief saturates at 1.0 regardless)."""
+        today_stats = load_json(
+            self._hass.config.path(ARAS_STATS_RELATIVE_PATH), {}
+        )
+        if today_stats.get("emit", 0) > 0:
+            return 0
+        path = self._hass.config.path(ARAS_STATS_HISTORY_RELATIVE_PATH)
+        last_emit_date = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        day = json.loads(line)
+                    except ValueError:
+                        continue
+                    date = day.get("date")
+                    if date and day.get("emit", 0) > 0:
+                        if last_emit_date is None or date > last_emit_date:
+                            last_emit_date = date
+        except OSError:
+            return 0
+        if last_emit_date is None:
+            return ARAS_RELAX_FULL_DAYS
+        try:
+            last_dt = datetime.strptime(last_emit_date, "%Y-%m-%d")
+        except ValueError:
+            return 0
+        return max((datetime.now() - last_dt).days, 0)
 
     def _log_stats(self, stats: dict) -> None:
         """Accumulate the day's ARAS stats (ports aras_log_stats.py) —

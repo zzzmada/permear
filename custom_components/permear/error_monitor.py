@@ -9,9 +9,9 @@ check (503/UNAVAILABLE/429/RESOURCE_EXHAUSTED + connection resets) →
 SELF/HA classification → direct Telegram card with a "Silenciar 24h" button.
 
 Errors NEVER enter the event buffer or ARAS (rule: errors are not household
-events). Health stays 2 states — archiving feeds sensor.permear_health's
-erros_silenciados_ativos attribute through the same archived_errors.json
-(flock-shared with the shell during coexistence).
+events). Errors never change the health STATE — archiving only feeds
+sensor.permear_health's erros_silenciados_ativos attribute through the same
+archived_errors.json (flock-shared with the shell during coexistence).
 
 Flood guard: max 5 cards per 10-minute rolling window (ports the shell's
 queued/max:5 + 10-min tail delay); excess errors are only logged.
