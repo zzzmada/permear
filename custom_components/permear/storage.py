@@ -36,6 +36,8 @@ from .const import (
     DRY_BOOST_EXCLUDED_DOMAINS,
     NOISE_BINARY_DEVICE_CLASSES,
     EMIT_HISTORY_MAX,
+    ENGAGEMENT_DELTA_MAX,
+    ENGAGEMENT_DELTA_MIN,
     ENGAGEMENT_DOWN_RATE,
     ENGAGEMENT_MIN_ALERTS,
     ENGAGEMENT_UP_RATE,
@@ -44,6 +46,7 @@ from .const import (
     MEMORY_ACTIVE_PROMOTE_MENTIONS,
     MEMORY_ACTIVE_PROMOTE_WINDOW,
     MEMORY_EPHEMERAL_FADE_DAYS,
+    MEMORY_RULE_FADE_DAYS,
     NOCTURNAL_HABIT_MIN_DAYS,
     NOCTURNAL_LOOKBACK_DAYS,
     PRESENCE_RECENT_MINUTES,
@@ -136,6 +139,28 @@ _RESTRICTION_FILLER_TOKENS = frozenset({
     "sala", "quarto", "cozinha", "casa", "banheiro", "corredor", "varanda",
     "escritorio", "esquerda", "direita", "frente", "fundo", "lado", "principal",
 })
+
+
+def _engagement_delta(ent: dict, floor: int, current: int) -> int:
+    """The entity's stored engagement delta, clamped (v9.7).
+
+    Legacy conversion: before v9.7 engagement wrote `priority` absolutely and
+    stamped priority_source='learned'. Those entities carry no delta, so it is
+    derived from what they actually hold — delta = current - floor — which
+    reproduces their present priority exactly. The demotion the engagement
+    learned is preserved; only its permanence is gone, because the delta is now
+    a value the next weekly run can move in either direction.
+    """
+    if "engagement_delta" in ent:
+        raw = ent.get("engagement_delta")
+    elif ent.get("priority_source") == "learned":
+        raw = current - floor
+    else:
+        return 0
+    try:
+        return max(ENGAGEMENT_DELTA_MIN, min(ENGAGEMENT_DELTA_MAX, int(raw)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _norm_token(word: str) -> str:
@@ -980,15 +1005,46 @@ class PermearStorage:
     def _tier_maintenance(self) -> dict:
         """Tier transitions. Fade beats promotion (silence wins over count).
         observation promoted ephemeral→active becomes 'pattern' (v7.9-D);
-        source='interaction' never promotes (rule #42)."""
+        kind='interaction' never promotes (rule #42, narrowed in v9.7).
+
+        v9.7 — rule #42 used to key on source='interaction', which covers TWO
+        kinds: the resident's raw speech ('ola', 'ok.', 'sim' — kind
+        'interaction') and the rules the Sleep extraction distils from it
+        (kind 'behavior_rule'). The rule's target was always the trivial
+        speech; catching the rules too meant a restriction could never leave
+        'ephemeral' and therefore always faded. "Nao notificar sobre TV
+        offline" reached mention_count=3 — the promotion threshold — and faded
+        anyway. Keying on KIND separates them with the discriminator that
+        already exists: speech stays unpromotable, a repeated rule can
+        consolidate. No new declarative path — the rule still only comes from
+        the Sleep extraction.
+
+        A behavior_rule also fades on its own horizon (MEMORY_RULE_FADE_DAYS):
+        an instruction is not an observation. Decay is preserved, not removed.
+        """
         assert self._conn is not None
         now = datetime.now()
         counts = {
             "promoted_active": 0, "promoted_stable": 0,
             "demoted_active": 0, "demoted_ephemeral": 0, "faded": 0,
-            "observation_to_pattern": 0,
+            "observation_to_pattern": 0, "rule_unfaded": 0,
         }
+        rule_floor = (
+            now - timedelta(days=MEMORY_RULE_FADE_DAYS)
+        ).isoformat()
         with self._lock:
+            # Calibration convergence (v9.7, idempotent): a behavior_rule that
+            # was retired by the OLD 7-day observation horizon but is still
+            # inside its own 30-day horizon goes back to ephemeral. This is not
+            # a general un-fade — only the kind whose horizon changed, and only
+            # while its own silence window has not expired. Once it does, the
+            # normal pass below fades it again and it stays faded.
+            counts["rule_unfaded"] = self._conn.execute(
+                "UPDATE memory_items SET tier = 'ephemeral'"
+                " WHERE kind = 'behavior_rule' AND tier = 'faded'"
+                " AND last_seen >= ?",
+                (rule_floor,),
+            ).rowcount
             rows = self._conn.execute(
                 "SELECT * FROM memory_items WHERE tier != 'faded'"
             ).fetchall()
@@ -1000,11 +1056,17 @@ class PermearStorage:
                 mentions = item["mention_count"]
                 new_tier = tier
 
+                is_rule = item["kind"] == "behavior_rule"
+                fade_after = (
+                    MEMORY_RULE_FADE_DAYS if is_rule
+                    else MEMORY_EPHEMERAL_FADE_DAYS
+                )
+
                 if tier == "ephemeral":
-                    if silence >= MEMORY_EPHEMERAL_FADE_DAYS:
+                    if silence >= fade_after:
                         new_tier = "faded"
                         counts["faded"] += 1
-                    elif (item["source"] != "interaction"
+                    elif (item["kind"] != "interaction"
                           and mentions >= MEMORY_ACTIVE_PROMOTE_MENTIONS
                           and age <= MEMORY_ACTIVE_PROMOTE_WINDOW):
                         new_tier = "active"
@@ -1036,17 +1098,39 @@ class PermearStorage:
         return counts
 
     def _update_priority_from_memory(self, binary_device_classes=None) -> list:
-        """Loop tiers→priority with bidirectional decay (v8.8-fix).
+        """Loop tiers→priority: memory sets the FLOOR, engagement modulates it.
 
-        active → priority ≥ 1, stable → priority ≥ 2 (source='memory');
-        entities whose consolidated memory vanished decay 1 level per run.
-        priority_source 'user'/'learned' is never touched (rule #31).
+        floor = 2 (stable) / 1 (active) / 0, granted only to entities that earn
+        the boost (dry state-change domains never do). Final priority =
+        clamp(floor + engagement_delta, 0, 2), and an entity with floor 0 stays
+        at 0 — engagement modulates the consolidation boost, it never invents
+        priority the memory did not earn. Recomputed from scratch every run:
+        idempotent, and it rises AND decays with the tier (rule #5).
+
+        v9.7 — engagement used to write `priority` absolutely and stamp
+        priority_source='learned', which this loop skipped forever (the
+        hierarchy user > learned > memory was written for HUMAN curation).
+        Since engagement is the only writer of 'learned', a single low-reaction
+        week sealed an entity at 0 with no way back: recovery needs
+        ENGAGEMENT_MIN_ALERTS, which a silenced entity cannot accumulate. The
+        three entities with stable memory (door, window, TV) sat at 0, so no
+        entity in the house reached SPIKE_MIN_PRIORITY and the orienting reflex
+        was arithmetically impossible (09/08 check). Only priority_source='user'
+        — the resident's own hand — is untouchable now; 'learned' is read as
+        legacy engagement and converted to a delta that preserves the entity's
+        current priority exactly (no behaviour jump on the first run).
         """
         assert self._conn is not None
         with self._lock:
+            # behavior_rule is EXCLUDED: its canonical key is
+            # 'restriction:<entity_id>', so a consolidated restriction would
+            # RAISE the priority of the very entity the resident asked to hear
+            # less about. Inert before v9.7 (a rule could never reach
+            # active/stable); live the moment rule #42 stopped blocking it.
             rows = self._conn.execute(
                 "SELECT key, tier FROM memory_items"
                 " WHERE tier IN ('active','stable') AND key IS NOT NULL"
+                " AND kind != 'behavior_rule'"
             ).fetchall()
             # RODADA B: a light is "rich" (dimmer) only if it EVER recorded a
             # brightness — a single consolidated row reflects just the last
@@ -1092,44 +1176,46 @@ class PermearStorage:
         changes = []
         path = self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH)
         with locked_json_update(path, {"entities": []}) as data:
-            entities = data.get("entities", [])
-            for ent in entities:  # pass 1 — promote consolidated entities
+            for ent in data.get("entities", []):
                 eid = ent.get("entity_id")
-                if eid not in entity_map or not ent.get("monitor", False):
+                if not eid or not ent.get("monitor", False):
                     continue
-                if ent.get("priority_source", "") in ("user", "learned"):
+                # The resident's own hand. Never recomputed (rule #5).
+                if ent.get("priority_source", "") == "user":
                     continue
-                if not _earns_memory_boost(eid):
-                    # Dry binary-state: never grant the boost, and strip any
-                    # stale memory boost from an entity that earned it before
-                    # this rule (converges to neutral, idempotent).
-                    if (ent.get("priority_source") == "memory"
-                            and int(ent.get("priority", 0)) > 0):
-                        current = int(ent.get("priority", 0))
-                        changes.append({"entity": eid, "from": current,
-                                        "to": 0, "tier": "dry-noboost"})
-                        ent["priority"] = 0
-                        ent.pop("priority_source", None)
-                    continue
-                target = 2 if entity_map[eid] == "stable" else 1
+
+                tier = entity_map.get(eid)
+                floor = 0
+                if tier and _earns_memory_boost(eid):
+                    floor = 2 if tier == "stable" else 1
+
                 current = int(ent.get("priority", 0))
-                if target > current:
-                    changes.append({"entity": eid, "from": current,
-                                    "to": target, "tier": entity_map[eid]})
-                    ent["priority"] = target
-                    ent["priority_source"] = "memory"
-            for ent in entities:  # pass 2 — decay entities no longer consolidated
-                eid = ent.get("entity_id")
-                if eid in entity_map or not ent.get("monitor", False):
-                    continue
-                if ent.get("priority_source", "") != "memory":
-                    continue
-                current = int(ent.get("priority", 0))
-                if current <= 0:
-                    continue
-                changes.append({"entity": eid, "from": current,
-                                "to": current - 1, "tier": "decayed"})
-                ent["priority"] = current - 1
+                delta = _engagement_delta(ent, floor, current)
+                # floor 0 → priority 0: engagement modulates the consolidation
+                # boost, it never originates priority on its own.
+                target = 0 if floor <= 0 else max(0, min(2, floor + delta))
+
+                if delta:
+                    source = "engagement"
+                elif target > 0:
+                    source = "memory"
+                else:
+                    source = None
+
+                if target != current or ent.get("priority_source") != source:
+                    changes.append({
+                        "entity": eid, "from": current, "to": target,
+                        "tier": tier or "none", "floor": floor, "delta": delta,
+                    })
+                ent["priority"] = target
+                if source:
+                    ent["priority_source"] = source
+                else:
+                    ent.pop("priority_source", None)
+                if delta:
+                    ent["engagement_delta"] = delta
+                else:
+                    ent.pop("engagement_delta", None)
         return changes
 
     # ------------------------------------------------------------------
@@ -1176,17 +1262,31 @@ class PermearStorage:
                 if alerts < ENGAGEMENT_MIN_ALERTS:
                     continue
                 rate = reacted / alerts
-                cur = int(e.get("priority", 0))
+                # v9.7 — move the DELTA, never `priority` itself. The effective
+                # priority is recomputed by _update_priority_from_memory as
+                # clamp(memory_floor + delta), so a demotion can always be
+                # walked back by a later week of reactions. Writing priority
+                # absolutely (with priority_source='learned') is what sealed
+                # entities at 0 and made the orienting reflex unreachable.
+                if "engagement_delta" not in e:
+                    if e.get("priority_source") == "learned":
+                        # Legacy stamp, delta not materialised yet. Deriving it
+                        # here would need the memory floor, which only the
+                        # nightly loop knows. Skip one run; it converges tonight.
+                        continue
+                    cur = 0
+                else:
+                    cur = _engagement_delta(e, 0, 0)
                 new = cur
-                if rate >= ENGAGEMENT_UP_RATE and cur < 2:
-                    new = cur + 1
-                elif rate <= ENGAGEMENT_DOWN_RATE and cur > 0:
-                    new = cur - 1
+                if rate >= ENGAGEMENT_UP_RATE:
+                    new = min(cur + 1, ENGAGEMENT_DELTA_MAX)
+                elif rate <= ENGAGEMENT_DOWN_RATE:
+                    new = max(cur - 1, ENGAGEMENT_DELTA_MIN)
                 if new != cur:
-                    e["priority"] = new
-                    e["priority_source"] = "learned"
-                    changes.append({"entity": eid, "from": cur, "to": new,
-                                    "rate": round(rate, 2), "alerts": alerts})
+                    e["engagement_delta"] = new
+                    changes.append({"entity": eid, "delta_from": cur,
+                                    "delta_to": new, "rate": round(rate, 2),
+                                    "alerts": alerts})
         return changes
 
     # ------------------------------------------------------------------

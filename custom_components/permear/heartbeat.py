@@ -30,6 +30,8 @@ import asyncio
 import json
 import logging
 import random
+import re
+import unicodedata
 from datetime import datetime, timedelta
 
 from homeassistant.core import HomeAssistant, callback
@@ -85,23 +87,46 @@ GRAY_STRUCTURE = {
 # delivered to Telegram as if it were an alert). Deterministic net: a SHORT
 # reply that only states "nothing to report" is silence. The length cap keeps
 # a real multi-event message safe even if it contained one of the phrases.
+# v9.7 — every comparison runs on the ACCENT-STRIPPED text. The provider
+# answered the correctly spelled PT word "silêncio" (2026-08-07 16:33) and it
+# reached Telegram, because 'silêncio'.upper() == 'SILÊNCIO' and the plain
+# substring "SILENCIO" is not in it. The resident asked why the system had
+# said "silêncio" and the agent could not explain its own message. PT is the
+# user-facing language: assume the sentinel comes back accented.
 _SILENCE_PARAPHRASES = (
     "nenhum evento", "nenhum dos eventos", "nada merece",
-    "nao merece aviso", "não merece aviso", "nada a avisar", "nenhum aviso",
+    "nao merece aviso", "nada a avisar", "nenhum aviso",
 )
 _SILENCE_MAX_LEN = 80
+# Accent-stripped, word-bounded. Matches "SILENCIO"/"silêncio" as the sentinel
+# without matching "silencioso" inside a legitimate sentence.
+_SILENCE_SENTINEL = re.compile(r"\bsilencio\b")
+
+
+def _strip_accents(text: str) -> str:
+    """Lowercase, accent-free copy for matching only (never for delivery)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(c) != "Mn"
+    )
 
 
 def is_silence(resposta: str | None) -> bool:
     """True when the gray-zone reply means 'emit nothing' — the sentinel or a
-    short PT paraphrase of it. Deliveries must never carry these to Telegram."""
-    if not resposta or len(resposta) <= 2:
+    short PT paraphrase of it. Deliveries must never carry these to Telegram.
+
+    Matching is on a WORD boundary, never a bare substring: "o ventilador
+    silencioso da sala" contains "silencio" and is a real message. Swallowing a
+    true alert is the worse failure of the two, so the sentinel only counts as
+    the whole reply or as a word inside a short one.
+    """
+    if not resposta or len(resposta.strip()) <= 2:
         return True
-    if "SILENCIO" in resposta.upper():
+    flat = _strip_accents(resposta)
+    if _SILENCE_SENTINEL.search(flat):
         return True
-    low = resposta.lower()
     return len(resposta) <= _SILENCE_MAX_LEN and any(
-        p in low for p in _SILENCE_PARAPHRASES
+        p in flat for p in _SILENCE_PARAPHRASES
     )
 
 
