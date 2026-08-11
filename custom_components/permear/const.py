@@ -116,7 +116,7 @@ CAPTURE_DOMAINS = frozenset({
 # dry switch (novelty 2 + 1 = threshold 3) to claim emission on its own. light
 # is conditional: a dimmer (brightness ever recorded) is informative and KEEPS
 # the boost; a relay light (never any brightness) is dry. Rich domains
-# (climate/cover/media_player) and user/learned priority are never affected.
+# (climate/cover/media_player) and priority_source='user' are never affected.
 DRY_BOOST_EXCLUDED_DOMAINS = frozenset({"switch"})
 
 # RODADA C: binary_sensor is heterogeneous. Noise classes (occupancy/motion/
@@ -273,12 +273,28 @@ MEMORY_STABLE_PROMOTE_MENTIONS = 10   # mentions for active -> stable
 MEMORY_STABLE_PROMOTE_WINDOW = 90     # window (days)
 MEMORY_ACTIVE_DEMOTE_DAYS = 30        # active without mention -> ephemeral
 MEMORY_STABLE_DEMOTE_DAYS = 90        # stable without mention -> active
+# v9.7 — a behavior_rule is an INSTRUCTION, not an observation, and decays on
+# its own horizon. The 7-day ephemeral fade is calibrated for "a light went on
+# once"; applied to a restriction it retired every rule the resident stated
+# (09/08 check: 6 of 7 faded, the only live one was the word "irrelevante",
+# and the plant-battery alert returned 9 days after he asked for silence).
+# Decay is kept — 30 days of silence still retires a rule — only the horizon
+# matches the kind. Aligned with MEMORY_ACTIVE_DEMOTE_DAYS on purpose.
+MEMORY_RULE_FADE_DAYS = 30            # behavior_rule without mention -> fade
 
 # Engagement-based priority learning (weekly, Systems Consolidation).
 ENGAGEMENT_MIN_ALERTS = 4       # minimum alerts to have confidence
 ENGAGEMENT_UP_RATE = 0.66       # reaction rate >= raises priority
 ENGAGEMENT_DOWN_RATE = 0.33     # reaction rate <= lowers priority
 EMIT_HISTORY_MAX = 30           # emission/reaction timestamps kept per item
+# v9.7 — engagement is MACHINE learning and no longer writes priority
+# absolutely; it carries a bounded delta applied on top of the memory floor
+# (see storage._update_priority_from_memory). Absolute writes let a demotion
+# stamp priority_source='learned', which the memory loop skips forever — the
+# entity was sealed at 0 and the orienting reflex became unreachable
+# (09/08 check: 0 entities at priority>=2 against SPIKE_MIN_PRIORITY=2).
+ENGAGEMENT_DELTA_MIN = -2       # engagement can cancel a full stable boost
+ENGAGEMENT_DELTA_MAX = 1        # but never invent priority memory didn't earn
 
 # Co-occurrence detection (v8.6 contract — deterministic, no LLM).
 COOCCURRENCE_WINDOW_SECONDS = 120

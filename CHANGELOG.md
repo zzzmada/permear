@@ -6,6 +6,18 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.7.0] — August 2026
+
+Your instructions stay, and attention can be earned back. Two weeks of production data showed that neither was true: every restriction the resident had ever given was expired, and an entity demoted once could never recover.
+
+### Fixed
+
+- **Restrictions no longer expire while you keep meaning them.** A rule you state in conversation was being aged out on the same seven-day clock as a passing observation — so "stop telling me about X" quietly stopped applying about a week later, no matter how often you repeated it. Rules extracted from your speech now consolidate like any other repeated memory and keep their own thirty-day horizon. An instruction is not an observation.
+- **A demoted entity can regain attention.** Engagement learning could lower an entity's priority and stamp it as permanent, which then blocked memory from ever raising it again — and recovery through engagement required alerts that a zero-priority entity would never receive. Engagement now carries a bounded adjustment on top of what memory has earned, so it can lower attention and give it back. Priorities you set by hand remain untouchable.
+- **A silence sentinel no longer reaches you.** When the language pass concluded there was nothing to report, an accented spelling of the sentinel word escaped detection and was delivered as if it were an alert. Detection is now accent-insensitive and matches whole words only, so a genuine message that merely mentions silence is never swallowed.
+
+---
+
 ## [9.6.0] — July 2026
 
 The filter breathes. A month of production telemetry showed the system habituating all the way into muteness — and repeating itself on the one channel habituation never reached. This release makes both directions work.
