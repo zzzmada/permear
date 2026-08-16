@@ -6,6 +6,15 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.7.1] — August 2026
+
+### Fixed
+
+- **The weekly summary is delivered again.** After the 9.7.0 change to how engagement adjusts attention, the weekly cycle still did all its work — new suggestions, pending items, and attention adjustments were all saved — but then failed while writing the summary text, so the message never reached you. The wording now matches the new model, and a formatting failure can no longer discard a whole week's summary: if the text cannot be composed, the raw result is sent instead.
+- **Clearer wording for engagement adjustments.** The weekly summary described these as priority changes; they are an adjustment layered on top of what memory has earned, and now read that way.
+
+---
+
 ## [9.7.0] — August 2026
 
 Your instructions stay, and attention can be earned back. Two weeks of production data showed that neither was true: every restriction the resident had ever given was expired, and an entity demoted once could never recover.
