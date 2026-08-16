@@ -170,7 +170,17 @@ class PermearSystems:
                             "writing nothing; deterministic part continues")
 
         applied = await self._compile(data or {})
-        summary = self._format_summary(applied, len(agent_autos))
+        # _compile has ALREADY persisted (insights in the DB, engagement deltas
+        # in monitored_entities.json). A failure while merely WORDING the report
+        # must never swallow the week's work: on 2026-08-16 a KeyError in the
+        # summary killed the cycle after everything was written, and the
+        # resident got no weekly message at all (v9.7.1).
+        try:
+            summary = self._format_summary(applied, len(agent_autos))
+        except Exception:  # noqa: BLE001 — formatting is never worth the cycle
+            _LOGGER.exception("Systems summary formatting failed — "
+                              "delivering the raw result instead")
+            summary = f"Resumo da semana (formato degradado): {applied}"
         # v9.2.2 — defer delivery to 08:00 (the weekly cycle still runs now).
         await async_defer_message(self._hass, "systems", summary)
         _LOGGER.info("Systems Consolidation done: %s", applied)
@@ -303,30 +313,41 @@ Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
 
         ns = applied.get("new_suggestions_list", [])
         if ns:
-            sample = ns[0][:80] if ns[0] else ""
+            first = ns[0] or ""
+            sample = first[:80]
+            # the ellipsis marks TRUNCATED TEXT, not "more suggestions" (the
+            # count already says that) — it used to key on len(ns), so a single
+            # long suggestion was cut mid-word with no sign it had been cut.
             lines.append(
-                f"- Sugestoes novas: {len(ns)} ({sample}{'...' if len(ns) > 1 else ''})"
+                f"- Sugestoes novas: {len(ns)} ({sample}{'...' if len(first) > 80 else ''})"
             )
 
         pa, pr = applied.get("pending_added", 0), applied.get("pending_removed", 0)
         if pa or pr:
             lines.append(f"- Pendencias: +{pa} -{pr}")
 
-        prio_changes = applied.get("priority_changes", [])
+        # v9.7 moved engagement from writing `priority` absolutely to moving a
+        # bounded DELTA over the memory floor, and renamed the reported keys
+        # from/to → delta_from/delta_to. This reader was not updated and raised
+        # KeyError: 'from' on 2026-08-16. The wording follows the rename too: an
+        # engagement adjustment is no longer a priority value, it is the delta
+        # the nightly tiers→priority loop applies on top of the memory floor.
+        prio_changes = applied.get("priority_changes") or []
         if prio_changes:
             lines.append(
-                f"- Prioridades ajustadas por engajamento: {len(prio_changes)}"
+                f"- Atencao ajustada por engajamento: {len(prio_changes)}"
             )
             for c in prio_changes:
-                pct = int(c["rate"] * 100)
+                pct = int((c.get("rate") or 0) * 100)
                 lines.append(
-                    f"  - {c['entity']}: {c['from']}->{c['to']} "
-                    f"(reagiu {pct}%, {c['alerts']} alertas)"
+                    f"  - {c.get('entity', '?')}: ajuste "
+                    f"{c.get('delta_from', 0)}->{c.get('delta_to', 0)} "
+                    f"(reagiu {pct}%, {c.get('alerts', 0)} alertas)"
                 )
         else:
-            lines.append("- Prioridades: nenhum ajuste.")
+            lines.append("- Atencao: nenhum ajuste.")
 
-        if len(lines) == 2 and lines[-1] == "- Prioridades: nenhum ajuste.":
+        if len(lines) == 2 and lines[-1] == "- Atencao: nenhum ajuste.":
             lines.insert(1, "- Nenhuma mudanca relevante esta semana.")
 
         lines.append(f"- Automacoes do agente: {agent_autos_count} ativas")
