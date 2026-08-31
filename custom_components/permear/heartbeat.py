@@ -37,6 +37,7 @@ from datetime import datetime, timedelta
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 
+from .ai_client import AiTaskClient
 from .aras import evaluate_salience
 from .config import PermearConfig
 from .const import (
@@ -66,7 +67,6 @@ from .const import (
     SPIKE_MIN_ANOMALY,
     SPIKE_MIN_PRIORITY,
 )
-from .llm import AiTaskClient
 from .notify import async_send_telegram, async_set_last_message
 from .storage import PermearStorage, load_json, locked_json_update
 
@@ -102,6 +102,24 @@ _SILENCE_MAX_LEN = 80
 # without matching "silencioso" inside a legitimate sentence.
 _SILENCE_SENTINEL = re.compile(r"\bsilencio\b")
 
+# v9.7.2 — markers of a reply that talks about the DELIVERY DECISION instead of
+# the house. Two are required (see silence_kind), so no single phrase can
+# swallow a real alert. Accent-free, matched at any length.
+_NON_MESSAGE_MARKERS = (
+    # the act of notifying
+    "nao e necessario avisar", "nao ha necessidade de avisar",
+    "nao e preciso avisar", "nao e necessario notificar",
+    "nao requer aviso", "nao justifica aviso",
+    # the act of acting
+    "nenhuma acao e necessaria", "nenhuma acao necessaria", "nao requer acao",
+    # nothing to report
+    "nada a relatar", "nada a reportar", "nada digno de nota",
+    "nada relevante", "sem novidade",
+    # frame break: PERMEAR speaks TO the resident, never ABOUT him
+    "o morador", "ao morador", "do morador", "o residente", "ao residente",
+)
+_NON_MESSAGE_MIN_MARKERS = 2
+
 
 def _strip_accents(text: str) -> str:
     """Lowercase, accent-free copy for matching only (never for delivery)."""
@@ -111,23 +129,46 @@ def _strip_accents(text: str) -> str:
     )
 
 
-def is_silence(resposta: str | None) -> bool:
-    """True when the gray-zone reply means 'emit nothing' — the sentinel or a
-    short PT paraphrase of it. Deliveries must never carry these to Telegram.
+def silence_kind(resposta: str | None) -> str | None:
+    """Why this gray-zone reply means 'emit nothing', or None to deliver it.
 
     Matching is on a WORD boundary, never a bare substring: "o ventilador
     silencioso da sala" contains "silencio" and is a real message. Swallowing a
     true alert is the worse failure of the two, so the sentinel only counts as
     the whole reply or as a word inside a short one.
+
+    v9.7.2 — 'prose'. On 24/08 the provider delivered "A janela da sala ja esta
+    fechada, entao nao e necessario avisar o morador agora. Nenhuma acao e
+    necessaria." — 108 chars (over _SILENCE_MAX_LEN) and none of the six
+    paraphrases, so it went to Telegram as an alert about nothing. It is not a
+    sentinel leak: the model simply said nothing in prose.
+
+    The prose branch is length-free, so it is deliberately made to cost TWO
+    independent markers. Every marker names the ACT of notifying ("nao e
+    necessario avisar") or breaks frame by discussing the resident in the third
+    person ("o morador") — things a real alert, which speaks TO him about the
+    house, never does. One marker alone delivers: "A porta esta aberta. Nenhuma
+    acao e necessaria." is a true alert with a reassuring tail and must survive.
+    Validated against the 11 real cycle deliveries of 23-30/08 (only the leak
+    suppressed) and the 17 real briefings/chat replies of the same days (none).
     """
     if not resposta or len(resposta.strip()) <= 2:
-        return True
+        return "empty"
     flat = _strip_accents(resposta)
     if _SILENCE_SENTINEL.search(flat):
-        return True
-    return len(resposta) <= _SILENCE_MAX_LEN and any(
+        return "sentinel"
+    if len(resposta) <= _SILENCE_MAX_LEN and any(
         p in flat for p in _SILENCE_PARAPHRASES
-    )
+    ):
+        return "paraphrase"
+    if sum(1 for m in _NON_MESSAGE_MARKERS if m in flat) >= _NON_MESSAGE_MIN_MARKERS:
+        return "prose"
+    return None
+
+
+def is_silence(resposta: str | None) -> bool:
+    """True when the gray-zone reply means 'emit nothing'. Pure, testable."""
+    return silence_kind(resposta) is not None
 
 
 def is_spike(decision: str, scores: dict) -> bool:
@@ -354,6 +395,7 @@ class PermearHeartbeat:
         user_state = self._build_user_state(monitored, db_ctx, mute_days)
 
         emits, grays, suppressed = [], [], 0
+        non_messages = 0
         for cand in candidates:
             result = evaluate_salience(cand, user_state)
             if result["decision"] == "emit":
@@ -386,7 +428,18 @@ class PermearHeartbeat:
                 grays, states, db_ctx.get("presence_recent", False)
             )
             resposta = await self._gray_zone_llm(prompt)
-            if not is_silence(resposta):
+            kind = silence_kind(resposta)
+            if kind in ("paraphrase", "prose"):
+                # A suppression that is not the bare sentinel is a JUDGEMENT,
+                # and a judgement that widens silently is how a real alert
+                # disappears without anyone noticing. Log the full text and
+                # count it (sensor attribute 'nao_mensagens_hoje') so the cost
+                # of this branch stays measurable in production.
+                non_messages += 1
+                _LOGGER.info(
+                    "Gray reply suppressed as a non-message (%s): %r", kind, resposta
+                )
+            if kind is None:
                 await self._deliver(resposta)
                 # Record the batch under each candidate's OWN key and dry
                 # content — deterministic, never parsed from the LLM text.
@@ -406,6 +459,9 @@ class PermearHeartbeat:
             "suppress": suppressed,
             "spike": spikes,
             "llm_calls": llm_called,
+            # v9.7.2 — observability only. Never read by _mute_days or by
+            # compute_dynamic_threshold; it cannot move emission or the relief.
+            "non_messages": non_messages,
             "emit_threshold": user_state["emit_threshold"],
         }
         await self._hass.async_add_executor_job(self._log_stats, stats)
@@ -980,10 +1036,12 @@ Responda em portugues no campo 'resposta'."""
                     rolled = dict(s)
                 s.clear()
                 s.update({"data": today, "total": 0, "emit": 0, "gray": 0,
-                          "suppress": 0, "spike": 0, "llm_calls": 0})
+                          "suppress": 0, "spike": 0, "llm_calls": 0,
+                          "non_messages": 0})
             # .get(k, 0): the file is external/editable — a missing key must
             # not abort the end of a cycle whose emissions already went out
-            for k in ("total", "emit", "gray", "suppress", "spike", "llm_calls"):
+            for k in ("total", "emit", "gray", "suppress", "spike",
+                      "llm_calls", "non_messages"):
                 s[k] = s.get(k, 0) + stats[k]
             s["emit_threshold"] = stats["emit_threshold"]  # last seen, not summed
         if rolled:
@@ -1002,6 +1060,7 @@ Responda em portugues no campo 'resposta'."""
             "gray": day_stats.get("gray", 0),
             "suppress": day_stats.get("suppress", 0),
             "spike": day_stats.get("spike", 0),
+            "non_messages": day_stats.get("non_messages", 0),
             "emit_threshold": day_stats.get("emit_threshold"),
         }, ensure_ascii=False)
         try:

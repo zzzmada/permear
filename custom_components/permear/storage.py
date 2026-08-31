@@ -36,11 +36,11 @@ from .const import (
     DRY_BOOST_EXCLUDED_DOMAINS,
     NOISE_BINARY_DEVICE_CLASSES,
     EMIT_HISTORY_MAX,
+    ENGAGEMENT_DELTA_DECAY_DAYS,
     ENGAGEMENT_DELTA_MAX,
     ENGAGEMENT_DELTA_MIN,
-    ENGAGEMENT_DOWN_RATE,
+    ENGAGEMENT_EVIDENCE_DAYS,
     ENGAGEMENT_MIN_ALERTS,
-    ENGAGEMENT_UP_RATE,
     EVENT_LOG_RETENTION_DAYS,
     MEMORY_ACTIVE_DEMOTE_DAYS,
     MEMORY_ACTIVE_PROMOTE_MENTIONS,
@@ -55,6 +55,9 @@ from .const import (
     MEMORY_STABLE_PROMOTE_MENTIONS,
     MEMORY_STABLE_PROMOTE_WINDOW,
     MONITORED_ENTITIES_RELATIVE_PATH,
+    RESTRICTION_SCOPE_EVENTS,
+    RESTRICTION_SCOPE_SUGGESTION,
+    RESTRICTION_SUGGESTION_MIN_TOKENS,
 )
 
 if TYPE_CHECKING:
@@ -139,6 +142,33 @@ _RESTRICTION_FILLER_TOKENS = frozenset({
     "sala", "quarto", "cozinha", "casa", "banheiro", "corredor", "varanda",
     "escritorio", "esquerda", "direita", "frente", "fundo", "lado", "principal",
 })
+
+# v9.7.2 — words that carry the ACT of refusing rather than its SUBJECT. They
+# appear in nearly every restriction the extraction writes ("morador considera
+# inutil a sugestao de..."), so counting them as overlap would make any two
+# refusals look like they talk about the same thing. Dropped before comparing a
+# refusal to a Systems insight.
+_RESTRICTION_ACT_TOKENS = frozenset({
+    "morador", "residente", "usuario", "avisar", "notificar", "aviso",
+    "notificacao", "informacao", "mensagem", "alerta", "desnecessaria",
+    "desnecessario", "irrelevante", "inutil", "ignorar", "esquecer", "esqueca",
+    "considera", "considerou", "disse", "pediu", "quer", "sobre", "para",
+    "como", "isso", "esse", "essa", "aquele", "aquela", "seja", "sejam",
+    "nao", "sim", "que", "com", "sem", "dos", "das", "uma",
+})
+
+
+def _subject_tokens(text: str) -> set:
+    """Significant SUBJECT tokens of a phrase — what it is about, not what it
+    does with it. Reuses _norm_token (accent-free, crude singular) and drops
+    both the place fillers and the refusal verbs, so "Cena para o quarto de
+    visitas e desnecessaria, ignorar" reduces to {cena, visita}."""
+    return {
+        tok for tok in (_norm_token(w) for w in re.findall(r"\w+", text))
+        if len(tok) >= 4
+        and tok not in _RESTRICTION_FILLER_TOKENS
+        and tok not in _RESTRICTION_ACT_TOKENS
+    }
 
 
 def _engagement_delta(ent: dict, floor: int, current: int) -> int:
@@ -500,6 +530,16 @@ class PermearStorage:
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
             if not meta.get("restriction"):
                 continue
+            # v9.7.2 — a refusal aimed at a Systems SUGGESTION never enters the
+            # salience path. It is answered where it was aimed (the insight is
+            # marked rejected); letting it also reach _user_match made the
+            # word match fire on every event of the room the suggestion named
+            # (-2 on 38 guest-room events from 27/08, a room the resident had
+            # said nothing about). Keyless EVENT restrictions keep matching by
+            # word exactly as before — restrictions are born from speech and
+            # that path is the thesis, not the bug.
+            if meta.get("scope") == RESTRICTION_SCOPE_SUGGESTION:
+                continue
             entity_id = meta.get("entity_id")
             if not entity_id and r["key"] and ":" in r["key"]:
                 entity_id = r["key"].split(":", 1)[1]
@@ -754,6 +794,123 @@ class PermearStorage:
         """System insights from memory_items source='systems' (v8.7 contract)."""
         return await self._hass.async_add_executor_job(self._system_insights)
 
+    # ------------------------------------------------------------------
+    # v9.7.2 — restriction scope. A refusal aimed at something the SYSTEM
+    # said (a Systems suggestion) is not a restriction on what the HOUSE
+    # does, and the two must not share consequences.
+    # ------------------------------------------------------------------
+
+    async def async_add_restriction(
+        self, content: str, entity_id: str | None
+    ) -> dict:
+        """Persist one restriction intent, scoped. Returns what was decided."""
+        return await self._hass.async_add_executor_job(
+            self._add_restriction, content, entity_id
+        )
+
+    def _add_restriction(self, content: str, entity_id: str | None) -> dict:
+        scope, insight_id = self._classify_restriction(content, entity_id)
+        metadata = {"restriction": True, "scope": scope}
+        if entity_id:
+            metadata["entity_id"] = entity_id
+        if insight_id is not None:
+            metadata["insight_id"] = insight_id
+        item_id, was_new, _via = self._add_or_reinforce(
+            content, kind="behavior_rule", source="interaction",
+            key=f"restriction:{entity_id}" if entity_id else None,
+            metadata=metadata,
+        )
+        # Reinforce keeps the ORIGINAL metadata (it only bumps mention_count /
+        # last_seen), so a re-stated refusal would otherwise never acquire its
+        # scope. Patch it explicitly — idempotent.
+        if not was_new:
+            patch = {"scope": scope}
+            if insight_id is not None:
+                patch["insight_id"] = insight_id
+            self._update_metadata(item_id, patch)
+        if insight_id is not None:
+            # Reject the exact row the resident refused. This is strictly
+            # better than the token guessing in _system_insights: we know
+            # WHICH insight it was, so a keyless refusal now works where
+            # before only an entity-anchored one did.
+            self._update_metadata(insight_id, {"rejected": True})
+            _LOGGER.info(
+                "Restriction %s refuses Systems insight %s — insight rejected, "
+                "rule kept out of the ARAS salience path", item_id, insight_id,
+            )
+        return {"id": item_id, "scope": scope, "insight_id": insight_id}
+
+    def _classify_restriction(
+        self, content: str, entity_id: str | None
+    ) -> tuple:
+        """(scope, insight_id) for one refusal — deterministic, no LLM.
+
+        An entity-anchored refusal is ALWAYS about events: the Sleep extraction
+        only tags [entity:...] when the speech maps to exactly one entity of
+        today's events, which is precisely the evidence that it is about that
+        entity's behaviour. Only a KEYLESS refusal is eligible to be read as a
+        suggestion refusal, and only when its subject tokens overlap a real
+        Systems insight by RESTRICTION_SUGGESTION_MIN_TOKENS. Under-classifying
+        is the safe direction: it leaves the rule where it is today.
+
+        Matches against ALL source='systems' rows, faded included — the
+        resident refuses a suggestion he read that morning, and tier decay may
+        already have retired the row by the time the night cycle runs.
+        """
+        if entity_id:
+            return RESTRICTION_SCOPE_EVENTS, None
+        wanted = _subject_tokens(content)
+        if len(wanted) < RESTRICTION_SUGGESTION_MIN_TOKENS:
+            return RESTRICTION_SCOPE_EVENTS, None
+        # half the refusal's own subject, never fewer than the floor: a long
+        # refusal must not qualify on two incidental words
+        need = max(RESTRICTION_SUGGESTION_MIN_TOKENS, (len(wanted) + 1) // 2)
+        assert self._conn is not None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content FROM memory_items WHERE source = 'systems'"
+            ).fetchall()
+        best_id, best_n = None, 0
+        for r in rows:
+            n = len(wanted & _subject_tokens(r["content"]))
+            if n >= need and n > best_n:
+                best_id, best_n = r["id"], n
+        if best_id is None:
+            return RESTRICTION_SCOPE_EVENTS, None
+        return RESTRICTION_SCOPE_SUGGESTION, best_id
+
+    def _converge_restriction_scopes(self) -> int:
+        """One-off convergence (idempotent): stamp scope on behavior_rules
+        written before v9.7.2. A row that already carries a scope is skipped
+        forever, so this retires itself. Faded rows are stamped too — they are
+        stamped correctly for the day a mention resurrects them."""
+        assert self._conn is not None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content, key, metadata FROM memory_items"
+                " WHERE kind = 'behavior_rule'"
+            ).fetchall()
+        stamped = 0
+        for r in rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if not meta.get("restriction") or meta.get("scope"):
+                continue
+            entity_id = meta.get("entity_id")
+            if not entity_id and r["key"] and r["key"].startswith("restriction:"):
+                entity_id = r["key"].split(":", 1)[1]
+            scope, insight_id = self._classify_restriction(r["content"], entity_id)
+            patch = {"scope": scope}
+            if insight_id is not None:
+                patch["insight_id"] = insight_id
+                self._update_metadata(insight_id, {"rejected": True})
+            self._update_metadata(r["id"], patch)
+            stamped += 1
+            _LOGGER.info(
+                "Restriction %s converged to scope=%s (insight %s)",
+                r["id"], scope, insight_id,
+            )
+        return stamped
+
     def _active_restriction_tokens(self) -> set:
         """Device-noun tokens of ACTIVE (non-faded) restriction behavior_rules.
 
@@ -996,9 +1153,11 @@ class PermearStorage:
         )
 
     def _run_maintenance(self, binary_device_classes: dict | None = None) -> dict:
+        scoped = self._converge_restriction_scopes()
         counts = self._tier_maintenance()
         changes = self._update_priority_from_memory(binary_device_classes or {})
-        report = {"tiers": counts, "priority_changes": changes}
+        report = {"tiers": counts, "priority_changes": changes,
+                  "restrictions_scoped": scoped}
         _LOGGER.info("Memory maintenance: %s", report)
         return report
 
@@ -1229,14 +1388,41 @@ class PermearStorage:
         )
 
     def _adjust_priorities_by_engagement(self) -> list:
-        cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+        """Weekly engagement pass (Systems). Moves the bounded delta the
+        nightly tiers→priority loop applies on top of the memory floor.
+
+        v9.7.2 — the reaction RATE is gone (see const.ENGAGEMENT_EVIDENCE_DAYS
+        for the measurement that retired it). Two forces remain, and they are
+        the same pair the ARAS threshold uses one floor up:
+
+          DOWN  the entity had ENGAGEMENT_MIN_ALERTS chances over
+                ENGAGEMENT_EVIDENCE_DAYS and NOT ONE reaction. Sustained and
+                unambiguous — a weekly rate of 1-in-4 cannot produce it.
+          BACK  no DOWN for ENGAGEMENT_DELTA_DECAY_DAYS → one step toward 0.
+                Nothing else raises the delta: in a component built so the
+                resident need not answer, his silence is not evidence, and a
+                claim with no evidence expires.
+
+        An entity that is genuinely ignored re-earns its DOWN every week and
+        never comes back. One that engaged him even once drifts back a step a
+        month, gets its chance, and is re-pinned the moment it is ignored
+        again — one burst per cycle, then inhibition re-arms.
+
+        Entities that stopped emitting entirely (alerts below the floor) used
+        to be frozen forever, since the old pass only looked at entities with
+        fresh alerts. They now decay like everyone else: no evidence is no
+        evidence, whether the silence is the resident's or the entity's.
+        """
+        cutoff = (
+            datetime.now() - timedelta(days=ENGAGEMENT_EVIDENCE_DAYS)
+        ).isoformat()
         engagement: dict = {}
-        for row in self._emits_for_engagement(days=7):
+        for row in self._emits_for_engagement(days=ENGAGEMENT_EVIDENCE_DAYS):
             meta = json.loads(row["metadata"]) if row.get("metadata") else {}
             # Alerts are counted per EMISSION (metadata.emits), not per row —
-            # reinforcement collapses the week into one row, which kept alerts
-            # below ENGAGEMENT_MIN_ALERTS forever. Rows without history (from
-            # before emits tracking) carry no evidence and are skipped.
+            # reinforcement collapses the window into one row, which kept
+            # alerts below ENGAGEMENT_MIN_ALERTS forever. Rows without history
+            # (from before emits tracking) carry no evidence and are skipped.
             emits = [t for t in (meta.get("emits") or []) if t >= cutoff]
             if not emits:
                 continue
@@ -1244,9 +1430,27 @@ class PermearStorage:
             st = engagement.setdefault(row["key"], {"alerts": 0, "reacted": 0})
             st["alerts"] += len(emits)
             st["reacted"] += min(len(reactions), len(emits))
-        if not engagement:
-            return []
 
+        # How often this house reacts to ANYTHING, over the same window. The
+        # DOWN bar is derived from it instead of being chosen: "zero reactions"
+        # only counts as evidence once the entity had enough chances that at
+        # least one reaction was EXPECTED (alerts x baseline >= 1). At four
+        # alerts and a house baseline near 0.10, silence is the likely outcome
+        # of chance, not a preference — and pinning an entity on that is how a
+        # dimmer (light.example) lost its consolidation boost in simulation. Relative
+        # and self-calibrating, the same idiom as the ARAS maturity ratio: no
+        # hand-tuned count, and it degrades gracefully — a house that reacts to
+        # nothing has a baseline of 0, no DOWN ever fires, and every delta
+        # decays back to the memory floor. That is the honest answer: with no
+        # reactions anywhere, non-reaction says nothing about any one entity.
+        total_alerts = sum(st["alerts"] for st in engagement.values())
+        total_reacted = sum(st["reacted"] for st in engagement.values())
+        baseline = (total_reacted / total_alerts) if total_alerts else 0.0
+
+        now = datetime.now()
+        decay_floor = (
+            now - timedelta(days=ENGAGEMENT_DELTA_DECAY_DAYS)
+        ).isoformat()
         changes = []
         path = self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH)
         with locked_json_update(path, {"entities": []}) as data:
@@ -1259,15 +1463,7 @@ class PermearStorage:
                     if key.endswith(f":{eid}"):
                         alerts += st["alerts"]
                         reacted += st["reacted"]
-                if alerts < ENGAGEMENT_MIN_ALERTS:
-                    continue
-                rate = reacted / alerts
-                # v9.7 — move the DELTA, never `priority` itself. The effective
-                # priority is recomputed by _update_priority_from_memory as
-                # clamp(memory_floor + delta), so a demotion can always be
-                # walked back by a later week of reactions. Writing priority
-                # absolutely (with priority_source='learned') is what sealed
-                # entities at 0 and made the orienting reflex unreachable.
+
                 if "engagement_delta" not in e:
                     if e.get("priority_source") == "learned":
                         # Legacy stamp, delta not materialised yet. Deriving it
@@ -1277,16 +1473,46 @@ class PermearStorage:
                     cur = 0
                 else:
                     cur = _engagement_delta(e, 0, 0)
-                new = cur
-                if rate >= ENGAGEMENT_UP_RATE:
-                    new = min(cur + 1, ENGAGEMENT_DELTA_MAX)
-                elif rate <= ENGAGEMENT_DOWN_RATE:
+
+                ignored = (
+                    reacted == 0
+                    and alerts >= ENGAGEMENT_MIN_ALERTS   # absolute floor
+                    and alerts * baseline >= 1.0          # and a chance missed
+                )
+                new, reason = cur, None
+                if ignored:
                     new = max(cur - 1, ENGAGEMENT_DELTA_MIN)
+                    reason = "ignored"
+                    # The DOWN is re-earned: restart its horizon even when the
+                    # delta is already at the floor, so a permanently ignored
+                    # entity never decays out from under a live demotion.
+                    e["engagement_delta_at"] = now.isoformat()
+                elif cur != 0:
+                    since = e.get("engagement_delta_at")
+                    if not since:
+                        # First sight under v9.7.2 — the age of this delta is
+                        # unknown, so stamp it and decay from here. One cycle
+                        # of warm-up, then it converges (same pattern as the
+                        # v9.7 calibration convergence).
+                        e["engagement_delta_at"] = now.isoformat()
+                    elif since <= decay_floor:
+                        # one step TOWARD 0, from either side
+                        new = cur + 1 if cur < 0 else cur - 1
+                        reason = "decay"
+                        e["engagement_delta_at"] = now.isoformat()
+
                 if new != cur:
-                    e["engagement_delta"] = new
+                    if new:
+                        e["engagement_delta"] = new
+                    else:
+                        # Back to neutral: drop the delta AND its clock, the
+                        # way the nightly loop drops a zero delta. Nothing to
+                        # decay, nothing to remember.
+                        e.pop("engagement_delta", None)
+                        e.pop("engagement_delta_at", None)
                     changes.append({"entity": eid, "delta_from": cur,
-                                    "delta_to": new, "rate": round(rate, 2),
-                                    "alerts": alerts})
+                                    "delta_to": new, "reason": reason,
+                                    "alerts": alerts, "reacted": reacted})
         return changes
 
     # ------------------------------------------------------------------

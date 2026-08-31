@@ -282,11 +282,51 @@ MEMORY_STABLE_DEMOTE_DAYS = 90        # stable without mention -> active
 # matches the kind. Aligned with MEMORY_ACTIVE_DEMOTE_DAYS on purpose.
 MEMORY_RULE_FADE_DAYS = 30            # behavior_rule without mention -> fade
 
+# v9.7.2 — a behavior_rule carries the OBJECT of the refusal in metadata.scope.
+# "Esqueça essa cena" (refusing a Systems SUGGESTION) and "para de avisar da
+# geladeira" (refusing EVENTS of a subject) arrived as the same row, and the
+# consequences were exactly inverted: ARAS matched the suggestion refusal by
+# word against every event of the room it named (-2 on 38 events of the guest
+# room from 27/08), while the Systems reject path — which only reads
+# entity-anchored rules — left the refused suggestion eligible for the
+# briefing. Scope is decided deterministically at extraction: a KEYLESS
+# refusal whose significant tokens overlap a real Systems insight is a
+# suggestion refusal (it names something the system said, not something the
+# house did). Entity-anchored rules are never reclassified — the extraction
+# already resolved them to one entity's events.
+RESTRICTION_SCOPE_EVENTS = "events"          # lowers salience of an entity/subject
+RESTRICTION_SCOPE_SUGGESTION = "suggestion"  # rejects one Systems insight, never ARAS
+RESTRICTION_SUGGESTION_MIN_TOKENS = 2        # overlap needed to call it a suggestion refusal
+
 # Engagement-based priority learning (weekly, Systems Consolidation).
 ENGAGEMENT_MIN_ALERTS = 4       # minimum alerts to have confidence
-ENGAGEMENT_UP_RATE = 0.66       # reaction rate >= raises priority
-ENGAGEMENT_DOWN_RATE = 0.33     # reaction rate <= lowers priority
 EMIT_HISTORY_MAX = 30           # emission/reaction timestamps kept per item
+# v9.7.2 — the reaction RATE thresholds (UP 0.66 / DOWN 0.33) are retired.
+# A "reaction" is the resident sending ANY Telegram message within
+# REACTION_WINDOW_MINUTES, blanket-marked onto every row the cycle touched —
+# so at weekly sample sizes (4-7 alerts, 0-1 reactions) the rate measures
+# which batch he happened to answer, not which entity matters. Measured over
+# the whole production history: the house-wide reaction rate is 0.09-0.17, so
+# rate <= 0.33 fired for EVERY entity EVERY week (30 of 30 weekly evaluations
+# across four rounds) while rate >= 0.66 never fired once. Engagement was not
+# learning; it was a one-way pump that drove every delta to the floor and
+# cancelled the memory boost the rest of the system had earned. Worse, the
+# system was penalising the resident for behaving exactly as it wants him to:
+# in a component whose thesis is that he should not have to answer,
+# non-reaction is the designed norm, not evidence of irrelevance.
+#
+# What replaces it is the only robust signal in the data plus decay — the
+# same shape as the two-way ARAS threshold (v9.5.1), one floor down:
+#   DOWN  = many chances over a long window and NOT ONE reaction (sustained,
+#           unambiguous; noise cannot produce it the way a weekly rate can)
+#   BACK  = the delta decays one step toward 0 on its own horizon whenever a
+#           DOWN was not renewed. No rate ever raises it.
+# An entity that is genuinely ignored keeps re-earning its DOWN every week and
+# never returns; one that engages the resident even once drifts back a step a
+# month, gets its chance, and is re-pinned if it is ignored again. One burst
+# per relaxation cycle, then inhibition re-arms.
+ENGAGEMENT_EVIDENCE_DAYS = 28   # window for "given many chances, never once reacted"
+ENGAGEMENT_DELTA_DECAY_DAYS = 30  # silence horizon: one step back toward 0
 # v9.7 — engagement is MACHINE learning and no longer writes priority
 # absolutely; it carries a bounded delta applied on top of the memory floor
 # (see storage._update_priority_from_memory). Absolute writes let a demotion

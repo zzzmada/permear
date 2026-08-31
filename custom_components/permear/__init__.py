@@ -26,6 +26,7 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.start import async_at_started
 
 from .agent_automations import AgentAutomations
+from .ai_client import AiTaskClient
 from .capture import PermearCapture
 from .config import config_from_entry
 from .const import (
@@ -38,7 +39,6 @@ from .const import (
 )
 from .error_monitor import PermearErrorMonitor
 from .heartbeat import PermearHeartbeat
-from .llm import AiTaskClient
 from .notify import async_drain_pending
 from .sleep import PermearSleep
 from .storage import PermearStorage

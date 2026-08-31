@@ -32,6 +32,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util.yaml import load_yaml
 
+from .ai_client import AiTaskClient
 from .config import PermearConfig, parse_hhmm
 from .const import (
     AGENT_AUTOMATIONS_RELATIVE_PATH,
@@ -40,7 +41,6 @@ from .const import (
 )
 from .correlate import compute_pairs
 from .household import get_residents
-from .llm import AiTaskClient
 from .notify import async_defer_message
 from .storage import PermearStorage
 
@@ -338,11 +338,16 @@ Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
                 f"- Atencao ajustada por engajamento: {len(prio_changes)}"
             )
             for c in prio_changes:
-                pct = int((c.get("rate") or 0) * 100)
+                # v9.7.2 — the rate is gone; the reason is what the reader
+                # needs. "ignorado" = many alerts and not one reaction in the
+                # evidence window; "sem evidencia" = the demotion expired.
+                motivo = ("ignorado" if c.get("reason") == "ignored"
+                          else "sem evidencia")
                 lines.append(
                     f"  - {c.get('entity', '?')}: ajuste "
                     f"{c.get('delta_from', 0)}->{c.get('delta_to', 0)} "
-                    f"(reagiu {pct}%, {c.get('alerts', 0)} alertas)"
+                    f"({motivo}, {c.get('alerts', 0)} alertas, "
+                    f"{c.get('reacted', 0)} reacoes)"
                 )
         else:
             lines.append("- Atencao: nenhum ajuste.")

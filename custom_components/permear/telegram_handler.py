@@ -39,6 +39,7 @@ from .agent_automations import (
     describe_action,
     describe_trigger,
 )
+from .ai_client import AiTaskClient
 from .config import PermearConfig
 from .const import (
     CONVERSATION_RETRY_DELAYS,
@@ -51,7 +52,6 @@ from .const import (
 )
 from .error_monitor import archive_error
 from .household import agent_preamble
-from .llm import AiTaskClient
 from .notify import (
     async_answer_callback,
     async_edit_message,
