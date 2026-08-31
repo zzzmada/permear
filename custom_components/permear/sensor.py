@@ -114,6 +114,10 @@ class PermearAttentionSensor(PermearSensorBase):
             "cinzentos_hoje": stats.get("gray", 0),
             "chamadas_llm_hoje": stats.get("llm_calls", 0),
             "total_avaliado_hoje": total,
+            # v9.7.2 — gray replies discarded as "nothing to say" written in
+            # prose. Surfaced so the widening of that judgement stays visible:
+            # a detector that swallows real alerts would show up here first.
+            "nao_mensagens_hoje": stats.get("non_messages", 0),
             "threshold_emit_atual": stats.get("emit_threshold"),
         }
 

@@ -6,6 +6,17 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.7.2] — August 2026
+
+### Fixed
+
+- **Compatibility with Home Assistant 2026.7.** An internal module shared a name with a Home Assistant platform, so Home Assistant tried to load it as one — producing an error on every conversation. The module was renamed; nothing else changed.
+- **Refusing a suggestion no longer silences a whole room.** When you dismissed a weekly automation suggestion, the refusal was stored as a general restriction: it never marked the suggestion as rejected, so it kept coming back — and meanwhile it suppressed every ordinary event in the room it mentioned. Refusals about suggestions and restrictions about events are now told apart, so each acts where it should.
+- **Ignored entities can regain attention.** The weekly engagement pass could only ever lower an entity's attention, never raise it: its measure of whether you had reacted was so easily met in the negative that it fired for every entity, every week. It now lowers attention only for entities you have had real, repeated chances to react to and did not — measured against how often you respond in your own home — and that adjustment fades on its own if the entity stops being alerted about, so nothing is demoted forever.
+- **Empty conclusions no longer reach you.** When the language pass concludes there is nothing worth reporting, it sometimes says so in a full sentence rather than the expected signal word. Those are now recognised and withheld — narrowly, requiring more than one telltale, so a genuine alert that ends with a reassurance still gets through. Withheld messages are counted and logged.
+
+---
+
 ## [9.7.1] — August 2026
 
 ### Fixed

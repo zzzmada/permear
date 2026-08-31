@@ -29,6 +29,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util.yaml import load_yaml
 
+from .ai_client import AiTaskClient, circuit_health_summary
 from .config import PermearConfig, parse_hhmm
 from .const import (
     AGENT_AUTOMATIONS_RELATIVE_PATH,
@@ -39,7 +40,6 @@ from .const import (
     SLEEP_EXTRACTION_DELAY_SECONDS,
     SLEEP_EXTRACTION_MAX_EVENTS,
 )
-from .llm import AiTaskClient, circuit_health_summary
 from .notify import async_defer_message, async_set_last_message
 from .storage import PermearStorage, load_json
 
@@ -354,6 +354,11 @@ If nothing is relevant, return an empty list."""
         vague subjects stay keyless and merge via the FTS layer. Reinforced
         when repeated; fades by normal tier decay when never mentioned again
         (a forgotten restriction re-emerges — organic, intentional).
+
+        v9.7.2 — the storage decides the OBJECT of the refusal (metadata.scope)
+        and, when it is a Systems suggestion, rejects that exact insight. Not
+        an LLM call: deterministic subject-token overlap against the insights
+        already in the DB. The LLM still only translates speech→intent here.
         """
         if not restricoes:
             return 0
@@ -367,13 +372,7 @@ If nothing is relevant, return an empty list."""
             if not content:
                 continue
             eid = entity_id if entity_id in valid_ids else None
-            metadata = {"restriction": True}
-            if eid:
-                metadata["entity_id"] = eid
-            await self._storage.async_add_or_reinforce(
-                content, kind="behavior_rule", source="interaction",
-                key=f"restriction:{eid}" if eid else None, metadata=metadata,
-            )
+            await self._storage.async_add_restriction(content, eid)
             applied += 1
         return applied
 
