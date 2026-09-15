@@ -19,12 +19,18 @@ CONF_SLEEP_TIME = "sleep_time"
 CONF_SYSTEMS_TIME = "systems_time"
 CONF_AGENT_NAME = "agent_name"
 CONF_VOICE_SCRIPT = "voice_script"
+# v9.8 — DELIVERY of the daily briefing only. The Sleep cycle always runs
+# (extraction, restrictions, tier maintenance, tiers->priority): stopping it
+# would stop the memory that feeds threshold, priority and restrictions.
+CONF_DAILY_BRIEFING_DELIVERY = "daily_briefing_delivery"
 
 DEFAULT_CHAT_ID = ""  # empty → telegram_bot uses the first allowed chat
 # Neutral agent name used when agent_name is left empty — keeps the component
 # brand-agnostic for public release (the agent's name is configurable, never
 # hardcoded).
 DEFAULT_AGENT_NAME = "PERMEAR"
+# On by default: an existing install must not change behavior on upgrade.
+DEFAULT_DAILY_BRIEFING_DELIVERY = True
 
 # Paths relative to the HA config dir (resolve via hass.config.path()).
 # guidelines.json is GONE (v9.0.1) — residents come from the HA person
@@ -367,6 +373,15 @@ SLEEP_EXTRACTION_DELAY_SECONDS = 5
 # Cap on events serialized into the extraction prompt (busy days must not
 # blow the provider context window).
 SLEEP_EXTRACTION_MAX_EVENTS = 100
+# v9.8 — thin-day gate. Below this many DISTINCT entities observed in the day,
+# the briefing is written deterministically ("I saw little") instead of being
+# narrated by the LLM. On 2026-09-05 and 09-06 the whole day carried 6 events
+# from ONE entity (a scheduled switch) and the narrated briefing filled the
+# gap with a consolidated memory, delivering an event that never happened.
+# Deliberately conservative: 2026-09-07, a genuinely degraded day, still had
+# 8 distinct entities and narrates normally. Saying "I saw little" on a quiet
+# day is TRUE, so a false positive here costs nothing; the opposite does.
+SLEEP_THIN_DAY_MIN_ENTITIES = 3
 EVENT_SLEEP_COMPLETE = "permear_sleep_consolidation_complete"
 
 # =============================================================================

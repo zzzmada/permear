@@ -25,6 +25,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     EntitySelector,
     EntitySelectorConfig,
     SelectSelector,
@@ -36,6 +37,7 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_AGENT_NAME,
+    CONF_DAILY_BRIEFING_DELIVERY,
     CONF_CHAT_ID,
     CONF_CONVERSATION,
     CONF_CONVERSATION_FALLBACK,
@@ -48,6 +50,7 @@ from .const import (
     CONF_SLEEP_TIME,
     CONF_SYSTEMS_TIME,
     CONF_VOICE_SCRIPT,
+    DEFAULT_DAILY_BRIEFING_DELIVERY,
     DEFAULT_HEARTBEAT_END,
     DEFAULT_HEARTBEAT_START,
     DEFAULT_SENSITIVITY,
@@ -78,18 +81,30 @@ USER_SCHEMA = vol.Schema(
 )
 
 def _options_schema(resident_options: list[str]) -> vol.Schema:
-    """Options schema — primary_resident is a dropdown of the HA person
-    entities (custom_value allows a free-text resident without a person).
-    RODADA E: the 4 AI providers + Telegram chat_id are reconfigurable here
-    (suggested with the current value); providers stay Required so a blank can
-    never zero them, and config.py also falls back to entry.data defensively."""
+    """Options schema, ordered essential → accessory (v9.8).
+
+    FLAT on purpose. HA `section` would group these visually but nests the
+    keys in entry.options, and config.py reads them FLAT
+    (`merged = {**data, **options}`). On an existing install every non-provider
+    option — sensitivity, resident, schedules, agent_name, voice_script —
+    would silently revert to its default, with no error raised. Flattening on
+    save is possible but the failure mode is silent and lands on the single
+    source of truth, so the grouping is carried by ORDER and by the labels /
+    descriptions in strings.json instead. Option identifiers are unchanged:
+    an installed config keeps working untouched.
+
+    Order: what the house says → who it says it to → when the cycles run →
+    the AI providers (set at install, rarely touched) → optional voice.
+
+    primary_resident is a dropdown of the HA person entities (custom_value
+    allows a free-text resident without a person). RODADA E: the 4 AI
+    providers + Telegram chat_id are reconfigurable here (suggested with the
+    current value); providers stay Required so a blank can never zero them,
+    and config.py also falls back to entry.data defensively.
+    """
     return vol.Schema(
         {
-            **{
-                vol.Required(field): EntitySelector(EntitySelectorConfig(domain=domain))
-                for field, domain in _PROVIDER_FIELDS
-            },
-            vol.Optional(CONF_CHAT_ID, default=""): TextSelector(),
+            # --- attention: the one knob that changes how much reaches you ---
             vol.Required(CONF_SENSITIVITY, default=DEFAULT_SENSITIVITY): SelectSelector(
                 SelectSelectorConfig(
                     options=sorted(SENSITIVITY_MAP),
@@ -97,6 +112,13 @@ def _options_schema(resident_options: list[str]) -> vol.Schema:
                     translation_key="sensitivity",
                 )
             ),
+            # --- what gets delivered, and where ---
+            vol.Required(
+                CONF_DAILY_BRIEFING_DELIVERY,
+                default=DEFAULT_DAILY_BRIEFING_DELIVERY,
+            ): BooleanSelector(),
+            vol.Optional(CONF_CHAT_ID, default=""): TextSelector(),
+            # --- who it is talking to, and as whom ---
             vol.Optional(CONF_PRIMARY_RESIDENT, default=""): SelectSelector(
                 SelectSelectorConfig(
                     options=resident_options,
@@ -104,19 +126,25 @@ def _options_schema(resident_options: list[str]) -> vol.Schema:
                     custom_value=True,
                 )
             ),
+            vol.Optional(CONF_AGENT_NAME, default=""): TextSelector(),
+            # --- when the cycles run ---
             vol.Required(CONF_HEARTBEAT_START, default=DEFAULT_HEARTBEAT_START): TimeSelector(),
             vol.Required(CONF_HEARTBEAT_END, default=DEFAULT_HEARTBEAT_END): TimeSelector(),
             vol.Required(CONF_SLEEP_TIME, default=DEFAULT_SLEEP_TIME): TimeSelector(),
             vol.Required(CONF_SYSTEMS_TIME, default=DEFAULT_SYSTEMS_TIME): TimeSelector(),
-            # Brand-agnostic surface (v9.x): empty agent_name → neutral name;
-            # empty voice_script → no voice. Both free text (a service id).
-            vol.Optional(CONF_AGENT_NAME, default=""): TextSelector(),
+            # --- infrastructure: set at install, rarely touched ---
+            **{
+                vol.Required(field): EntitySelector(EntitySelectorConfig(domain=domain))
+                for field, domain in _PROVIDER_FIELDS
+            },
+            # --- optional, off by default ---
             vol.Optional(CONF_VOICE_SCRIPT, default=""): TextSelector(),
         }
     )
 
 DEFAULT_OPTIONS = {
     CONF_SENSITIVITY: DEFAULT_SENSITIVITY,
+    CONF_DAILY_BRIEFING_DELIVERY: DEFAULT_DAILY_BRIEFING_DELIVERY,
     CONF_PRIMARY_RESIDENT: "",
     CONF_HEARTBEAT_START: DEFAULT_HEARTBEAT_START,
     CONF_HEARTBEAT_END: DEFAULT_HEARTBEAT_END,

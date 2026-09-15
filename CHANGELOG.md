@@ -6,6 +6,20 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.8.0] — September 2026
+
+### Added
+
+- **The daily summary is now optional.** The 08:00 message can be turned off in Configure at any time, without reinstalling. The nightly cycle keeps running either way — it is what builds memory, learns your restrictions and tunes the filter; only the message stops. The weekly summary is unaffected. It ships on, so nothing changes unless you turn it off.
+- **A clearer settings screen.** The options are now ordered as a sequence rather than a pile — how much the house tells you, what it sends, who lives there, when it pays attention, which providers it uses, and the optional voice hook. Labels describe the effect instead of the mechanism.
+
+### Fixed
+
+- **The daily summary no longer fills a quiet day with old memories.** On a day when almost nothing was observed, the summary could present a remembered pattern as if it had happened that day — a device described as acting at specific hours that it had not acted at all. On days with too little to report, the summary is now written plainly and says so: how much was actually seen, and that nothing was filled in from other days.
+- **Remembered items now carry their date.** Pending items and suggestions that appear in the summary are shown with when they were first recorded and how often they have recurred, so a months-old observation can no longer read as today's news.
+
+---
+
 ## [9.7.2] — August 2026
 
 ### Fixed

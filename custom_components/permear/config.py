@@ -19,6 +19,7 @@ from homeassistant.config_entries import ConfigEntry
 
 from .const import (
     CONF_AGENT_NAME,
+    CONF_DAILY_BRIEFING_DELIVERY,
     CONF_CHAT_ID,
     CONF_CONVERSATION,
     CONF_CONVERSATION_FALLBACK,
@@ -32,6 +33,7 @@ from .const import (
     CONF_SYSTEMS_TIME,
     CONF_VOICE_SCRIPT,
     DEFAULT_CHAT_ID,
+    DEFAULT_DAILY_BRIEFING_DELIVERY,
     DEFAULT_HEARTBEAT_END,
     DEFAULT_HEARTBEAT_START,
     DEFAULT_SENSITIVITY,
@@ -86,6 +88,9 @@ class PermearConfig:
     # like "script.minha_voz"; empty → PERMEAR stays silent on voice).
     agent_name: str = ""
     voice_script: str = ""
+    # v9.8 — DELIVERY of the daily briefing (the 08:00 drain). The Sleep cycle
+    # runs regardless: turning this off silences a message, never the memory.
+    daily_briefing_delivery: bool = DEFAULT_DAILY_BRIEFING_DELIVERY
 
 
 def config_from_entry(entry: ConfigEntry) -> PermearConfig:
@@ -127,4 +132,8 @@ def config_from_entry(entry: ConfigEntry) -> PermearConfig:
         telegram_chat_id=str(merged.get(CONF_CHAT_ID) or "").strip(),
         agent_name=str(merged.get(CONF_AGENT_NAME) or "").strip(),
         voice_script=str(merged.get(CONF_VOICE_SCRIPT) or "").strip(),
+        daily_briefing_delivery=bool(
+            merged.get(CONF_DAILY_BRIEFING_DELIVERY,
+                       DEFAULT_DAILY_BRIEFING_DELIVERY)
+        ),
     )

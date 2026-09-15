@@ -39,6 +39,7 @@ from .const import (
     MONITORED_ENTITIES_RELATIVE_PATH,
     SLEEP_EXTRACTION_DELAY_SECONDS,
     SLEEP_EXTRACTION_MAX_EVENTS,
+    SLEEP_THIN_DAY_MIN_ENTITIES,
 )
 from .notify import async_defer_message, async_set_last_message
 from .storage import PermearStorage, load_json
@@ -132,39 +133,68 @@ class PermearSleep:
         insights = await self._storage.async_system_insights()
         eventos = daily["eventos"][-10:]
         interacoes = daily["interacoes"]
-        pendencias = [i["content"] for i in insights["pending"]]
-        sugestoes = [i["content"] for i in insights["suggestions"]]
+        # v9.8 — keep the whole insight dict: the prompt DATES it instead of
+        # handing the model a bare past-tense sentence (see _history_lines).
+        pendencias = insights["pending"]
+        sugestoes = insights["suggestions"]
 
         # Empty-day suppression: nothing to synthesize, nothing runs (v8.3)
         if not eventos and not interacoes and not pendencias and not sugestoes:
             _LOGGER.info("Sleep Consolidation suppressed — empty day")
             return {"suppressed": True}
 
-        agent_autos, health_line = await self._hass.async_add_executor_job(
-            self._load_prompt_files
-        )
-        prompt = self._build_briefing_prompt(
-            eventos, len(interacoes), pendencias, sugestoes, agent_autos, health_line
-        )
+        # v9.8 — thin-day gate. The narration path may only describe what the
+        # day actually showed. When the day carries fewer than
+        # SLEEP_THIN_DAY_MIN_ENTITIES distinct entities there is no material to
+        # summarize, and the LLM — asked to "highlight the unusual" with only
+        # historical insights in reach — fills the gap from memory. That is how
+        # 2026-09-05 delivered a TV event that never happened. Here the text is
+        # written deterministically and the LLM is never asked to narrate. The
+        # cycle continues: extraction, restrictions and maintenance still run.
+        all_events = daily["eventos"]
+        observed_entities = {
+            e.get("entity_id") for e in all_events if e.get("entity_id")
+        }
+        thin_day = len(observed_entities) < SLEEP_THIN_DAY_MIN_ENTITIES
 
-        data = await self._llm.async_generate(
-            "Sleep Consolidation", prompt, BRIEFING_STRUCTURE
-        )
-        briefing = str((data or {}).get("briefing") or "").strip()
+        if thin_day:
+            briefing = self._thin_day_briefing(
+                len(all_events), len(observed_entities), len(interacoes)
+            )
+            _LOGGER.info(
+                "Sleep briefing written deterministically — thin day "
+                "(%d events, %d distinct entities, floor %d). Nothing inferred "
+                "from memory.",
+                len(all_events), len(observed_entities),
+                SLEEP_THIN_DAY_MIN_ENTITIES,
+            )
+        else:
+            agent_autos, health_line = await self._hass.async_add_executor_job(
+                self._load_prompt_files
+            )
+            prompt = self._build_briefing_prompt(
+                eventos, len(all_events), len(interacoes), pendencias,
+                sugestoes, agent_autos, health_line,
+            )
+            data = await self._llm.async_generate(
+                "Sleep Consolidation", prompt, BRIEFING_STRUCTURE
+            )
+            briefing = str((data or {}).get("briefing") or "").strip()
 
-        if len(briefing) <= 5:
+        if not thin_day and len(briefing) <= 5:
             # sleep_simple contract: short deterministic PT summary, NO persist
-            fallback = self._simple_briefing(len(daily["eventos"]),
-                                             len(interacoes), pendencias)
+            fallback = self._simple_briefing(
+                len(all_events), len(interacoes),
+                [i["content"] for i in pendencias],
+            )
             # v9.2.2 — defer delivery to 08:00 (the cycle still runs at ~23:30).
-            await async_defer_message(self._hass, "sleep", fallback)
+            await self._deliver(fallback)
             _LOGGER.warning("Sleep briefing failed on both providers — "
                             "simple fallback deferred, nothing persisted")
             return {"suppressed": False, "briefing": False}
 
         # v9.2.2 — persist the briefing for the 08:00 drain instead of sending now.
-        await async_defer_message(self._hass, "sleep", briefing)
-        await async_set_last_message(self._hass, briefing)
+        await self._deliver(briefing)
 
         # Brief pause between the two LLM calls (provider courtesy, as shell)
         await asyncio.sleep(SLEEP_EXTRACTION_DELAY_SECONDS)
@@ -201,6 +231,30 @@ class PermearSleep:
             "maintenance": maintenance,
         }
 
+    async def _deliver(self, briefing: str) -> bool:
+        """v9.8 — deliver the daily briefing, unless the resident turned the
+        DELIVERY off. Returns whether it was queued.
+
+        Gated at the DEFER, never at the 08:00 drain: the pending file is a
+        dict keyed by cycle, so a briefing written every night and dropped
+        every morning would leave a "sleep" entry that is overwritten forever
+        and never drained. Not deferring keeps the file clean.
+
+        The cycle itself is untouched — extraction, restrictions and tier
+        maintenance run either way, because they are what feeds threshold,
+        priority and the restrictions. The WEEKLY summary uses its own key and
+        is unaffected by this option.
+        """
+        if not self._config.daily_briefing_delivery:
+            _LOGGER.info(
+                "Daily briefing generated but not delivered "
+                "(daily_briefing_delivery is off) — cycle continues"
+            )
+            return False
+        await async_defer_message(self._hass, "sleep", briefing)
+        await async_set_last_message(self._hass, briefing)
+        return True
+
     # ------------------------------------------------------------------
     # Prompts (PT — resident-facing briefing content)
     # ------------------------------------------------------------------
@@ -219,8 +273,59 @@ class PermearSleep:
         return agent_autos, circuit_health_summary(self._hass)
 
     @staticmethod
+    def _thin_day_briefing(n_events: int, n_entities: int, n_inter: int) -> str:
+        """v9.8 — deterministic text for a day with almost nothing observed.
+
+        No LLM, no insights, no memory: the one honest thing to say is how
+        little was seen. Saying it plainly is the whole point — the failure
+        this replaces was a confident narration built from consolidated memory
+        on a day the system observed six events from a single entity.
+        """
+        now = datetime.now()
+        head = f"{DAYS_PT[now.weekday()]}, {now.strftime('%d/%m/%Y')}"
+        ent_txt = ("1 entidade monitorada" if n_entities == 1
+                   else f"{n_entities} entidades monitoradas")
+        ev_txt = "1 evento" if n_events == 1 else f"{n_events} eventos"
+        linhas = [
+            f"{head} — dia de pouca observacao.",
+            f"Registrei apenas {ev_txt} em {ent_txt}. "
+            "E' pouco para resumir o dia.",
+        ]
+        if n_inter:
+            linhas.append(f"Interacoes com voce hoje: {n_inter}.")
+        linhas.append(
+            "Nao preenchi com o que sei de outros dias: o que esta acima e' "
+            "o que eu de fato vi."
+        )
+        return "\n".join(linhas)
+
+    @staticmethod
+    def _history_lines(items: list, limit: int = 3) -> str:
+        """v9.8 — render insights WITH their date and reinforcement count.
+
+        The content is an episode-shaped sentence frozen at the epoch start
+        (reinforce never rewrites it — see _reinforce_row_locked). Dating it
+        is what stops the model from reading "entre 19:54 e 21:25" as tonight.
+        """
+        if not items:
+            return "nenhuma"
+        out = []
+        for i in items[:limit]:
+            if isinstance(i, str):  # defensive: legacy plain string
+                out.append(f"- {i}")
+                continue
+            seen = str(i.get("first_seen") or "")[:10]
+            data_br = (f"{seen[8:10]}/{seen[5:7]}" if len(seen) == 10 else "?")
+            n = i.get("mention_count") or 1
+            vezes = "1x" if n == 1 else f"{n}x"
+            out.append(f"- [registrado em {data_br}, reforcado {vezes}] "
+                       f"{i.get('content', '')}")
+        return "\n".join(out)
+
+    @staticmethod
     def _build_briefing_prompt(
-        eventos, n_interacoes, pendencias, sugestoes, agent_autos, health_line
+        eventos, n_eventos_total, n_interacoes, pendencias, sugestoes,
+        agent_autos, health_line
     ) -> str:
         now = datetime.now()
         dia_pt = DAYS_PT[now.weekday()]
@@ -239,8 +344,9 @@ class PermearSleep:
                       for e in eventos)
             if eventos else "nenhum"
         )
-        pendencias_txt = "; ".join(pendencias[:3]) if pendencias else "nenhuma"
-        sugestoes_txt = "; ".join(sugestoes[:3]) if sugestoes else "nenhuma"
+        n_mostrados = len(eventos)
+        pendencias_txt = PermearSleep._history_lines(pendencias)
+        sugestoes_txt = PermearSleep._history_lines(sugestoes)
         health_section = f"\n{health_line}\n" if health_line else ""
 
         return f"""Produza o briefing residencial de {dia_pt}, {data_str}.
@@ -251,17 +357,32 @@ Apenas comportamento real da casa conta.
 
 {autos_txt}
 
-EVENTOS DO DIA (ultimos 10): {eventos_txt}
-INTERACOES HOJE: {n_interacoes} registradas.
-PENDENCIAS: {pendencias_txt}
-SUGESTOES DE AUTOMACAO PENDENTES: {sugestoes_txt}
+O QUE ACONTECEU HOJE (unica fonte para o resumo do dia)
+EVENTOS DE HOJE ({n_eventos_total} no total; os {n_mostrados} mais recentes abaixo):
+{eventos_txt}
+INTERACOES DE HOJE: {n_interacoes} registradas.
+
+MEMORIA DE OUTROS DIAS (NAO aconteceu hoje)
+PENDENCIAS ANTIGAS:
+{pendencias_txt}
+SUGESTOES DE AUTOMACAO ANTIGAS:
+{sugestoes_txt}
 {health_section}
+REGRA ABSOLUTA — leia antes de escrever:
+As linhas sob "MEMORIA DE OUTROS DIAS" sao registros passados, cada uma com a
+data em que foi registrada. Elas NAO sao eventos de hoje. Nunca as narre como
+se tivessem acontecido hoje e nunca reaproveite os horarios que elas citam.
+Se mencionar uma, diga explicitamente que e' de outro dia ("desde o dia X",
+"segue pendente desde"). O resumo do dia sai APENAS de EVENTOS DE HOJE e
+INTERACOES DE HOJE.
+
 INSTRUCOES:
 1. Se ha automacoes do agente listadas, mencione-as brevemente e pergunte se ainda sao uteis.
-2. Resuma o dia em 2-3 topicos. Destaque o incomum.
-3. Mencione pendencias relevantes brevemente.
-4. Se ha sugestoes de automacao pendentes, apresente a mais relevante.
-5. Se nada especial, diga em uma frase e acrescente algo util."""
+2. Resuma o dia em 2-3 topicos, usando somente os eventos de hoje. Destaque o incomum que voce VIU hoje.
+3. Se uma pendencia antiga ainda importa, cite-a como pendencia antiga, datada.
+4. Se ha sugestoes de automacao pendentes, apresente a mais relevante como sugestao, nao como fato.
+5. Se hoje foi um dia sem nada especial, diga isso em uma frase e pare.
+   Nao complete o texto com conteudo de outros dias para deixa-lo mais cheio."""
 
     @staticmethod
     def _build_extraction_prompt(eventos, interacoes) -> str:

@@ -32,36 +32,38 @@
     "step": {
       "init": {
         "title": "PERMEAR options",
-        "description": "Attention and cycle settings. Saving reloads the integration — no restart needed.",
+        "description": "Attention, delivery and cycle settings, in that order — the AI providers sit at the end; you normally never touch them. Saving reloads the integration, no restart needed.",
         "data": {
+          "sensitivity": "How much the house tells you",
+          "daily_briefing_delivery": "Send the daily summary (08:00)",
+          "telegram_chat_id": "Telegram chat ID",
+          "primary_resident": "Primary resident",
+          "agent_name": "Name the assistant uses",
+          "heartbeat_start": "Start listening at",
+          "heartbeat_end": "Stop listening at",
+          "sleep_time": "Nightly consolidation time",
+          "systems_time": "Weekly summary time (Sundays)",
           "conversation": "Conversation provider (primary)",
           "data": "Data provider (primary)",
           "conversation_fallback": "Conversation provider (fallback)",
           "data_fallback": "Data provider (fallback)",
-          "telegram_chat_id": "Telegram chat ID",
-          "sensitivity": "ARAS sensitivity",
-          "primary_resident": "Primary resident",
-          "heartbeat_start": "Heartbeat start",
-          "heartbeat_end": "Heartbeat end",
-          "sleep_time": "Sleep Consolidation time",
-          "systems_time": "Systems Consolidation time (Sundays)",
-          "agent_name": "Agent name",
-          "voice_script": "Voice hook (optional)"
+          "voice_script": "Speak through a script (optional)"
         },
         "data_description": {
+          "sensitivity": "The only attention knob. Quieter means fewer events reach you; the emit threshold self-regulates inside the band you pick.",
+          "daily_briefing_delivery": "The morning summary of the previous day. Turning it off stops the message only — the nightly cycle keeps running and keeps feeding memory, priorities and restrictions. The weekly summary is sent either way.",
+          "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot.",
+          "primary_resident": "The resident PERMEAR centers on. Pick a person from Home Assistant, or type a name for a resident without a person entry.",
+          "agent_name": "What the assistant calls itself in conversation. Leave empty for the neutral name (PERMEAR).",
+          "heartbeat_start": "Before this time the house stays silent, whatever happens.",
+          "heartbeat_end": "After this time the house stays silent again.",
+          "sleep_time": "When the day is consolidated into memory. This always runs, even with the daily summary turned off.",
+          "systems_time": "When the week is compiled into patterns and suggestions.",
           "conversation": "Conversation agent used for dialogue (with tools).",
           "data": "AI Task entity used by the cycles (gray zone, briefing, weekly compile).",
           "conversation_fallback": "Takes over with tools when the primary conversation provider fails.",
           "data_fallback": "Takes over when the primary data provider fails.",
-          "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot.",
-          "sensitivity": "The only attention knob: how easily events reach you. The emit threshold self-regulates within this band.",
-          "primary_resident": "The resident PERMEAR centers on. Pick a person from Home Assistant, or type a name for a resident without a person entry.",
-          "heartbeat_start": "Hourly attention cycle runs from this time…",
-          "heartbeat_end": "…until this time. Outside the window the house stays silent.",
-          "sleep_time": "Nightly briefing and memory extraction.",
-          "systems_time": "Weekly compile: patterns, suggestions and pending items.",
-          "agent_name": "What the assistant calls itself in conversation. Leave empty to use the neutral name (PERMEAR).",
-          "voice_script": "Optional. A service PERMEAR speaks through, e.g. script.minha_voz, called with a message variable. Leave empty for no voice — PERMEAR never decides on its own when to speak."
+          "voice_script": "Optional. A service PERMEAR speaks through, e.g. script.my_voice, called with a message variable. Leave empty for no voice — PERMEAR never decides on its own when to speak."
         }
       }
     },
