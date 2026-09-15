@@ -957,8 +957,14 @@ class PermearStorage:
             # this filter, one faded suggestion was repeated nightly for 14+
             # days (30-day report, 2026-07). The row stays: mark/decay, never
             # delete; a resident mention still resurrects it.
+            # v9.8 — first_seen/mention_count travel with the insight so the
+            # briefing prompt can DATE it. The content is an episode-shaped
+            # sentence ("TV ligada entre 19:54 e 21:25") frozen at the epoch
+            # start; handed over bare it reads as an observation of today, and
+            # on 2026-09-05 it was delivered as exactly that.
             rows = self._conn.execute(
-                "SELECT id, content, metadata, last_seen FROM memory_items"
+                "SELECT id, content, metadata, last_seen, first_seen,"
+                " mention_count FROM memory_items"
                 " WHERE source = 'systems' AND tier != 'faded'"
                 " ORDER BY last_seen DESC"
             ).fetchall()
@@ -987,7 +993,13 @@ class PermearStorage:
                 continue
             bucket = "suggestions" if insight_type == "suggestion" else "pending"
             result[bucket].append(
-                {"id": r["id"], "content": r["content"], "last_seen": r["last_seen"]}
+                {
+                    "id": r["id"],
+                    "content": r["content"],
+                    "last_seen": r["last_seen"],
+                    "first_seen": r["first_seen"],
+                    "mention_count": r["mention_count"],
+                }
             )
         return result
 
