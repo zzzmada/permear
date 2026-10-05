@@ -46,7 +46,7 @@ from .storage import PermearStorage, load_json
 
 _LOGGER = logging.getLogger(__name__)
 
-ENTITY_TAG = re.compile(r"\[entity:([^\]]+)\]\s*$")
+ENTITY_TAG = re.compile(r"\[entity:([^\]]*)\]")
 
 BRIEFING_STRUCTURE = {
     "briefing": {
@@ -413,6 +413,14 @@ resident asking NOT to be notified about something or saying a subject is
 irrelevant ("para de avisar da geladeira", "isso não importa", "não me fala
 disso"), return one short PT-BR phrase per subject in 'restricoes', appending
 [entity:<entity_id>] when it maps to exactly ONE entity from today's events.
+Every phrase MUST name its subject ("Não avisar sobre a bateria do sensor
+de exemplo") — never a bare judgement like "irrelevante".
+A CONDITION or a technical correction is NOT a restriction and must NOT be
+returned here: "só considere a TV ligada depois de alguns minutos", "se tem
+gente na cozinha a janela não importa", "luz só está esquecida se não houver
+presença". The resident is explaining WHEN something matters, not asking for
+silence about it; turning that into a restriction would silence the whole
+subject. Leave such sentences out of 'restricoes'.
 Never invent restrictions — only what the resident actually expressed.
 Return an empty list when there is none.
 
@@ -472,7 +480,8 @@ If nothing is relevant, return an empty list."""
         restriction only needs to EXIST to be read), metadata.restriction.
         Key 'restriction:<entity_id>' when the speech names ONE resolvable
         entity (own namespace — must never reinforce the event memory);
-        vague subjects stay keyless and merge via the FTS layer. Reinforced
+        vague subjects stay keyless and merge by SUBJECT (v9.9 — never FTS,
+        which matched the refusal verb instead of the subject). Reinforced
         when repeated; fades by normal tier decay when never mentioned again
         (a forgotten restriction re-emerges — organic, intentional).
 
@@ -493,16 +502,20 @@ If nothing is relevant, return an empty list."""
             if not content:
                 continue
             eid = entity_id if entity_id in valid_ids else None
-            await self._storage.async_add_restriction(content, eid)
-            applied += 1
+            result = await self._storage.async_add_restriction(content, eid)
+            if result.get("id") is not None:
+                applied += 1
         return applied
 
     @staticmethod
     def _parse_memory(raw: str) -> tuple:
-        m = ENTITY_TAG.search(raw)
-        if not m:
-            return raw.strip(), None
-        return raw[: m.start()].strip(), m.group(1).strip()
+        """(content, entity_id). Every [entity:...] tag is stripped wherever it
+        sits; the memory is keyed only when it names exactly ONE entity (v9.9 —
+        a two-tag memory used to keep the first tag inside its text and be
+        keyed to the second)."""
+        tagged = {t.strip() for t in ENTITY_TAG.findall(raw) if t.strip()}
+        content = " ".join(ENTITY_TAG.sub(" ", raw).split())
+        return content, (tagged.pop() if len(tagged) == 1 else None)
 
     def _valid_entity_ids(self) -> set:
         data = load_json(

@@ -6,6 +6,24 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.9.0] — October 2026
+
+The assistant can finally read what the house has learned — and what it reads is now trustworthy.
+
+### Added
+
+- **The conversation agent knows what it has learned about you.** Until now the assistant wrote to memory and never read from it, so asking who lives here, what your standing preferences are, or when a device usually comes on got no answer — even though the system had the answer stored. Each day's first conversation now carries a short summary of the household, the instructions currently in force (with the date you gave them), and a handful of consolidated routines, marked clearly as past observation rather than current state. Live device state continues to come from Home Assistant, unchanged.
+
+### Fixed
+
+- **An instruction can no longer be overwritten by an unrelated one.** Two different requests that happened to share a word — any two sentences both phrased as "ignore…" — could be merged into a single rule, so the second one silently rewrote what the first meant and was itself never recorded. Instructions now merge only when they are genuinely about the same thing, and what a rule means is fixed when it is created: repeating it reinforces it, never redefines it.
+- **Each rule now keeps the words that created it.** A rule records its recent phrasings with dates, so its history can be inspected rather than inferred from a counter.
+- **A refusal with no subject is no longer stored as a rule.** A bare "that's irrelevant", with nothing to attach it to, used to become a rule that matched almost nothing and expired quietly.
+- **Memories no longer borrow the wrong device.** An entry that started without a device could latch onto an unrelated one through text similarity, so its subject and its label disagreed. Entries that already name a device no longer merge by similarity at all.
+- **Technical corrections are no longer stored as silence requests.** Telling the system how a device behaves ("the TV only counts as on after a few minutes") was being recorded as a request to stop mentioning that device.
+
+---
+
 ## [9.8.0] — September 2026
 
 ### Added

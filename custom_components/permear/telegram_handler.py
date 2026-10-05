@@ -51,7 +51,7 @@ from .const import (
     TELEGRAM_REJECT_WORDS,
 )
 from .error_monitor import archive_error
-from .household import agent_preamble
+from .household import agent_preamble, get_resident_names, memory_block
 from .notify import (
     async_answer_callback,
     async_edit_message,
@@ -336,7 +336,19 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
 
     async def _conversation_flow(self, text: str) -> None:
         conv_id = f"permear_telegram_{datetime.now():%Y%m%d}"  # daily rotation
-        prompt = self._build_conversation_prompt(text, conv_id)
+        # v9.9 — what Organic Memory has learned reaches the turn, with the
+        # preamble: once per daily conversation, never on every message.
+        memory = ""
+        if conv_id != self._context_conv_id:
+            try:
+                memory = memory_block(
+                    get_resident_names(self._hass),
+                    self._config.primary_resident,
+                    await self._storage.async_conversation_memory(),
+                )
+            except Exception:  # noqa: BLE001 — memory must never block a reply
+                _LOGGER.exception("Conversation memory block failed")
+        prompt = self._build_conversation_prompt(text, conv_id, memory)
 
         speech = None
         if self._config.conversation:
@@ -388,7 +400,9 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
         await async_send_telegram(self._hass, speech)
         await async_set_last_message(self._hass, speech)
 
-    def _build_conversation_prompt(self, text: str, conv_id: str) -> str:
+    def _build_conversation_prompt(
+        self, text: str, conv_id: str, memory: str = ""
+    ) -> str:
         """User turn, optionally prefixed by the PERMEAR context preamble.
 
         The preamble goes INSIDE the same conversation.process text block as
@@ -401,6 +415,8 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
         parts = []
         if conv_id != self._context_conv_id:
             parts.append(agent_preamble(self._hass, self._config))
+            if memory:
+                parts.append(memory)
         if any(k in lower for k in _AUTO_REQUEST_KEYWORDS):
             parts.append(
                 "[INSTRUCAO OBRIGATORIA: Responda APENAS com uma linha no "

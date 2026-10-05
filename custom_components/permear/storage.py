@@ -51,6 +51,9 @@ from .const import (
     NOCTURNAL_LOOKBACK_DAYS,
     PRESENCE_RECENT_MINUTES,
     MEMORY_FTS_MIN_SCORE,
+    RULE_MENTION_HISTORY_MAX,
+    CONVERSATION_MEMORY_MAX_ROUTINES,
+    CONVERSATION_MEMORY_MAX_RULES,
     MEMORY_STABLE_DEMOTE_DAYS,
     MEMORY_STABLE_PROMOTE_MENTIONS,
     MEMORY_STABLE_PROMOTE_WINDOW,
@@ -534,8 +537,8 @@ class PermearStorage:
             # salience path. It is answered where it was aimed (the insight is
             # marked rejected); letting it also reach _user_match made the
             # word match fire on every event of the room the suggestion named
-            # (-2 on 38 guest-room events from 27/08, a room the resident had
-            # said nothing about). Keyless EVENT restrictions keep matching by
+            # (-2 on every event of that room, which the resident had said
+            # nothing about). Keyless EVENT restrictions keep matching by
             # word exactly as before — restrictions are born from speech and
             # that path is the thesis, not the bug.
             if meta.get("scope") == RESTRICTION_SCOPE_SUGGESTION:
@@ -616,6 +619,19 @@ class PermearStorage:
     ) -> tuple:
         """Two-layer reinforce-or-create: canonical key, then FTS (≤ -5.0).
 
+        v9.9 — the FTS layer is for KEYLESS observations only:
+        - a caller that brings a canonical key and misses it creates its own
+          row. The fuzzy layer used to merge it into whatever read alike and
+          stamp the caller's key on that row, so a memory about one entity
+          ended up owned by another entity's key.
+        - kind='behavior_rule' never goes through FTS. Rules are short phrases
+          sharing the same refusal verbs ("ignorar", "notificar",
+          "irrelevante"), so bm25 matched the VERB, not the subject: on
+          2026-09-17 a new refusal reinforced an unrelated rule instead of
+          being born. Keyless rules merge by SUBJECT (refusal verbs stripped),
+          see _same_subject_rule_locked. Same class as the v9.4.1 interaction
+          fix, one layer down.
+
         kind='interaction' skips the FTS layer and dedups by EXACT content
         instead: an interaction is the resident's literal words, read verbatim
         by the Sleep extraction — a fuzzy merge replaces today's speech with an
@@ -656,28 +672,28 @@ class PermearStorage:
                 )
                 self._conn.commit()
                 return cur.lastrowid, True, "new"
-            try:
-                rows = self._conn.execute(
-                    "SELECT m.id, m.tier, m.first_seen, m.key,"
-                    " bm25(memory_fts) AS score"
-                    " FROM memory_fts JOIN memory_items m ON m.id = memory_fts.rowid"
-                    " WHERE memory_fts MATCH ? AND m.kind = ?"
-                    " ORDER BY score LIMIT 1",
-                    (_fts_query(content), kind),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []  # FTS query parse issue -> treat as no match
+            if kind == "behavior_rule" and not key:
+                hit = self._same_subject_rule_locked(content, metadata or {})
+                if hit is not None:
+                    self._reinforce_row_locked(hit, now)
+                    self._conn.commit()
+                    return hit["id"], False, "subject"
+            rows = []
+            if not key and kind != "behavior_rule":
+                try:
+                    rows = self._conn.execute(
+                        "SELECT m.id, m.tier, m.first_seen, m.key,"
+                        " bm25(memory_fts) AS score"
+                        " FROM memory_fts JOIN memory_items m"
+                        " ON m.id = memory_fts.rowid"
+                        " WHERE memory_fts MATCH ? AND m.kind = ?"
+                        " ORDER BY score LIMIT 1",
+                        (_fts_query(content), kind),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []  # FTS query parse issue -> treat as no match
             if rows and rows[0]["score"] <= MEMORY_FTS_MIN_SCORE:
                 self._reinforce_row_locked(rows[0], now)
-                if key and not rows[0]["key"]:
-                    # Adopt the caller's canonical key on a keyless row — the
-                    # key lookup above already missed, so no other row owns it.
-                    # Without this the subject reinforces keyless forever and
-                    # never enters recent_keys (novelty dedup).
-                    self._conn.execute(
-                        "UPDATE memory_items SET key = ? WHERE id = ?",
-                        (key, rows[0]["id"]),
-                    )
                 self._conn.commit()
                 return rows[0]["id"], False, "fts"
             cur = self._conn.execute(
@@ -689,6 +705,41 @@ class PermearStorage:
             )
             self._conn.commit()
             return cur.lastrowid, True, "new"
+
+    def _same_subject_rule_locked(self, content: str, metadata: dict):
+        """The keyless behavior_rule that says the same thing, or None (v9.9).
+
+        Caller holds the lock. Deterministic, no FTS:
+        - never across scopes — a reinforce says "this was said again", never
+          "this is now something else";
+        - scope='suggestion': the same refused insight is the same rule;
+        - scope='events': the SUBJECT tokens (refusal verbs and place fillers
+          stripped) must overlap by a strict majority of BOTH phrases, so a
+          rewording merges ("bateria do sensor de exemplo" said twice) and a shared word
+          does not (two different batteries stay two rules).
+        Live rows win over faded ones; a faded match is resurrected by the
+        caller's reinforce, as before.
+        """
+        scope = metadata.get("scope") or RESTRICTION_SCOPE_EVENTS
+        wanted = _subject_tokens(content)
+        rows = self._conn.execute(
+            "SELECT id, tier, first_seen, content, metadata FROM memory_items"
+            " WHERE kind = 'behavior_rule' AND key IS NULL"
+            " ORDER BY (tier = 'faded'), last_seen DESC"
+        ).fetchall()
+        for r in rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if (meta.get("scope") or RESTRICTION_SCOPE_EVENTS) != scope:
+                continue
+            if scope == RESTRICTION_SCOPE_SUGGESTION:
+                if meta.get("insight_id") == metadata.get("insight_id"):
+                    return r
+                continue
+            have = _subject_tokens(r["content"])
+            n = len(wanted & have)
+            if n * 2 > len(wanted) and n * 2 > len(have):
+                return r
+        return None
 
     def _reinforce_row_locked(self, row, now: str) -> None:
         """Reinforce one matched row (caller holds the lock) with epoch rules.
@@ -809,6 +860,15 @@ class PermearStorage:
         )
 
     def _add_restriction(self, content: str, entity_id: str | None) -> dict:
+        # v9.9 — a refusal must name what it refuses. "irrelevante" alone
+        # (extracted twice from a CONDITIONAL sentence) has no subject left
+        # once the refusal verbs are stripped: it can match nothing on purpose
+        # and it used to absorb later refusals by the verb. Not persisted.
+        if not entity_id and not _subject_tokens(content):
+            _LOGGER.info(
+                "Restriction dropped — no subject and no entity: %r", content
+            )
+            return {"id": None, "scope": None, "insight_id": None}
         scope, insight_id = self._classify_restriction(content, entity_id)
         metadata = {"restriction": True, "scope": scope}
         if entity_id:
@@ -820,14 +880,16 @@ class PermearStorage:
             key=f"restriction:{entity_id}" if entity_id else None,
             metadata=metadata,
         )
-        # Reinforce keeps the ORIGINAL metadata (it only bumps mention_count /
-        # last_seen), so a re-stated refusal would otherwise never acquire its
-        # scope. Patch it explicitly — idempotent.
-        if not was_new:
-            patch = {"scope": scope}
-            if insight_id is not None:
-                patch["insight_id"] = insight_id
-            self._update_metadata(item_id, patch)
+        # v9.9 — scope is fixed at BIRTH. The reinforce path used to rewrite
+        # it from the NEW phrase, so the latest sentence redefined what the
+        # rule had always been (an unrelated refusal flipped a suggestion
+        # refusal into an event restriction). A reinforce only fills a
+        # scope that is missing (rows older than v9.7.2).
+        self._note_rule_mention(item_id, content, scope, insight_id)
+        _LOGGER.info(
+            "Restriction %s %s via %s (scope=%s): %r",
+            item_id, "created" if was_new else "reinforced", _via, scope, content,
+        )
         if insight_id is not None:
             # Reject the exact row the resident refused. This is strictly
             # better than the token guessing in _system_insights: we know
@@ -839,6 +901,36 @@ class PermearStorage:
                 "rule kept out of the ARAS salience path", item_id, insight_id,
             )
         return {"id": item_id, "scope": scope, "insight_id": insight_id}
+
+    def _note_rule_mention(
+        self, item_id: int, content: str, scope: str, insight_id
+    ) -> None:
+        """Record the phrasing behind this mention and fill a MISSING scope.
+
+        metadata.mentions keeps the last RULE_MENTION_HISTORY_MAX phrasings
+        with their timestamps, so mention_count can be audited: what was said,
+        and when, each time the rule was created or reinforced.
+        """
+        assert self._conn is not None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata FROM memory_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            if not meta.get("scope"):
+                meta["scope"] = scope
+                if insight_id is not None:
+                    meta["insight_id"] = insight_id
+            mentions = list(meta.get("mentions") or [])
+            mentions.append({"at": datetime.now().isoformat(), "text": content})
+            meta["mentions"] = mentions[-RULE_MENTION_HISTORY_MAX:]
+            self._conn.execute(
+                "UPDATE memory_items SET metadata = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), item_id),
+            )
+            self._conn.commit()
 
     def _classify_restriction(
         self, content: str, entity_id: str | None
@@ -862,9 +954,11 @@ class PermearStorage:
         wanted = _subject_tokens(content)
         if len(wanted) < RESTRICTION_SUGGESTION_MIN_TOKENS:
             return RESTRICTION_SCOPE_EVENTS, None
-        # half the refusal's own subject, never fewer than the floor: a long
-        # refusal must not qualify on two incidental words
-        need = max(RESTRICTION_SUGGESTION_MIN_TOKENS, (len(wanted) + 1) // 2)
+        # a strict MAJORITY of the refusal's own subject, never fewer than the
+        # floor: a long refusal must not qualify on two incidental words
+        # (v9.9 — exactly half let "bateria do sensor de temperatura movel"
+        # read as a refusal of an insight that mentioned a temperature sensor)
+        need = max(RESTRICTION_SUGGESTION_MIN_TOKENS, len(wanted) // 2 + 1)
         assert self._conn is not None
         with self._lock:
             rows = self._conn.execute(
@@ -893,7 +987,24 @@ class PermearStorage:
         stamped = 0
         for r in rows:
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
-            if not meta.get("restriction") or meta.get("scope"):
+            if not meta.get("restriction"):
+                continue
+            # v9.9 — insight_id is only ever written together with
+            # scope='suggestion'. A row carrying one under any other scope had
+            # its scope rewritten by a later reinforce: restore it.
+            if (meta.get("insight_id") is not None
+                    and meta.get("scope") != RESTRICTION_SCOPE_SUGGESTION):
+                self._update_metadata(
+                    r["id"], {"scope": RESTRICTION_SCOPE_SUGGESTION}
+                )
+                stamped += 1
+                _LOGGER.warning(
+                    "Restriction %s had scope=%s with insight %s — restored "
+                    "to suggestion", r["id"], meta.get("scope"),
+                    meta["insight_id"],
+                )
+                continue
+            if meta.get("scope"):
                 continue
             entity_id = meta.get("entity_id")
             if not entity_id and r["key"] and r["key"].startswith("restriction:"):
@@ -1006,6 +1117,58 @@ class PermearStorage:
     # ------------------------------------------------------------------
     # v8.10 — Sleep / Systems reads and writes.
     # ------------------------------------------------------------------
+
+    async def async_conversation_memory(self) -> dict:
+        """What Organic Memory has learned that is ALIVE, for the conversation
+        turn (v9.9). Read-only, one executor job."""
+        return await self._hass.async_add_executor_job(self._conversation_memory)
+
+    def _conversation_memory(self) -> dict:
+        """Live rules + consolidated routines, each with its provenance.
+
+        - rules: behavior_rule rows that still apply (not faded). The scope
+          travels with them: a refused suggestion is a preference too, but it
+          is not a request for silence about events.
+        - routines: kind='pattern' in active/stable from the Sleep extraction
+          (source='daily'). Heartbeat `event:` rows are left out — their
+          content is a bare device name, a counter rather than knowledge — and
+          so are Systems insights, which are the system's own suggestions, not
+          something the house taught. A daily row that ended up under an
+          `event:` key is left out too: its count is the device's emissions,
+          not repetitions of what its text says.
+        A routine's content is an EXEMPLAR frozen at the epoch start (rule
+        #22), so first_seen/mention_count travel with it and the caller dates
+        every line.
+        """
+        assert self._conn is not None
+        with self._lock:
+            rule_rows = self._conn.execute(
+                "SELECT content, last_seen, metadata FROM memory_items"
+                " WHERE kind = 'behavior_rule' AND tier != 'faded'"
+                " ORDER BY last_seen DESC"
+            ).fetchall()
+            routine_rows = self._conn.execute(
+                "SELECT content, first_seen, mention_count FROM memory_items"
+                " WHERE kind = 'pattern' AND source = 'daily'"
+                " AND tier IN ('stable', 'active')"
+                " AND (key IS NULL OR key NOT LIKE 'event:%')"
+                " ORDER BY (tier = 'stable') DESC, mention_count DESC LIMIT ?",
+                (CONVERSATION_MEMORY_MAX_ROUTINES,),
+            ).fetchall()
+        rules = []
+        for r in rule_rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if not meta.get("restriction"):
+                continue
+            rules.append({
+                "content": r["content"],
+                "last_seen": r["last_seen"],
+                "scope": meta.get("scope") or RESTRICTION_SCOPE_EVENTS,
+            })
+        return {
+            "rules": rules[:CONVERSATION_MEMORY_MAX_RULES],
+            "routines": [dict(r) for r in routine_rows],
+        }
 
     async def async_add_or_reinforce(
         self, content: str, kind: str, source: str,
