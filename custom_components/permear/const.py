@@ -292,8 +292,8 @@ MEMORY_RULE_FADE_DAYS = 30            # behavior_rule without mention -> fade
 # "Esqueça essa cena" (refusing a Systems SUGGESTION) and "para de avisar da
 # geladeira" (refusing EVENTS of a subject) arrived as the same row, and the
 # consequences were exactly inverted: ARAS matched the suggestion refusal by
-# word against every event of the room it named (-2 on 38 events of the guest
-# room from 27/08), while the Systems reject path — which only reads
+# word against every event of the room it named, while the Systems reject
+# path — which only reads
 # entity-anchored rules — left the refused suggestion eligible for the
 # briefing. Scope is decided deterministically at extraction: a KEYLESS
 # refusal whose significant tokens overlap a real Systems insight is a
@@ -303,6 +303,19 @@ MEMORY_RULE_FADE_DAYS = 30            # behavior_rule without mention -> fade
 RESTRICTION_SCOPE_EVENTS = "events"          # lowers salience of an entity/subject
 RESTRICTION_SCOPE_SUGGESTION = "suggestion"  # rejects one Systems insight, never ARAS
 RESTRICTION_SUGGESTION_MIN_TOKENS = 2        # overlap needed to call it a suggestion refusal
+# v9.9 — a rule keeps the last phrasings that created/reinforced it
+# (metadata.mentions). mention_count alone could not be audited: an unrelated
+# refusal could reinforce another rule and nothing recorded what was said.
+RULE_MENTION_HISTORY_MAX = 5
+
+# v9.9 — what the conversation agent reads from Organic Memory. Bounded on
+# purpose: the Assist Live Context already fills the turn with the house's
+# live state, and competing context degraded grounding once before. Only what
+# is ALIVE enters (live rules, consolidated routines), dated, once per daily
+# conversation — never the corpus.
+CONVERSATION_MEMORY_MAX_RULES = 6
+CONVERSATION_MEMORY_MAX_ROUTINES = 8
+CONVERSATION_MEMORY_MAX_CHARS = 1500
 
 # Engagement-based priority learning (weekly, Systems Consolidation).
 ENGAGEMENT_MIN_ALERTS = 4       # minimum alerts to have confidence

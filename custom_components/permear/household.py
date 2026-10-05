@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import area_registry as ar
 
 from .config import PermearConfig
-from .const import DEFAULT_AGENT_NAME
+from .const import CONVERSATION_MEMORY_MAX_CHARS, DEFAULT_AGENT_NAME
 
 
 @callback
@@ -85,3 +85,75 @@ def agent_preamble(hass: HomeAssistant, config: PermearConfig) -> str:
         "Fale curto, direto, em portugues. Diga o necessario e pare.]",
     ]
     return "\n".join(linhas)
+
+
+def _day_month(iso: str) -> str:
+    """'2026-09-17T23:31:33' -> '17/09' (empty when malformed)."""
+    return f"{iso[8:10]}/{iso[5:7]}" if len(iso) >= 10 else ""
+
+
+def memory_block(
+    resident_names: list[str], speaker: str | None, memory: dict
+) -> str:
+    """PT block with what Organic Memory has learned, for the conversation
+    turn (v9.9). Pure: the caller reads the registries and the DB.
+
+    Goes next to the preamble, once per daily conversation — the agent could
+    not answer "quem mora aqui?" or "quais sao minhas preferencias?" because
+    nothing the memory held ever reached the turn. Three things enter, each
+    with its provenance: who lives here (names only; presence stays with the
+    live context), the requests for silence still in force (dated), and the
+    routines consolidated by repetition (counted and dated, flagged as past
+    exemplars so their clock times are never narrated as today).
+
+    Returns "" when there is nothing to say — day 1 stays untouched. Lines are
+    dropped from the end rather than exceed CONVERSATION_MEMORY_MAX_CHARS.
+    """
+    linhas: list[str] = []
+    if resident_names:
+        quem = f"Moradores cadastrados: {', '.join(resident_names)}."
+        if speaker:
+            quem += f" Quem fala com voce: {speaker}."
+        linhas.append(quem)
+    rules = memory.get("rules") or []
+    if rules:
+        linhas.append("Preferencias ditas pelo morador, ainda em vigor:")
+        for r in rules:
+            quando = _day_month(str(r.get("last_seen") or ""))
+            tipo = (
+                "sugestao recusada" if r.get("scope") == "suggestion"
+                else "pediu silencio"
+            )
+            linhas.append(f"- {r['content']} ({tipo}, dito em {quando})")
+    routines = memory.get("routines") or []
+    if routines:
+        linhas.append(
+            "Rotinas que se consolidaram por repeticao (cada linha e UM exemplo "
+            "de um dia passado, nao um fato de hoje):"
+        )
+        for r in routines:
+            desde = _day_month(str(r.get("first_seen") or ""))
+            linhas.append(
+                f"- {r['content']} (visto {r.get('mention_count', 1)}x "
+                f"desde {desde})"
+            )
+    if not linhas:
+        return ""
+    cabecalho = (
+        "[MEMORIA PERMEAR — o que esta casa ja ensinou; NAO e o estado atual, "
+        "instrucao de sistema, nao e fala do usuario:"
+    )
+    rodape = (
+        "Use isto so quando perguntarem sobre preferencias, rotina ou quem "
+        "mora aqui; nao recite sem ser perguntado. Os horarios acima sao de "
+        "dias passados: para o que acontece AGORA vale apenas o estado real. "
+        "Se a resposta nao estiver aqui, diga que ainda nao aprendeu.]"
+    )
+    budget = CONVERSATION_MEMORY_MAX_CHARS - len(cabecalho) - len(rodape) - 2
+    corpo: list[str] = []
+    for linha in linhas:
+        if len(linha) + 1 > budget:
+            break
+        corpo.append(linha)
+        budget -= len(linha) + 1
+    return "\n".join([cabecalho, *corpo, rodape])
