@@ -6,6 +6,20 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.10.0] — October 2026
+
+The assistant now remembers what it just told you.
+
+### Added
+
+- **The agent knows its own recent messages.** When the house reported something on its own — a low battery, a light left on, the nightly summary — and you replied asking "which one?" or "what do you mean?", the assistant had no record of having said anything: alerts go out through one path and your reply arrives through another, and the two never met. Each conversation now carries what the system sent in the last few hours, together with the plain event lines behind each message. So a follow-up question gets answered with the actual device instead of a list of everything in the house. These notes live only in memory and are forgotten on restart.
+
+### Fixed
+
+- **Context is restored for every new conversation.** Home Assistant ends a conversation after a few idle minutes, but the household context and learned preferences introduced in 9.9.0 were only sent once a day — so in practice they applied for the first few minutes and then quietly stopped. They are now sent again whenever a new conversation begins.
+
+---
+
 ## [9.9.0] — October 2026
 
 The assistant can finally read what the house has learned — and what it reads is now trustworthy.

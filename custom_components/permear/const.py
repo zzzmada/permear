@@ -304,8 +304,8 @@ RESTRICTION_SCOPE_EVENTS = "events"          # lowers salience of an entity/subj
 RESTRICTION_SCOPE_SUGGESTION = "suggestion"  # rejects one Systems insight, never ARAS
 RESTRICTION_SUGGESTION_MIN_TOKENS = 2        # overlap needed to call it a suggestion refusal
 # v9.9 — a rule keeps the last phrasings that created/reinforced it
-# (metadata.mentions). mention_count alone could not be audited: an unrelated
-# refusal could reinforce another rule and nothing recorded what was said.
+# (metadata.mentions). mention_count alone could not be audited: an
+# unrelated refusal reinforced another rule and nothing recorded what was said.
 RULE_MENTION_HISTORY_MAX = 5
 
 # v9.9 — what the conversation agent reads from Organic Memory. Bounded on
@@ -316,6 +316,21 @@ RULE_MENTION_HISTORY_MAX = 5
 CONVERSATION_MEMORY_MAX_RULES = 6
 CONVERSATION_MEMORY_MAX_ROUTINES = 8
 CONVERSATION_MEMORY_MAX_CHARS = 1500
+
+# v9.10 — what the system said ON ITS OWN reaches the conversation turn. The
+# cycles deliver through notify, the resident answers through the handler, and
+# the two never met: on 29/10 the system named a battery at 08:40 and could not
+# say which sensor at 08:41. Every Telegram send except the conversation's own
+# reply (already in HA's chat log) is kept in memory with what it was written
+# FROM (the dry lines of the event(s)). A message enters the turn once per live
+# HA chat session — HA drops a session after 5 idle minutes, so "once per day"
+# would be once per 5 minutes of memory — and only while it is recent.
+OUTBOUND_CONTEXT_HOURS = 6        # older than this, the resident is not replying to it
+OUTBOUND_MEMORY_MAX = 20          # in-memory ring; a restart simply forgets
+OUTBOUND_BLOCK_MAX_MESSAGES = 5   # most recent first
+OUTBOUND_TEXT_MAX_CHARS = 300     # a long briefing is cut, its referents are not the point
+OUTBOUND_ABOUT_MAX_CHARS = 400    # dry lines a message was written from
+OUTBOUND_BLOCK_MAX_CHARS = 1500
 
 # Engagement-based priority learning (weekly, Systems Consolidation).
 ENGAGEMENT_MIN_ALERTS = 4       # minimum alerts to have confidence

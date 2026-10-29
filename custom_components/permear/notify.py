@@ -10,11 +10,17 @@ Best-effort: delivery failures are logged, never raised into a cycle.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, PENDING_MESSAGE_PATH
+from .const import (
+    DOMAIN,
+    OUTBOUND_CONTEXT_HOURS,
+    OUTBOUND_MEMORY_MAX,
+    PENDING_MESSAGE_PATH,
+)
 from .storage import load_json, locked_json_update
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,6 +28,9 @@ _LOGGER = logging.getLogger(__name__)
 LAST_MESSAGE_ENTITY = "input_text.permear_last_message"
 # Stable drain order (Sleep before Systems when both are pending the same day).
 _PENDING_KEYS = ("sleep", "systems")
+# v9.10 — its own key, NOT under hass.data[DOMAIN] (whose values are the
+# per-entry dicts that _configured_chat_id and friends iterate).
+_OUTBOUND_KEY = f"{DOMAIN}_outbound"
 
 
 def _configured_chat_id(hass: HomeAssistant) -> str:
@@ -34,11 +43,22 @@ def _configured_chat_id(hass: HomeAssistant) -> str:
 
 
 async def async_send_telegram(
-    hass: HomeAssistant, message: str, inline_keyboard: list[str] | None = None
+    hass: HomeAssistant,
+    message: str,
+    inline_keyboard: list[str] | None = None,
+    *,
+    about: list[str] | None = None,
+    remember: bool = True,
 ) -> bool:
     """Send a Telegram message. Returns True on success, False on failure —
     callers that don't care ignore it; the deferred-message drain relies on it
-    to keep an entry that failed to deliver."""
+    to keep an entry that failed to deliver.
+
+    v9.10 — a delivered message is remembered (in memory) so the conversation
+    agent can see what the system said on its own. `about` carries the dry
+    lines the message was written FROM (the paraphrase may drop the name, as
+    on 29/10). The conversation's own reply passes remember=False: HA's chat
+    log already holds it."""
     data: dict = {"message": message, "parse_mode": "plain_text"}
     chat_id = _configured_chat_id(hass)
     if chat_id:
@@ -55,7 +75,29 @@ async def async_send_telegram(
     except Exception as exc:  # noqa: BLE001
         _LOGGER.warning("Telegram delivery failed: %s", exc)
         return False
+    if remember:
+        _remember_outbound(hass, message, about)
     return True
+
+
+def _remember_outbound(
+    hass: HomeAssistant, message: str, about: list[str] | None
+) -> None:
+    ring = hass.data.get(_OUTBOUND_KEY)
+    if ring is None:
+        ring = hass.data[_OUTBOUND_KEY] = deque(maxlen=OUTBOUND_MEMORY_MAX)
+    text = str(message or "").strip()
+    lines = [a for a in (str(x).strip() for x in (about or [])) if a and a != text]
+    ring.append({"ts": datetime.now(), "text": text, "about": lines})
+
+
+def recent_outbound(hass: HomeAssistant, now: datetime | None = None) -> list[dict]:
+    """What the system delivered on its own within OUTBOUND_CONTEXT_HOURS,
+    oldest first. Each item keeps its identity (the dict) so the caller can
+    tell which ones the live conversation has already seen."""
+    now = now or datetime.now()
+    cutoff = now - timedelta(hours=OUTBOUND_CONTEXT_HOURS)
+    return [m for m in hass.data.get(_OUTBOUND_KEY) or () if m["ts"] >= cutoff]
 
 
 async def async_defer_message(hass: HomeAssistant, key: str, text: str) -> None:

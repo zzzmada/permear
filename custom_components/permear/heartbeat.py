@@ -137,11 +137,11 @@ def silence_kind(resposta: str | None) -> str | None:
     true alert is the worse failure of the two, so the sentinel only counts as
     the whole reply or as a word inside a short one.
 
-    v9.7.2 — 'prose'. On 24/08 the provider delivered "A janela da sala ja esta
-    fechada, entao nao e necessario avisar o morador agora. Nenhuma acao e
-    necessaria." — 108 chars (over _SILENCE_MAX_LEN) and none of the six
-    paraphrases, so it went to Telegram as an alert about nothing. It is not a
-    sentinel leak: the model simply said nothing in prose.
+    v9.7.2 — 'prose'. A provider once delivered a full sentence stating that
+    the device was already in the desired state and that no action was needed —
+    over _SILENCE_MAX_LEN and matching none of the six paraphrases, so it went
+    to Telegram as an alert about nothing. It is not a sentinel leak: the model
+    simply said nothing in prose.
 
     The prose branch is length-free, so it is deliberately made to cost TWO
     independent markers. Every marker names the ACT of notifying ("nao e
@@ -414,7 +414,7 @@ class PermearHeartbeat:
             if is_spike(result["decision"], result["scores"]):
                 spikes += 1
                 content = await self._orient_or_narrate(cand, content)
-            await self._deliver(content)
+            await self._deliver(content, about=[cand["content"]])
             await self._storage.async_record_emit(
                 content, cand.get("key"),
                 self._emit_metadata(cand.get("metadata"), result["salience"]),
@@ -440,7 +440,9 @@ class PermearHeartbeat:
                     "Gray reply suppressed as a non-message (%s): %r", kind, resposta
                 )
             if kind is None:
-                await self._deliver(resposta)
+                # v9.10 — the paraphrase may drop the device's name; the batch's
+                # dry lines travel with it so the conversation can resolve it.
+                await self._deliver(resposta, about=[c["content"] for c, _ in grays])
                 # Record the batch under each candidate's OWN key and dry
                 # content — deterministic, never parsed from the LLM text.
                 # The keys enter today's recent_keys (novelty dedup for the
@@ -979,10 +981,11 @@ Responda em portugues no campo 'resposta'."""
     # Delivery + stats
     # ------------------------------------------------------------------
 
-    async def _deliver(self, message: str) -> None:
+    async def _deliver(self, message: str, about: list[str] | None = None) -> None:
         """Telegram (PT, chat_id from the config entry) + last-message holder.
-        Best-effort each (notify.py logs failures, never raises)."""
-        await async_send_telegram(self._hass, message)
+        Best-effort each (notify.py logs failures, never raises). `about` = the
+        dry lines the message was written from (v9.10, conversation context)."""
+        await async_send_telegram(self._hass, message, about=about)
         await async_set_last_message(self._hass, message)
 
     def _mute_days(self) -> int:

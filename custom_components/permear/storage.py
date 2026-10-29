@@ -537,8 +537,8 @@ class PermearStorage:
             # salience path. It is answered where it was aimed (the insight is
             # marked rejected); letting it also reach _user_match made the
             # word match fire on every event of the room the suggestion named
-            # (-2 on every event of that room, which the resident had said
-            # nothing about). Keyless EVENT restrictions keep matching by
+            # (-2 on every event of that room, which the resident had
+            # said nothing about). Keyless EVENT restrictions keep matching by
             # word exactly as before — restrictions are born from speech and
             # that path is the thesis, not the bug.
             if meta.get("scope") == RESTRICTION_SCOPE_SUGGESTION:

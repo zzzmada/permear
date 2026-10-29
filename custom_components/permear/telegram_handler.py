@@ -51,12 +51,18 @@ from .const import (
     TELEGRAM_REJECT_WORDS,
 )
 from .error_monitor import archive_error
-from .household import agent_preamble, get_resident_names, memory_block
+from .household import (
+    agent_preamble,
+    get_resident_names,
+    memory_block,
+    outbound_block,
+)
 from .notify import (
     async_answer_callback,
     async_edit_message,
     async_send_telegram,
     async_set_last_message,
+    recent_outbound,
 )
 from .storage import PermearStorage, load_json, locked_json_update
 from .updates import PermearUpdates
@@ -131,6 +137,9 @@ class PermearTelegramHandler:
         self._pending_spec: dict | None = None
         self._seen_messages: dict = {}  # message_id -> monotonic-ish ts
         self._context_conv_id: str | None = None  # preamble sent for this conv
+        # v9.10 — timestamps of the system's own deliveries already shown to
+        # the LIVE HA chat session; reset whenever that session is gone.
+        self._outbound_seen: set = set()
 
     @callback
     def start(self) -> None:
@@ -246,7 +255,7 @@ class PermearTelegramHandler:
                 self._hass,
                 "⚠️ Nao consegui interpretar a descricao.\n\n"
                 'Tente reformular com mais detalhes, ex:\n'
-                '"ligar AC suite todo dia as 18h"',
+                '"ligar o ar-condicionado todo dia as 18h"',
             )
             return
 
@@ -336,8 +345,15 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
 
     async def _conversation_flow(self, text: str) -> None:
         conv_id = f"permear_telegram_{datetime.now():%Y%m%d}"  # daily rotation
+        # v9.10 — HA drops a chat session after 5 idle minutes and reuses our
+        # custom id with an EMPTY history. Whatever the dead session was told
+        # is gone: the preamble, the memory block and the system's own
+        # deliveries all go out again in the next session.
+        if not self._chat_session_alive(conv_id):
+            self._context_conv_id = None
+            self._outbound_seen = set()
         # v9.9 — what Organic Memory has learned reaches the turn, with the
-        # preamble: once per daily conversation, never on every message.
+        # preamble: once per live chat session, never on every message.
         memory = ""
         if conv_id != self._context_conv_id:
             try:
@@ -348,7 +364,14 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
                 )
             except Exception:  # noqa: BLE001 — memory must never block a reply
                 _LOGGER.exception("Conversation memory block failed")
-        prompt = self._build_conversation_prompt(text, conv_id, memory)
+        # v9.10 — what the system said on its own since this chat session last
+        # saw it.
+        unseen = [
+            m for m in recent_outbound(self._hass)
+            if m["ts"] not in self._outbound_seen
+        ]
+        said = outbound_block(unseen)
+        prompt = self._build_conversation_prompt(text, conv_id, memory, said)
 
         speech = None
         if self._config.conversation:
@@ -378,9 +401,10 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
                 "Sistema temporariamente indisponível. Tente em alguns minutos.",
             )
             return
-        # Preamble delivered for this conversation — don't repeat it.
+        # Preamble delivered for this chat session — don't repeat it.
         # (Only marked on success: a fully failed call re-injects next time.)
         self._context_conv_id = conv_id
+        self._outbound_seen.update(m["ts"] for m in unseen)
 
         # Internal agent tokens — intercepted, never shown to the user
         if "REMOVE_AUTO:" in speech:
@@ -397,11 +421,22 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
             )
             return
 
-        await async_send_telegram(self._hass, speech)
+        # The reply is already in HA's chat log — not remembered as outbound.
+        await async_send_telegram(self._hass, speech, remember=False)
         await async_set_last_message(self._hass, speech)
 
+    def _chat_session_alive(self, conv_id: str) -> bool:
+        """True while HA still holds this conversation's chat log (it drops a
+        session after 5 idle minutes and reuses our custom id with an EMPTY
+        history)."""
+        try:
+            from homeassistant.components.conversation.chat_log import DATA_CHAT_LOGS
+        except ImportError:
+            return False
+        return conv_id in (self._hass.data.get(DATA_CHAT_LOGS) or {})
+
     def _build_conversation_prompt(
-        self, text: str, conv_id: str, memory: str = ""
+        self, text: str, conv_id: str, memory: str = "", said: str = ""
     ) -> str:
         """User turn, optionally prefixed by the PERMEAR context preamble.
 
@@ -417,6 +452,8 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
             parts.append(agent_preamble(self._hass, self._config))
             if memory:
                 parts.append(memory)
+        if said:
+            parts.append(said)
         if any(k in lower for k in _AUTO_REQUEST_KEYWORDS):
             parts.append(
                 "[INSTRUCAO OBRIGATORIA: Responda APENAS com uma linha no "
@@ -469,7 +506,7 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
                     self._hass,
                     "Nova automacao\n\n"
                     "Descreva o que ela deve fazer.\n"
-                    'Ex: "ligar AC suite as 18h se temperatura passar de 25 graus"',
+                    'Ex: "ligar o ar-condicionado as 18h se a temperatura passar de 25 graus"',
                 )
                 self._set_state("awaiting_new", None)
             elif command == "/listar_automacoes":

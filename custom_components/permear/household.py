@@ -11,11 +11,22 @@ depends on a PERMEAR prompt hand-pasted into the HA agent UI.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+from datetime import datetime
+
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import area_registry as ar
 
 from .config import PermearConfig
-from .const import CONVERSATION_MEMORY_MAX_CHARS, DEFAULT_AGENT_NAME
+from .const import (
+    CONVERSATION_MEMORY_MAX_CHARS,
+    DEFAULT_AGENT_NAME,
+    OUTBOUND_ABOUT_MAX_CHARS,
+    OUTBOUND_BLOCK_MAX_CHARS,
+    OUTBOUND_BLOCK_MAX_MESSAGES,
+    OUTBOUND_TEXT_MAX_CHARS,
+)
 
 
 @callback
@@ -156,4 +167,75 @@ def memory_block(
             break
         corpo.append(linha)
         budget -= len(linha) + 1
+    return "\n".join([cabecalho, *corpo, rodape])
+
+
+def _words(text: str) -> set[str]:
+    plain = unicodedata.normalize("NFKD", text.lower())
+    plain = "".join(c for c in plain if not unicodedata.combining(c))
+    return {w for w in re.findall(r"[a-z0-9]+", plain) if len(w) > 3}
+
+
+def _referents(text: str, about: list[str]) -> str:
+    """The dry lines a message was written from, the ones sharing words with
+    the delivered text first (a gray batch can hold a dozen; the paraphrase
+    names one). Ranking only — nothing is dropped for not matching, only for
+    the size cap."""
+    said = _words(text)
+    ranked = sorted(about, key=lambda a: -len(_words(a) & said))
+    kept: list[str] = []
+    size = 0
+    for line in ranked:
+        if size + len(line) + 2 > OUTBOUND_ABOUT_MAX_CHARS:
+            break
+        kept.append(line)
+        size += len(line) + 2
+    return "; ".join(kept)
+
+
+def outbound_block(messages: list[dict], now: datetime | None = None) -> str:
+    """PT block with what the system said on its own, for the conversation
+    turn (v9.10). Pure: the caller picks the messages (recent, not yet seen by
+    the live chat session).
+
+    On 29/10 the system wrote "Bateria do sensor de temperatura esta muito
+    baixa (10%)", the resident asked "qual sensor?" a minute later, and the
+    agent listed twenty sensors — the delivery and the conversation never met.
+    Each message goes in with its time and the dry lines it was written from,
+    so the agent can name the device the paraphrase left out. Returns "" when
+    there is nothing to say."""
+    if not messages:
+        return ""
+    now = now or datetime.now()
+    cabecalho = (
+        "[O QUE VOCE MESMO DISSE AO MORADOR, por iniciativa propria, antes "
+        "desta mensagem — instrucao de sistema, nao e fala do usuario:"
+    )
+    rodape = (
+        "Se a mensagem do morador se refere a algo acima ('qual?', 'o que?', "
+        "'por que?'), responda sobre ISSO, pelo nome do dispositivo em 'sobre' "
+        "que corresponde ao que voce disse. "
+        "Se nao se refere, ignore este bloco e nao o recite.]"
+    )
+    budget = OUTBOUND_BLOCK_MAX_CHARS - len(cabecalho) - len(rodape) - 2
+    corpo: list[str] = []
+    for m in reversed(messages[-OUTBOUND_BLOCK_MAX_MESSAGES:]):  # newest first
+        ts: datetime = m["ts"]
+        quando = (
+            ts.strftime("%H:%M") if ts.date() == now.date()
+            else ts.strftime("%d/%m %H:%M")
+        )
+        texto = " ".join(str(m.get("text") or "").split())
+        if len(texto) > OUTBOUND_TEXT_MAX_CHARS:
+            texto = texto[:OUTBOUND_TEXT_MAX_CHARS].rstrip() + "…"
+        linha = f'- {quando} voce enviou: "{texto}"'
+        sobre = _referents(texto, m.get("about") or [])
+        if sobre:
+            linha += f"\n  (sobre: {sobre})"
+        if len(linha) + 1 > budget:
+            break
+        corpo.append(linha)
+        budget -= len(linha) + 1
+    if not corpo:
+        return ""
     return "\n".join([cabecalho, *corpo, rodape])
