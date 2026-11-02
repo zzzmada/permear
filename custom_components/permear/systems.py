@@ -26,23 +26,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_change
-from homeassistant.util.yaml import load_yaml
 
 from .ai_client import AiTaskClient
 from .config import PermearConfig, parse_hhmm
 from .const import (
-    AGENT_AUTOMATIONS_RELATIVE_PATH,
     DEFAULT_SYSTEMS_TIME,
     EVENT_LOG_CORRELATION_DAYS,
+    MONITORED_ENTITIES_RELATIVE_PATH,
+    STANDING_RULES_RELATIVE_PATH,
+    SUGGESTION_ACTIONS,
 )
 from .correlate import compute_pairs
 from .household import get_residents
 from .notify import async_defer_message
-from .storage import PermearStorage
+from .storage import PermearStorage, load_json
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +63,11 @@ DIRETRIZES_RESUMO = """DIRETRIZES (resumo — regras completas validadas pelo Py
 - memory_items source='systems': insights do sistema (suggestions/sugestoes e pending/pendencias). Decay nativo do banco substitui poda manual.
 - NUNCA duplicar info entre arquivos. Antes de adicionar, verificar se ja existe."""
 
+# v9.16 — a suggestion's subject: closed tags at the end of the sentence, in the
+# [entity:...] idiom of the Sleep extraction. The output stays a list of texts.
+_TRIGGER_TAG = re.compile(r"\[gatilho:([^\]]*)\]")
+_SUBJECT_TAGS = re.compile(r"\[alvo:([^\]]*)\]\s*\[acao:([^\]]*)\]")
+
 INSIGHTS_STRUCTURE = {
     "novas_pendencias": {
         "description": "Household pending items to register",
@@ -78,6 +85,42 @@ INSIGHTS_STRUCTURE = {
         "selector": {"text": {"multiple": True}},
     },
 }
+
+
+def parse_suggestion(raw: str, valid_ids) -> tuple:
+    """(text, subject). subject = 'action|entity,entity|trigger', the identity of the
+    suggestion and of its refusal: never its wording, which changes weekly and
+    which bm25 matches by the verb (rule #29). None when the tags are missing or
+    name something that does not exist. PURE."""
+    valid_ids = set(valid_ids)
+    match = _SUBJECT_TAGS.search(raw)
+    text = " ".join(_TRIGGER_TAG.sub(" ", _SUBJECT_TAGS.sub(" ", raw)).split())
+    if not text or not match or len(_SUBJECT_TAGS.findall(raw)) != 1:
+        return text, None
+    entities = sorted({e.strip() for e in match.group(1).split(",") if e.strip()})
+    action = match.group(2).strip().lower()
+    if (action not in SUGGESTION_ACTIONS or not entities
+            or not set(entities) <= set(valid_ids)):
+        return text, None
+    tags = _TRIGGER_TAG.findall(raw)
+    if len(tags) != 1:
+        return text, None
+    parts = [p.strip() for p in tags[0].split(":")]
+    coordinate = None
+    if parts[0] == "time" and len(parts) in (3, 4):
+        values = parts[1:]
+        if all(re.fullmatch(r"\d{2}", value) for value in values):
+            hour, minute = map(int, values[:2])
+            second = int(values[2]) if len(values) == 3 else 0
+            if hour < 24 and minute < 60 and second < 60:
+                coordinate = f"time:{hour:02d}:{minute:02d}:{second:02d}"
+    elif parts[0] == "state" and len(parts) == 3:
+        entity_id, value = parts[1:]
+        if entity_id in valid_ids and re.fullmatch(r"[\w.-]+", value):
+            coordinate = f"state:{entity_id}:{value}"
+    if coordinate is None:
+        return text, None
+    return text, f"{action}|{','.join(entities)}|{coordinate}"
 
 
 def _is_meta_pendency(text: str) -> bool:
@@ -159,8 +202,9 @@ class PermearSystems:
             self._load_prompt_files
         )
 
+        entidades = await self._hass.async_add_executor_job(self._monitored_ids)
         prompt = self._build_prompt(
-            insights, residents, agent_autos, memorias, interacoes, pairs
+            insights, residents, agent_autos, memorias, interacoes, pairs, entidades
         )
         data = await self._llm.async_generate(
             "Systems Consolidation - insights", prompt, INSIGHTS_STRUCTURE
@@ -169,7 +213,7 @@ class PermearSystems:
             _LOGGER.warning("Systems insights failed on both providers — "
                             "writing nothing; deterministic part continues")
 
-        applied = await self._compile(data or {})
+        applied = await self._compile(data or {}, entidades)
         # _compile has ALREADY persisted (insights in the DB, engagement deltas
         # in monitored_entities.json). A failure while merely WORDING the report
         # must never swallow the week's work: on 2026-08-16 a KeyError in the
@@ -186,18 +230,19 @@ class PermearSystems:
         _LOGGER.info("Systems Consolidation done: %s", applied)
         return applied
 
+    def _monitored_ids(self) -> list:
+        data = load_json(
+            self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH),
+            {"entities": []},
+        )
+        return sorted(
+            e["entity_id"] for e in data.get("entities", [])
+            if isinstance(e, dict) and e.get("entity_id") and e.get("monitor")
+        )
+
     def _load_prompt_files(self) -> list:
-        agent_autos = []
-        path = self._hass.config.path(AGENT_AUTOMATIONS_RELATIVE_PATH)
-        try:
-            raw = load_yaml(path)
-            if isinstance(raw, list):
-                agent_autos = raw
-        except (FileNotFoundError, OSError):
-            pass
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Cannot parse %s: %s", path, exc)
-        return agent_autos
+        rules = load_json(self._hass.config.path(STANDING_RULES_RELATIVE_PATH), [])
+        return rules if isinstance(rules, list) else []
 
     # ------------------------------------------------------------------
     # Prompt (PT body — ports build_systems_prompt.py; the FORMATO JSON
@@ -206,7 +251,8 @@ class PermearSystems:
 
     @staticmethod
     def _build_prompt(
-        insights, residents, agent_autos, memorias, interacoes, pairs
+        insights, residents, agent_autos, memorias, interacoes, pairs,
+        entidades=(),
     ) -> str:
         autos_txt = (
             json.dumps(
@@ -236,7 +282,7 @@ class PermearSystems:
                 correl_txt += (f"  {p['a']} ↔ {p['b']}: {p['dias']} dias, "
                                f"{p['ocorrencias']} ocorrencias\n")
             correl_txt += (
-                "INSTRUCAO: destes pares, proponha AUTOMACAO SOMENTE quando "
+                "INSTRUCAO: destes pares, proponha AVISO SOMENTE quando "
                 "sugerirem uma rotina domestica plausivel. Ignore pares "
                 "espurios ou coincidenciais.\n"
             )
@@ -256,7 +302,7 @@ ESTADO ATUAL DOS ARQUIVOS PERENES:
 |--- residents (registro de pessoas do Home Assistant) ---
 {json.dumps(residents, ensure_ascii=False, indent=2)}
 
-AUTOMACOES ATUAIS DO AGENTE (permear_agent.yaml):
+AVISOS PERMANENTES ATUAIS:
 {autos_txt}
 
 DADOS DA SEMANA (banco de memoria — memorias consolidadas + interacoes):
@@ -266,6 +312,10 @@ INSTRUCOES (relevancia > completude):
 
 Analise os 7 dias e identifique APENAS as mudancas mais relevantes da semana.
 Maximo 3 novas_sugestoes (apenas se realmente acionaveis) e novas_pendencias (apenas itens acionaveis da casa, nunca erros do framework).
+Cada sugestao e um AVISO ao morador: voce nao aciona, liga, desliga, abre, fecha, ajusta nem agrupa nada, entao nunca sugira isso.
+Cada sugestao nomeia o GATILHO (um horario, ou uma entidade mudando de estado) e o que sera avisado: "Avisar sobre a porta" nao e sugestao; "Avisar as 22h se a porta estiver aberta" e. O morador aceita ou recusa exatamente o que estiver escrito.
+Cada sugestao termina com as etiquetas [alvo:<entity_id>] [acao:<tipo>] [gatilho:time:HH:MM:SS] para horario ou [gatilho:state:<entity_id>:<estado>] para mudanca de estado, com os entity_id do alvo separados por virgula. <tipo> e um de: {', '.join(sorted(SUGGESTION_ACTIONS))}. Ex: "Avisar as 22h se a porta estiver aberta [alvo:binary_sensor.door_example] [acao:notificar] [gatilho:time:22:00:00]". Sem essas etiquetas a sugestao e descartada.
+Entidades da casa: {json.dumps(list(entidades), ensure_ascii=False)}
 Pendencias: SOMENTE itens da casa (temperatura, sensores, dispositivos, eletrodomesticos). NUNCA inclua erros do proprio framework PERMEAR (compilacao_semanal, weekly_compile, byte offset, parse entities, etc).
 Verificar se ja existe na lista atual antes de adicionar.
 Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
@@ -274,20 +324,40 @@ Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
     # Compile (ports systems_compile.py — insights → DB, never guidelines)
     # ------------------------------------------------------------------
 
-    async def _compile(self, changes: dict) -> dict:
+    async def _compile(self, changes: dict, entidades=()) -> dict:
         applied = {
             "pending_added": 0, "pending_removed": 0,
-            "new_suggestions_list": [],
+            "new_suggestions_list": [], "suggestions_blocked": 0,
+            "suggestions_dropped": 0,
         }
 
+        ids = []
         for s in changes.get("novas_sugestoes") or []:
             if not s:
                 continue
-            await self._storage.async_add_or_reinforce(
-                str(s), kind="observation", source="systems",
-                metadata={"insight_type": "suggestion"},
+            text, subject = parse_suggestion(str(s), entidades)
+            # v9.18 — no subject means it is not something a standing rule can
+            # do, or names what does not exist. Refused here, not at the yes:
+            # what the code would refuse never reaches the resident.
+            if not subject:
+                applied["suggestions_dropped"] += 1
+                _LOGGER.info("Suggestion dropped, not a valid notice: %r", text)
+                continue
+            if await self._storage.async_suggestion_blocked(subject):
+                applied["suggestions_blocked"] += 1
+                continue
+            item_id, _, _ = await self._storage.async_add_or_reinforce(
+                text, kind="observation", source="systems",
+                key=f"suggestion:{subject}",
+                metadata={"insight_type": "suggestion", "subject": subject},
             )
-            applied["new_suggestions_list"].append(str(s))
+            ids.append(item_id)
+        # The row speaks, not this week's sentence: a reinforce keeps the words
+        # the subject was born with, and those are what an answer refers to.
+        applied["new_suggestions_list"] = [
+            p for p in await self._storage.async_pending_suggestions()
+            if p["id"] in ids
+        ]
 
         for p in changes.get("novas_pendencias") or []:
             if not p or _is_meta_pendency(str(p)):
@@ -311,16 +381,13 @@ Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
         """Telegram summary — user-facing, stays PT (i18n)."""
         lines = ["Resumo da semana:"]
 
+        # v9.16 — every suggestion in full: this is what a yes consents to. The
+        # #id is how the Telegram handler knows what was offered.
         ns = applied.get("new_suggestions_list", [])
+        for s in ns:
+            lines.append(f"- Sugestao #{s['id']}: {s['content']}")
         if ns:
-            first = ns[0] or ""
-            sample = first[:80]
-            # the ellipsis marks TRUNCATED TEXT, not "more suggestions" (the
-            # count already says that) — it used to key on len(ns), so a single
-            # long suggestion was cut mid-word with no sign it had been cut.
-            lines.append(
-                f"- Sugestoes novas: {len(ns)} ({sample}{'...' if len(first) > 80 else ''})"
-            )
+            lines.append("  Responda: aceito N ou recuso N.")
 
         pa, pr = applied.get("pending_added", 0), applied.get("pending_removed", 0)
         if pa or pr:
@@ -355,5 +422,5 @@ Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
         if len(lines) == 2 and lines[-1] == "- Atencao: nenhum ajuste.":
             lines.insert(1, "- Nenhuma mudanca relevante esta semana.")
 
-        lines.append(f"- Automacoes do agente: {agent_autos_count} ativas")
+        lines.append(f"- Avisos permanentes: {agent_autos_count} ativos")
         return "\n".join(lines)

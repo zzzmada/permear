@@ -1,198 +1,212 @@
-"""CRUD for agent-created automations, in-process (v9.0-final).
+"""Standing notification rules, in-process (v9.17).
 
-Replaces the shell scripts manage_agent_automations.py +
-build_automation_spec.py + write_pending_spec.py. Same target file:
-/config/automations/permear_agent.yaml (loaded by HA's automation include).
+A rule is something the resident asked to be told: a trigger, an optional
+condition and a message. Not an HA automation: a YAML file only works where
+configuration.yaml happens to include it, and a HACS install must not depend on
+that. The rules live in the integration's own data, are evaluated by the
+Heartbeat module and only ever speak; nothing here touches a device.
 
-What changed with the in-process port:
-- entity validation via hass.states (no REST, no token);
-- automation reload via hass.services ("automation"/"reload");
-- the Supervisor pre-reload config check was dropped — the written YAML is
-  re-parsed before reload and rolled back if invalid (the stronger guard);
-- the pending spec lives in the Telegram handler's memory, not in
-  pending_auto_spec.json / input_text (no shell state).
-
-The agent CREATES nothing on its own — every write here is user-confirmed
-through the Telegram cards. User-facing strings are PT without underscores
-(rule #19). File I/O in the executor.
+Nothing is created without the resident's yes. The message is assembled in code
+at delivery, with no LLM on that path. User-facing strings are PT.
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
-import time
+import re
 import uuid
 
 from homeassistant.core import HomeAssistant
-from homeassistant.util.yaml import dump as yaml_dump
-from homeassistant.util.yaml import load_yaml, parse_yaml
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
-    AGENT_ACTION_DOMAINS,
-    AGENT_AUTOMATIONS_RELATIVE_PATH,
+    RULE_ALIAS_MAX_BYTES,
+    RULE_CONDITION_MARKERS,
+    CONDITION_MAX_SECONDS,
+    CONDITION_Q_COMPANION,
+    CONDITION_Q_DURATION,
+    CONDITION_Q_PRESENCE,
+    CONDITION_WHEN_IGNORED,
+    CONDITION_WHEN_MATTERS,
     MAX_AGENT_AUTOMATIONS,
+    PRESENCE_RECENT_MINUTES,
+    SIGNAL_RULES_CHANGED,
+    SILENT_STATES,
+    STANDING_RULES_RELATIVE_PATH,
 )
+from .storage import load_json, locked_json_update
 
 _LOGGER = logging.getLogger(__name__)
 
+# The only template a message may carry: the state of an entity. The text comes
+# from an LLM, so anything else in {{ }} or {% %} is refused.
+_MESSAGE_STATE_RE = re.compile(r"\{\{\s*states\(\s*'([\w.]+)'\s*\)\s*\}\}")
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
+
 
 # ---------------------------------------------------------------------------
-# Spec building — raw ai_task fields → canonical HA automation spec
-# (ports build_automation_spec.py; pure)
+# Spec building — raw ai_task fields → a rule (pure)
 # ---------------------------------------------------------------------------
 
-def build_spec(raw: dict) -> tuple[dict | None, str]:
-    """{alias, trigger_type, trigger_config, action_service, action_entity}
-    → canonical spec. Returns (spec, "") or (None, PT error)."""
+def build_spec(raw: dict, consented_text: str = "") -> tuple[dict | None, str]:
+    """{alias, trigger_type, trigger_config, action_message, condition_*}
+    → rule. Returns (rule, "") or (None, PT reason)."""
     alias = str(raw.get("alias", "")).strip()
     if not alias:
         return None, "alias vazio"
+    if len(alias.encode("utf-8")) > RULE_ALIAS_MAX_BYTES:
+        return None, (f"apelido excede {RULE_ALIAS_MAX_BYTES} bytes; "
+                      "acentos e emojis ocupam mais espaco")
 
-    trigger_type = str(raw.get("trigger_type", "time"))
-    trigger = _build_trigger(trigger_type, raw.get("trigger_config", ""))
+    trigger = _build_trigger(raw.get("trigger_type"), raw.get("trigger_config"))
     if not trigger:
-        tc_repr = str(raw.get("trigger_config", ""))[:80]
-        return None, f"gatilho invalido (tipo '{trigger_type}', config '{tc_repr}')"
+        return None, "gatilho nao suportado"
 
-    action_service = str(raw.get("action_service", "")).strip()
-    action_entity = str(raw.get("action_entity", "")).strip()
-    if not action_service or not action_entity:
-        return None, (f"acao invalida (service '{action_service}', "
-                      f"entidade '{action_entity}')")
-    if action_service.partition(".")[0] not in AGENT_ACTION_DOMAINS:
-        return None, f"servico nao permitido ('{action_service}')"
+    message = str(raw.get("action_message", "")).strip()
+    if not message:
+        return None, "aviso sem mensagem"
+    rest = _MESSAGE_STATE_RE.sub("", message)
+    if "{{" in rest or "{%" in rest:
+        return None, "mensagem com modelo nao permitido"
+
+    # A condition the rule cannot carry is a refusal, never a silent drop: the
+    # resident said yes to "at 18h if someone is home", not to "at 18h".
+    condition = _build_condition(raw.get("condition_config"), trigger)
+    if condition is None:
+        return None, "condicao nao suportada"
+    expresses_condition = any(
+        re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", consented_text.casefold())
+        for marker in RULE_CONDITION_MARKERS
+    )
+    if not condition and expresses_condition:
+        return None, "a condicao aceita nao foi preservada"
+    if not condition and str(raw.get("condition_text") or "").strip():
+        return None, "condicao nao suportada"
 
     return {
-        "id": f"agent_auto_{uuid.uuid4().hex[:8]}",
+        "id": f"aviso_{uuid.uuid4().hex[:8]}",
         "alias": alias,
         "trigger": trigger,
-        "action": [{"service": action_service,
-                    "target": {"entity_id": action_entity}}],
-        "mode": "single",
-        "initial_state": "on",
+        "condition": condition,
+        "message": message,
     }, ""
 
 
-def _build_trigger(trigger_type: str, config_raw) -> list | None:
-    if isinstance(config_raw, dict):
-        cfg = config_raw
-    elif isinstance(config_raw, str):
-        config_str = config_raw.strip()
-        if not config_str or config_str.lower() in ("null", "none", "{}", ""):
+def _build_trigger(trigger_type, config_raw) -> dict | None:
+    """{'at': 'HH:MM:SS'} or {'entity_id': x, 'to': state}."""
+    cfg = _as_dict(config_raw)
+    if not cfg:
+        return None
+    if trigger_type == "time" and _TIME_RE.match(str(cfg.get("at", ""))):
+        return {"at": str(cfg["at"])}
+    if trigger_type == "state" and cfg.get("entity_id") and cfg.get("to"):
+        return {"entity_id": str(cfg["entity_id"]), "to": str(cfg["to"])}
+    return None
+
+
+def _build_condition(config_raw, trigger: dict) -> dict | None:
+    """{} when none was given, a condition of the closed v9.13 schema, or None
+    when one was given and does not fit it."""
+    if config_raw is None or config_raw == {} or (
+        isinstance(config_raw, str)
+        and config_raw.strip().lower() in ("", "null", "none", "{}", "[]")
+    ):
+        return {}
+    cfg = _as_dict(config_raw)
+    if not cfg:
+        return None
+    when = CONDITION_WHEN_MATTERS
+    if cfg.get("condition") == "not":
+        nested = cfg.get("conditions")
+        if not isinstance(nested, list) or len(nested) != 1:
             return None
-        try:
-            cfg = json.loads(config_str)
-        except json.JSONDecodeError:
-            try:
-                cfg = ast.literal_eval(config_str)
-            except (ValueError, SyntaxError):
-                return None
-    else:
+        cfg, when = nested[0], CONDITION_WHEN_IGNORED
+        if not isinstance(cfg, dict):
+            return None
+    kind = cfg.get("condition")
+    if kind == "state" and cfg.get("entity_id") and "state" in cfg:
+        return {"q": CONDITION_Q_COMPANION, "when": when,
+                "entity_id": str(cfg["entity_id"]), "state": str(cfg["state"])}
+    if kind == CONDITION_Q_PRESENCE:
+        return {"q": CONDITION_Q_PRESENCE, "when": when,
+                "minutes": PRESENCE_RECENT_MINUTES}
+    # A state's duration can only be waited for, and only from a state trigger:
+    # "held at most N" has no moment at which it could fire.
+    if (kind == CONDITION_Q_DURATION and when == CONDITION_WHEN_MATTERS
+            and "entity_id" in trigger):
+        seconds = cfg.get("min_seconds")
+        if isinstance(seconds, int) and 0 < seconds <= CONDITION_MAX_SECONDS:
+            return {"q": CONDITION_Q_DURATION, "when": when,
+                    "min_seconds": seconds}
+    return None
+
+
+def _as_dict(raw) -> dict | None:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except json.JSONDecodeError:
         return None
-    if not isinstance(cfg, dict):
-        return None
-    cfg.setdefault("platform", trigger_type)
-    return [cfg]
+    return data if isinstance(data, dict) else None
+
+
+def render_message(rule: dict, state_of) -> str | None:
+    """The message with its entity states filled in, in code. None when one of
+    them cannot be read now: a broken sentence is not a message."""
+    missing = False
+
+    def _state(match) -> str:
+        nonlocal missing
+        value = state_of(match.group(1))
+        if value is None or value in SILENT_STATES:
+            missing = True
+            return ""
+        return value
+
+    text = _MESSAGE_STATE_RE.sub(_state, rule.get("message", ""))
+    return None if missing else " ".join(text.split())
 
 
 # ---------------------------------------------------------------------------
-# PT summaries (cards) — port the telegram.yaml Jinja + script summaries
+# PT summaries (cards)
 # ---------------------------------------------------------------------------
 
 def _entity_pt(eid: str) -> str:
     return eid.split(".")[1].replace("_", " ") if "." in eid else eid
 
 
-def describe_trigger(spec: dict) -> str:
-    triggers = spec.get("trigger") or []
-    t = triggers[0] if triggers else {}
-    platform = t.get("platform", "")
-    if platform == "time":
-        return f"Todo dia as {t.get('at', '?')}"
-    if platform == "state":
-        nome = _entity_pt(t.get("entity_id", "?"))
-        return f"{nome.capitalize()} muda para {t.get('to', 'novo estado')}"
-    if platform == "numeric_state":
-        nome = _entity_pt(t.get("entity_id", "?"))
-        if t.get("above") is not None:
-            return f"{nome.capitalize()} acima de {t['above']}"
-        if t.get("below") is not None:
-            return f"{nome.capitalize()} abaixo de {t['below']}"
-        return f"{nome.capitalize()} valor limite"
-    if platform == "time_pattern":
-        if t.get("hours"):
-            return f"A cada {t['hours']} hora(s)"
-        if t.get("minutes"):
-            return f"A cada {t['minutes']} minuto(s)"
-        return "Padrao de tempo recorrente"
-    if platform == "sun":
-        return ("Ao nascer do sol" if t.get("event") == "sunrise"
-                else "Ao por do sol")
-    if platform == "homeassistant":
-        return "Quando o Home Assistant inicia"
-    return "Gatilho configurado"
+def describe_when(rule: dict) -> str:
+    trigger = rule.get("trigger") or {}
+    if "at" in trigger:
+        return f"Todo dia as {trigger['at']}"
+    return (f"{_entity_pt(trigger.get('entity_id', '?')).capitalize()} "
+            f"muda para {trigger.get('to', '?')}")
 
 
-_ACTION_VERBS_PT = {
-    ("light", "turn_on"): "Ligar luz",
-    ("light", "turn_off"): "Desligar luz",
-    ("climate", "turn_on"): "Ligar ar condicionado",
-    ("climate", "turn_off"): "Desligar ar condicionado",
-    ("climate", "set_temperature"): "Ajustar temperatura",
-    ("media_player", "turn_on"): "Ligar midia",
-    ("media_player", "turn_off"): "Desligar midia",
-}
+def describe_condition(rule: dict) -> str:
+    condition = rule.get("condition") or {}
+    negated = condition.get("when") == CONDITION_WHEN_IGNORED
+    q = condition.get("q")
+    if q == CONDITION_Q_COMPANION:
+        relation = "nao esta" if negated else "esta"
+        return (f"se {_entity_pt(condition['entity_id'])} {relation} em "
+                f"{condition['state']}")
+    if q == CONDITION_Q_PRESENCE:
+        return "se houver alguem em casa" if negated else "se nao houver ninguem em casa"
+    if q == CONDITION_Q_DURATION:
+        return f"depois de {condition['min_seconds']}s nesse estado"
+    return ""
 
 
-def describe_action(spec: dict) -> str:
-    actions = spec.get("action") or []
-    a = actions[0] if actions else {}
-    svc = a.get("service", a.get("action", ""))
-    domain, _, cmd = svc.partition(".")
-    eid = (a.get("target") or {}).get("entity_id", a.get("entity_id", ""))
-    nome = _entity_pt(eid) if eid else ""
-
-    label = _ACTION_VERBS_PT.get((domain, cmd))
-    if label:
-        return f"{label} {nome}".strip()
-    if domain == "switch":
-        verb = "Ligar" if cmd == "turn_on" else "Desligar"
-        return f"{verb} {nome or 'dispositivo'}"
-    if domain == "script":
-        return f"Executar script {nome}".strip()
-    if cmd == "turn_on":
-        return f"Ligar {nome or svc}"
-    if cmd == "turn_off":
-        return f"Desligar {nome or svc}"
-    return svc or "acao configurada"
+def describe_trigger(rule: dict) -> str:
+    condition = describe_condition(rule)
+    return f"{describe_when(rule)}, {condition}" if condition else describe_when(rule)
 
 
-def _summarize_trigger_short(triggers) -> str:
-    """Short PT trigger summary for the list card (ports _summarize_trigger)."""
-    if not triggers:
-        return "sem gatilho"
-    if not isinstance(triggers, list):
-        triggers = [triggers]
-    t = triggers[0]
-    platform = t.get("platform", "?")
-    if platform == "time":
-        return f"todo dia as {t.get('at', '?')}"
-    if platform == "state":
-        to = t.get("to")
-        entity = t.get("entity_id", "?")
-        return f"{entity} mudar para {to}" if to else f"{entity} mudar de estado"
-    if platform == "numeric_state":
-        entity = t.get("entity_id", "?")
-        if t.get("above") is not None:
-            return f"{entity} acima de {t['above']}"
-        if t.get("below") is not None:
-            return f"{entity} abaixo de {t['below']}"
-        return f"{entity} (valor numerico)"
-    if platform == "time_pattern":
-        return "padrao de tempo recorrente"
-    return f"gatilho {platform}"
+def describe_action(rule: dict) -> str:
+    return f"Avisar: {rule.get('message', '')}"
 
 
 # ---------------------------------------------------------------------------
@@ -200,180 +214,83 @@ def _summarize_trigger_short(triggers) -> str:
 # ---------------------------------------------------------------------------
 
 class AgentAutomations:
-    """Read/create/remove automations in permear_agent.yaml."""
+    """Read/create/remove the standing rules."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
-        self._path = hass.config.path(AGENT_AUTOMATIONS_RELATIVE_PATH)
-
-    # -- reads ----------------------------------------------------------
+        self._path = hass.config.path(STANDING_RULES_RELATIVE_PATH)
 
     async def async_list(self) -> dict:
-        autos = await self._hass.async_add_executor_job(self._load)
+        rules = await self._hass.async_add_executor_job(self._load)
         items = [
-            {
-                "id": a.get("id", ""),
-                "alias": a.get("alias", "sem nome"),
-                "enabled": a.get("initial_state", "on") == "on",
-                "trigger_summary": _summarize_trigger_short(a.get("trigger", [])),
-            }
-            for a in autos
+            {"id": r.get("id", ""), "alias": r.get("alias", "sem nome"),
+             "trigger_summary": describe_trigger(r)}
+            for r in rules
         ]
         return {"count": len(items), "automations": items}
 
     async def async_list_text(self) -> str:
         """PT text for the LIST_AUTOS agent token."""
-        autos = await self._hass.async_add_executor_job(self._load)
-        if not autos:
-            return "Nenhuma automacao criada ainda."
-        lines = [f"Automacoes ativas ({len(autos)}):"]
-        for i, a in enumerate(autos, 1):
-            triggers = a.get("trigger") or []
-            actions = a.get("action") or []
-            lines.append(f"{i}. {a.get('alias', '?')} "
-                         f"({len(triggers)} gatilho, {len(actions)} acao)")
+        rules = await self._hass.async_add_executor_job(self._load)
+        if not rules:
+            return "Nenhum aviso criado ainda."
+        lines = [f"Avisos ativos ({len(rules)}):"]
+        lines += [f"{i}. {r.get('alias', '?')} ({describe_trigger(r)})"
+                  for i, r in enumerate(rules, 1)]
         return "\n".join(lines)
 
     def _load(self) -> list:
-        try:
-            data = load_yaml(self._path)
-        except (FileNotFoundError, OSError):
-            return []
-        except Exception as exc:  # noqa: BLE001 — corrupted file must not crash
-            _LOGGER.warning("Cannot parse %s: %s", self._path, exc)
-            return []
-        return data if isinstance(data, list) else []
+        rules = load_json(self._path, [])
+        return rules if isinstance(rules, list) else []
 
-    # -- create ---------------------------------------------------------
-
-    async def async_create(self, spec: dict) -> str:
-        """Validate + append + reload. Returns the PT result message."""
-        alias = str(spec.get("alias", "")).strip()
+    async def async_create(self, rule: dict) -> str:
+        """Validate + persist. Returns the PT result message."""
+        alias = str(rule.get("alias", "")).strip()
         if not alias:
-            return "Erro: a automacao precisa de um nome."
-
-        trigger = spec.get("trigger")
-        if isinstance(trigger, dict):
-            trigger = [trigger]
-        if not trigger:
-            return "Erro: a automacao precisa de um gatilho."
-        action = spec.get("action")
-        if isinstance(action, dict):
-            action = [action]
-        if not action:
-            return "Erro: a automacao precisa de uma acao."
-        for a in action:
-            if "action" in a and "service" not in a:
-                a["service"] = a.pop("action")
-
-        # Action-domain allowlist — the spec text comes from an LLM; never
-        # write homeassistant.*/shell_command.*/python_script.* automations
-        for a in action:
-            svc = str(a.get("service", ""))
-            if svc.partition(".")[0] not in AGENT_ACTION_DOMAINS:
-                return f"Erro: servico '{svc}' nao permitido em automacoes do agente."
-
-        # Entity validation straight from the state machine (no REST)
-        for ent_id in self._referenced_entities(trigger, action):
+            return "Erro: o aviso precisa de um nome."
+        for ent_id in self._referenced_entities(rule):
             if self._hass.states.get(ent_id) is None:
                 return f"Erro: a entidade {ent_id} nao existe no Home Assistant."
-
-        spec = {
-            "alias": alias,
-            "id": spec.get("id") or f"permear_agent_{int(time.time())}",
-            "trigger": trigger,
-            "condition": spec.get("condition", []),
-            "action": action,
-            "mode": spec.get("mode", "single"),
-            "initial_state": spec.get("initial_state", "on"),
-        }
-
-        error = await self._hass.async_add_executor_job(self._append, spec)
+        error = await self._hass.async_add_executor_job(self._append, rule)
         if error:
             return error
-
-        reloaded = await self._reload()
-        if reloaded:
-            return f"Automacao criada: '{alias}'. Ativa imediatamente."
-        return (f"Automacao criada: '{alias}'. O reload falhou — "
-                "ativa no proximo reinicio do Home Assistant.")
+        async_dispatcher_send(self._hass, SIGNAL_RULES_CHANGED)
+        return f"Aviso criado: '{alias}'. Ativo a partir de agora."
 
     @staticmethod
-    def _referenced_entities(trigger: list, action: list):
-        for t in trigger:
-            if isinstance(t, dict) and t.get("entity_id"):
-                yield t["entity_id"]
-        for a in action:
-            if not isinstance(a, dict):
-                continue
-            if (a.get("data") or {}).get("entity_id"):
-                yield a["data"]["entity_id"]
-            if (a.get("target") or {}).get("entity_id"):
-                yield a["target"]["entity_id"]
+    def _referenced_entities(rule: dict):
+        for part in (rule.get("trigger") or {}, rule.get("condition") or {}):
+            if part.get("entity_id"):
+                yield part["entity_id"]
+        yield from _MESSAGE_STATE_RE.findall(rule.get("message", ""))
 
-    def _append(self, spec: dict) -> str:
-        """Executor: append + write + revalidate, rollback on bad YAML."""
-        autos = self._load()
-        if len(autos) >= MAX_AGENT_AUTOMATIONS:
-            return (f"Limite de {MAX_AGENT_AUTOMATIONS} automacoes atingido. "
-                    "Remova uma antes de criar outra.")
-        alias_lower = spec["alias"].lower()
-        for a in autos:
-            if str(a.get("alias", "")).lower() == alias_lower:
-                return f"Ja existe uma automacao chamada '{spec['alias']}'."
-        autos.append(spec)
-        if not self._write_validated(autos):
-            autos.pop()
-            self._write_validated(autos)
-            return "Erro ao gravar a automacao (YAML invalido). Nada foi criado."
+    def _append(self, rule: dict) -> str:
+        with locked_json_update(self._path, []) as rules:
+            if len(rules) >= MAX_AGENT_AUTOMATIONS:
+                return (f"Limite de {MAX_AGENT_AUTOMATIONS} avisos atingido. "
+                        "Remova um antes de criar outro.")
+            alias_lower = rule["alias"].lower()
+            if any(str(r.get("alias", "")).lower() == alias_lower for r in rules):
+                return f"Ja existe um aviso chamado '{rule['alias']}'."
+            rules.append(rule)
         return ""
-
-    # -- remove ---------------------------------------------------------
 
     async def async_remove(self, identifier: str) -> str:
         result = await self._hass.async_add_executor_job(self._remove, identifier)
-        if result.startswith("Automacao removida"):
-            await self._reload()
+        if result.startswith("Aviso removido"):
+            async_dispatcher_send(self._hass, SIGNAL_RULES_CHANGED)
         return result
 
     def _remove(self, identifier: str) -> str:
-        autos = self._load()
         ident = identifier.strip().lower()
-        idx = next(
-            (i for i, a in enumerate(autos)
-             if str(a.get("id", "")).lower() == ident
-             or str(a.get("alias", "")).lower() == ident),
-            None,
-        )
-        if idx is None:
-            return f"Nenhuma automacao encontrada com o nome '{identifier}'."
-        removed = autos.pop(idx)
-        if not self._write_validated(autos):
-            autos.insert(idx, removed)
-            self._write_validated(autos)
-            return "Erro ao gravar a remocao (YAML invalido). Automacao restaurada."
-        return f"Automacao removida: '{removed.get('alias', identifier)}'."
-
-    # -- shared ---------------------------------------------------------
-
-    def _write_validated(self, autos: list) -> bool:
-        """Validate, then write — invalid YAML never touches the file."""
-        try:
-            text = yaml_dump(autos)
-            parse_yaml(text)
-            with open(self._path, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.error("Agent automations YAML write failed: %s", exc)
-            return False
-
-    async def _reload(self) -> bool:
-        try:
-            await self._hass.services.async_call(
-                "automation", "reload", {}, blocking=True
+        with locked_json_update(self._path, []) as rules:
+            idx = next(
+                (i for i, r in enumerate(rules)
+                 if ident in (str(r.get("id", "")).lower(),
+                              str(r.get("alias", "")).lower())),
+                None,
             )
-            return True
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("automation.reload failed: %s", exc)
-            return False
+            if idx is None:
+                return f"Nenhum aviso encontrado com o nome '{identifier}'."
+            removed = rules.pop(idx)
+        return f"Aviso removido: '{removed.get('alias', identifier)}'."

@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING
 
 from .const import (
     SCHEMA_VERSION,
+    ARAS_STATS_RELATIVE_PATH,
+    CONDITIONAL_RULE_KIND,
     BATTERY_RENOTIFY_DAYS,
     DRY_BOOST_EXCLUDED_DOMAINS,
     NOISE_BINARY_DEVICE_CLASSES,
@@ -41,17 +43,22 @@ from .const import (
     ENGAGEMENT_DELTA_MIN,
     ENGAGEMENT_EVIDENCE_DAYS,
     ENGAGEMENT_MIN_ALERTS,
+    EVIDENCE_MAX_CHARS,
+    EVIDENCE_MAX_PER_SUBJECT,
     EVENT_LOG_RETENTION_DAYS,
     MEMORY_ACTIVE_DEMOTE_DAYS,
     MEMORY_ACTIVE_PROMOTE_MENTIONS,
     MEMORY_ACTIVE_PROMOTE_WINDOW,
     MEMORY_EPHEMERAL_FADE_DAYS,
     MEMORY_RULE_FADE_DAYS,
+    MEMORY_SYSTEM_SOURCES,
     NOCTURNAL_HABIT_MIN_DAYS,
     NOCTURNAL_LOOKBACK_DAYS,
     PRESENCE_RECENT_MINUTES,
     MEMORY_FTS_MIN_SCORE,
     RULE_MENTION_HISTORY_MAX,
+    SUGGESTION_PENDING_DAYS,
+    SUGGESTION_REFUSAL_DAYS,
     CONVERSATION_MEMORY_MAX_ROUTINES,
     CONVERSATION_MEMORY_MAX_RULES,
     MEMORY_STABLE_DEMOTE_DAYS,
@@ -116,6 +123,32 @@ def locked_json_update(path: str, default=None):
             os.replace(tmp_path, path)
         finally:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+# v9.11 — the system's OWN bookkeeping: rows the Heartbeat writes to count how
+# often ARAS evaluated a key (content = a bare device name or a dry state, no
+# hour, no co-occurrence), plus a Sleep row that ended up under an `event:` key
+# (its count is the device's emissions, not repetitions of its text). They stay
+# in the table — they are the novelty dedup and the reinforce ballast, and
+# their TIER keeps feeding the priority floor — but they are not knowledge the
+# house taught: never relabelled 'pattern', never counted in the maturity.
+_BOOKKEEPING_SQL = "(source = 'heartbeat' OR COALESCE(key, '') LIKE 'event:%')"
+
+
+def _is_bookkeeping(item: dict) -> bool:
+    return item.get("source") == "heartbeat" or (
+        item.get("key") or ""
+    ).startswith("event:")
+
+
+def _evidence_norm(text: str) -> str:
+    """Same wording ignoring case, accents and spacing. Nothing subtler: the
+    hour in "ligada às 16h46" vs "às 19h10" is exactly what a frozen content
+    loses, and a similarity threshold would drop it."""
+    flat = unicodedata.normalize("NFD", text or "")
+    return " ".join(
+        "".join(c for c in flat if unicodedata.category(c) != "Mn").lower().split()
+    )
 
 
 def _today_local() -> str:
@@ -478,8 +511,16 @@ class PermearStorage:
                     (today, battery_floor),
                 )
             ]
+            # v9.11 — the system's own bookkeeping is not maturity: counting
+            # it held the threshold at MAX by the filter's own accounting
+            # (27 of 42 consolidated rows on 29/10 were heartbeat counters).
             consolidated = self._conn.execute(
                 "SELECT COUNT(*) FROM memory_items WHERE tier IN ('active','stable')"
+                f" AND NOT {_BOOKKEEPING_SQL} AND kind != ?"
+                # v9.14 — what Systems wrote is the system's own suggestion, not
+                # something the house taught: same class as the bookkeeping.
+                " AND source != 'systems'",
+                (CONDITIONAL_RULE_KIND,),
             ).fetchone()[0]
             # Learned restrictions (v9.0.2) — biological: a faded restriction
             # stops applying and the subject re-emerges. Few rows; the
@@ -579,6 +620,38 @@ class PermearStorage:
             self._note_emission(item_id)
         return item_id, was_new, via
 
+    async def async_record_seen(
+        self, content: str, key: str | None, metadata: dict | None
+    ) -> None:
+        """A gray candidate that was evaluated and left out of the delivered
+        text (v9.14). Not an emission."""
+        await self._hass.async_add_executor_job(
+            self._record_seen, content, key, metadata
+        )
+
+    def _record_seen(self, content: str, key: str | None, metadata: dict | None):
+        """Touches last_seen so the key stays in today's recent_keys and the
+        subject is not re-evaluated all day, which is the batch's old effect on
+        the voice. No mention, no emits: a row with no history is still born,
+        because novelty needs a row to read."""
+        clean_key = (key.strip() or None) if key else None
+        if not clean_key:
+            return
+        assert self._conn is not None
+        with self._lock:
+            touched = self._conn.execute(
+                "UPDATE memory_items SET last_seen = ? WHERE id = ("
+                "SELECT id FROM memory_items WHERE key = ?"
+                " ORDER BY last_seen DESC LIMIT 1)",
+                (datetime.now().isoformat(), clean_key),
+            ).rowcount
+            self._conn.commit()
+        if not touched:
+            self._add_or_reinforce(
+                content.strip(), kind="observation", source="heartbeat",
+                key=clean_key, metadata=metadata,
+            )
+
     def _note_emission(self, item_id: int) -> None:
         """Append the emission timestamp to metadata.emits (bounded list).
 
@@ -649,15 +722,21 @@ class PermearStorage:
                     (key,),
                 ).fetchone()
                 if hit:
-                    self._reinforce_row_locked(hit, now)
+                    self._reinforce_row_locked(hit, now, content, source)
                     self._conn.commit()
                     return hit["id"], False, "key"
-            if kind == "interaction":
+            # v9.15 — the system's own text never goes through FTS, not even
+            # against itself: its sentences share the same verbs, so bm25 matched
+            # "Criar automacao para..." and two unrelated suggestions became one
+            # row, one of them a suggestion the resident had refused. Same class
+            # as interactions (v9.4.1) and rules (v9.9): exact words or a new row.
+            system_text = not key and source in MEMORY_SYSTEM_SOURCES
+            if kind == "interaction" or system_text:
                 hit = self._conn.execute(
                     "SELECT id, tier, first_seen FROM memory_items"
-                    " WHERE kind = 'interaction' AND content = ?"
-                    " ORDER BY last_seen DESC LIMIT 1",
-                    (content,),
+                    f" WHERE {'source = ?' if system_text else 'kind = ?'}"
+                    " AND content = ? ORDER BY last_seen DESC LIMIT 1",
+                    (source if system_text else kind, content),
                 ).fetchone()
                 if hit:
                     self._reinforce_row_locked(hit, now)
@@ -686,14 +765,20 @@ class PermearStorage:
                         " bm25(memory_fts) AS score"
                         " FROM memory_fts JOIN memory_items m"
                         " ON m.id = memory_fts.rowid"
-                        " WHERE memory_fts MATCH ? AND m.kind = ?"
+                        # v9.15 — similar words prove nothing across origins:
+                        # Systems text resurrected a faded house row, and Sleep
+                        # text reinforced Systems rows. Same source or no merge.
+                        " WHERE memory_fts MATCH ? AND m.kind = ? AND m.source = ?"
+                        # v9.14 — since v9.11 the counters are 'observation' too;
+                        # a Sleep memory must not vanish into a bare device name.
+                        f" AND NOT {_BOOKKEEPING_SQL}"
                         " ORDER BY score LIMIT 1",
-                        (_fts_query(content), kind),
+                        (_fts_query(content), kind, source),
                     ).fetchall()
                 except sqlite3.OperationalError:
                     rows = []  # FTS query parse issue -> treat as no match
             if rows and rows[0]["score"] <= MEMORY_FTS_MIN_SCORE:
-                self._reinforce_row_locked(rows[0], now)
+                self._reinforce_row_locked(rows[0], now, content, source)
                 self._conn.commit()
                 return rows[0]["id"], False, "fts"
             cur = self._conn.execute(
@@ -741,7 +826,9 @@ class PermearStorage:
                 return r
         return None
 
-    def _reinforce_row_locked(self, row, now: str) -> None:
+    def _reinforce_row_locked(
+        self, row, now: str, content: str | None = None, source: str | None = None
+    ) -> None:
         """Reinforce one matched row (caller holds the lock) with epoch rules.
 
         - faded row → resurrect as a fresh ephemeral (new epoch). The key/FTS
@@ -753,6 +840,9 @@ class PermearStorage:
           first_seen, so a demoted or long-lived row otherwise sat below the
           window forever no matter how often it was mentioned.
         - anything else → plain reinforce (mention_count+1, last_seen).
+
+        v9.14 — `content` stays frozen (rule #22), but a mention that says
+        something new is no longer thrown away: see _note_evidence_locked.
         """
         stale_ephemeral = (
             row["tier"] == "ephemeral"
@@ -775,6 +865,43 @@ class PermearStorage:
                 " last_seen = ? WHERE id = ?",
                 (now, row["id"]),
             )
+        self._note_evidence_locked(row["id"], content, source, now)
+
+    def _note_evidence_locked(
+        self, item_id: int, content: str | None, source: str | None, now: str
+    ) -> None:
+        """Keep a wording this row has not seen, with its date and origin.
+
+        In metadata.evidence, on the subject's own row: one subject stays one
+        row, so nothing that counts rows (maturity, priority) can read it as a
+        new subject. Nothing reads it yet. Left out: bookkeeping (a dry state
+        line is not a description), and speech and rules, which have their own
+        exact-content and metadata.mentions histories."""
+        if not content or source in MEMORY_SYSTEM_SOURCES:
+            return
+        row = self._conn.execute(
+            "SELECT content, key, kind, source, metadata FROM memory_items"
+            " WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None or row["kind"] not in ("observation", "pattern"):
+            return
+        if row["source"] != source or _is_bookkeeping(dict(row)):
+            return
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        evidence = list(meta.get("evidence") or [])
+        known = {_evidence_norm(row["content"])}
+        known.update(_evidence_norm(e.get("text")) for e in evidence)
+        if _evidence_norm(content) in known:
+            return
+        evidence.append({
+            "text": content[:EVIDENCE_MAX_CHARS], "at": now, "source": source,
+        })
+        meta["evidence"] = evidence[-EVIDENCE_MAX_PER_SUBJECT:]
+        self._conn.execute(
+            "UPDATE memory_items SET metadata = ? WHERE id = ?",
+            (json.dumps(meta, ensure_ascii=False), item_id),
+        )
 
     def _update_metadata(self, item_id: int, patch: dict) -> bool:
         assert self._conn is not None
@@ -902,6 +1029,53 @@ class PermearStorage:
             )
         return {"id": item_id, "scope": scope, "insight_id": insight_id}
 
+    async def async_add_conditional_rule(
+        self, content: str, entity_id: str, condition: dict
+    ) -> dict:
+        """Persist one rule that carries its condition (v9.13). Inert until a
+        cycle consumes it: its own kind, so nothing that reads 'behavior_rule'
+        sees it."""
+        return await self._hass.async_add_executor_job(
+            self._add_conditional_rule, content, entity_id, condition
+        )
+
+    def _add_conditional_rule(
+        self, content: str, entity_id: str, condition: dict
+    ) -> dict:
+        """One row per entity + qualifier, in its own key namespace: a plain
+        refusal of the same entity (key 'restriction:<eid>') must never land on
+        this row and go inert with it. source='daily' because the 'interaction'
+        readers feed Sleep and engagement as if it were the resident's speech.
+        A re-statement keeps the row and takes the latest condition: the key
+        already says it is the same subject and the same qualifier."""
+        item_id, was_new, _via = self._add_or_reinforce(
+            content, kind=CONDITIONAL_RULE_KIND, source="daily",
+            key=f"condition:{entity_id}:{condition['q']}",
+            metadata={"entity_id": entity_id, "condition": condition},
+        )
+        self._update_metadata(item_id, {"condition": condition})
+        self._note_rule_mention(item_id, content, None, None)
+        _LOGGER.info(
+            "Conditional rule %s %s: %r %s", item_id,
+            "created" if was_new else "reinforced", content, condition,
+        )
+        return {"id": item_id, "new": was_new}
+
+    async def async_count_conditions(self, captured: int, discarded: int) -> None:
+        """Conditions taught today, for the day's ARAS stats (v9.13). The ratio
+        is what validates or refutes the three qualifiers; it is never told to
+        the resident."""
+        if captured or discarded:
+            await self._hass.async_add_executor_job(
+                self._count_conditions, captured, discarded
+            )
+
+    def _count_conditions(self, captured: int, discarded: int) -> None:
+        path = self._hass.config.path(ARAS_STATS_RELATIVE_PATH)
+        with locked_json_update(path, {}) as s:
+            s["cond_captured"] = s.get("cond_captured", 0) + captured
+            s["cond_discarded"] = s.get("cond_discarded", 0) + discarded
+
     def _note_rule_mention(
         self, item_id: int, content: str, scope: str, insight_id
     ) -> None:
@@ -919,7 +1093,7 @@ class PermearStorage:
             if row is None:
                 return
             meta = json.loads(row["metadata"]) if row["metadata"] else {}
-            if not meta.get("scope"):
+            if scope and not meta.get("scope"):
                 meta["scope"] = scope
                 if insight_id is not None:
                     meta["insight_id"] = insight_id
@@ -1088,7 +1262,7 @@ class PermearStorage:
             # Refused before → stays refused. Durable + idempotent: the flag
             # survives the weekly Systems reinforce (which only bumps
             # mention_count/last_seen, never metadata).
-            if meta.get("rejected"):
+            if meta.get("rejected") or meta.get("accepted_at"):
                 continue
             # The resident refused this subject (an active restriction names
             # the entity). Mark rejected so it stops reappearing — biological:
@@ -1113,6 +1287,98 @@ class PermearStorage:
                 }
             )
         return result
+
+    # ------------------------------------------------------------------
+    # v9.16 — suggestions the resident can answer.
+    # ------------------------------------------------------------------
+
+    async def async_pending_suggestions(self) -> list:
+        """Suggestions still answerable, oldest first. Read-only."""
+        return await self._hass.async_add_executor_job(self._pending_suggestions)
+
+    def _pending_suggestions(self) -> list:
+        """A Systems suggestion nobody answered, reinforced within the window.
+        No state of its own: the row, its date and its answer are the state, so
+        a restart loses nothing."""
+        assert self._conn is not None
+        cutoff = (
+            datetime.now() - timedelta(days=SUGGESTION_PENDING_DAYS)
+        ).isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content, metadata FROM memory_items"
+                " WHERE source = 'systems' AND last_seen >= ?"
+                " ORDER BY first_seen, id",
+                (cutoff,),
+            ).fetchall()
+        pending = []
+        for r in rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if (meta.get("insight_type") == "suggestion"
+                    and not meta.get("rejected") and not meta.get("accepted_at")):
+                pending.append({"id": r["id"], "content": r["content"]})
+        return pending
+
+    async def async_presence_idle_minutes(self, entity_ids) -> float | None:
+        """Minutes since the last presence event, for a standing rule's
+        condition (v9.17). None with no sensors or no record."""
+        ids = sorted(entity_ids)
+        if not ids:
+            return None
+        return await self._hass.async_add_executor_job(
+            self._presence_idle_minutes, ids
+        )
+
+    def _presence_idle_minutes(self, ids: list) -> float | None:
+        assert self._conn is not None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM event_log"
+                f" WHERE entity_id IN ({','.join('?' * len(ids))})",
+                ids,
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        return (datetime.now() - _parse_iso(row[0])).total_seconds() / 60
+
+    async def async_answer_suggestion(self, item_id: int, accepted: bool) -> None:
+        """Record the resident's answer on the suggestion's row. `rejected` is
+        the flag _system_insights already honours."""
+        now = datetime.now().isoformat()
+        patch = (
+            {"accepted_at": now} if accepted
+            else {"rejected": True, "refused_at": now}
+        )
+        await self._hass.async_add_executor_job(
+            self._update_metadata, item_id, patch
+        )
+
+    async def async_suggestion_blocked(self, subject: str) -> bool:
+        return await self._hass.async_add_executor_job(
+            self._suggestion_blocked, subject
+        )
+
+    def _suggestion_blocked(self, subject: str) -> bool:
+        """This entity + action was answered: accepted, or refused within its
+        horizon. By the row of the SUBJECT, so the wording plays no part. A
+        refusal past its horizon is cleared and the subject can return."""
+        assert self._conn is not None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, metadata FROM memory_items WHERE key = ?",
+                (f"suggestion:{subject}",),
+            ).fetchone()
+        meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
+        if meta.get("accepted_at"):
+            return True
+        refused = meta.get("refused_at")
+        if not refused:
+            return False
+        floor = datetime.now() - timedelta(days=SUGGESTION_REFUSAL_DAYS)
+        if _parse_iso(refused) >= floor:
+            return True
+        self._update_metadata(row["id"], {"rejected": False, "refused_at": None})
+        return False
 
     # ------------------------------------------------------------------
     # v8.10 — Sleep / Systems reads and writes.
@@ -1290,13 +1556,14 @@ class PermearStorage:
                 meta = json.loads(r["metadata"]) if r["metadata"] else {}
                 emits = meta.get("emits") or []
                 reactions = meta.get("reactions") or []
-                if emits:
-                    # one reaction per emission at most — a second reply inside
-                    # the window must not double-credit the same alert
-                    if reactions and reactions[-1] >= emits[-1]:
-                        continue
-                elif meta.get("reacted"):
-                    continue  # legacy row without emission history
+                # v9.14 — last_seen also moves on a subject that was only seen;
+                # a reply can only be to something that was actually said.
+                if not emits or emits[-1] < cutoff:
+                    continue
+                # one reaction per emission at most — a second reply inside
+                # the window must not double-credit the same alert
+                if reactions and reactions[-1] >= emits[-1]:
+                    continue
                 reactions.append(now.isoformat())
                 meta["reactions"] = reactions[-EMIT_HISTORY_MAX:]
                 meta["reacted"] = True
@@ -1329,12 +1596,54 @@ class PermearStorage:
 
     def _run_maintenance(self, binary_device_classes: dict | None = None) -> dict:
         scoped = self._converge_restriction_scopes()
+        reclassified = self._reclassify_system_evidence()
         counts = self._tier_maintenance()
         changes = self._update_priority_from_memory(binary_device_classes or {})
         report = {"tiers": counts, "priority_changes": changes,
-                  "restrictions_scoped": scoped}
+                  "restrictions_scoped": scoped,
+                  "evidence_reclassified": reclassified}
         _LOGGER.info("Memory maintenance: %s", report)
         return report
+
+    def _reclassify_system_evidence(self) -> int:
+        """Convergence (v9.15, idempotent): system text recorded as evidence of a
+        house row goes back to what it was, a suggestion on its own row. Only
+        Systems could reach this path, and only as suggestions (01/11: the two
+        of the three announced that never got a row). Nothing is lost: the text
+        moves, and the mention it added to the house row is returned."""
+        assert self._conn is not None
+        moved: list = []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, mention_count, metadata FROM memory_items"
+                " WHERE metadata LIKE '%\"evidence\"%'"
+            ).fetchall()
+            for r in rows:
+                meta = json.loads(r["metadata"])
+                evidence = meta.get("evidence") or []
+                foreign = [e for e in evidence if e.get("source") in MEMORY_SYSTEM_SOURCES]
+                if not foreign:
+                    continue
+                kept = [e for e in evidence if e not in foreign]
+                if kept:
+                    meta["evidence"] = kept
+                else:
+                    meta.pop("evidence", None)
+                self._conn.execute(
+                    "UPDATE memory_items SET mention_count = ?, metadata = ?"
+                    " WHERE id = ?",
+                    (max(1, r["mention_count"] - len(foreign)),
+                     json.dumps(meta, ensure_ascii=False), r["id"]),
+                )
+                moved.extend((e, r["id"]) for e in foreign)
+            self._conn.commit()
+        for entry, origin_id in moved:
+            self._add_or_reinforce(
+                entry["text"], kind="observation", source=entry["source"],
+                metadata={"insight_type": "suggestion",
+                          "reclassified_from": origin_id},
+            )
+        return len(moved)
 
     def _tier_maintenance(self) -> dict:
         """Tier transitions. Fade beats promotion (silence wins over count).
@@ -1362,6 +1671,7 @@ class PermearStorage:
             "promoted_active": 0, "promoted_stable": 0,
             "demoted_active": 0, "demoted_ephemeral": 0, "faded": 0,
             "observation_to_pattern": 0, "rule_unfaded": 0,
+            "bookkeeping_unlabelled": 0,
         }
         rule_floor = (
             now - timedelta(days=MEMORY_RULE_FADE_DAYS)
@@ -1379,6 +1689,13 @@ class PermearStorage:
                 " AND last_seen >= ?",
                 (rule_floor,),
             ).rowcount
+            # Label convergence (v9.11, idempotent): bookkeeping rows promoted
+            # before v9.11 carry kind='pattern', which their content never was.
+            # Only the label returns; tier, counters and content are untouched.
+            counts["bookkeeping_unlabelled"] = self._conn.execute(
+                "UPDATE memory_items SET kind = 'observation'"
+                f" WHERE kind = 'pattern' AND {_BOOKKEEPING_SQL}"
+            ).rowcount
             rows = self._conn.execute(
                 "SELECT * FROM memory_items WHERE tier != 'faded'"
             ).fetchall()
@@ -1390,7 +1707,7 @@ class PermearStorage:
                 mentions = item["mention_count"]
                 new_tier = tier
 
-                is_rule = item["kind"] == "behavior_rule"
+                is_rule = item["kind"] in ("behavior_rule", CONDITIONAL_RULE_KIND)
                 fade_after = (
                     MEMORY_RULE_FADE_DAYS if is_rule
                     else MEMORY_EPHEMERAL_FADE_DAYS
@@ -1421,7 +1738,8 @@ class PermearStorage:
                 if new_tier != tier:
                     new_kind = item["kind"]
                     if (tier == "ephemeral" and new_tier == "active"
-                            and item["kind"] == "observation"):
+                            and item["kind"] == "observation"
+                            and not _is_bookkeeping(item)):
                         new_kind = "pattern"
                         counts["observation_to_pattern"] += 1
                     self._conn.execute(
@@ -1464,7 +1782,8 @@ class PermearStorage:
             rows = self._conn.execute(
                 "SELECT key, tier FROM memory_items"
                 " WHERE tier IN ('active','stable') AND key IS NOT NULL"
-                " AND kind != 'behavior_rule'"
+                " AND kind NOT IN ('behavior_rule', ?)",
+                (CONDITIONAL_RULE_KIND,),
             ).fetchall()
             # RODADA B: a light is "rich" (dimmer) only if it EVER recorded a
             # brightness — a single consolidated row reflects just the last

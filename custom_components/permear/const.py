@@ -263,7 +263,14 @@ PERCEPTION_MIN_ENTITIES = 5
 # v8.10 — Sleep + Systems + Wake (ported from scripts/permear_config.py)
 # =============================================================================
 
-AGENT_AUTOMATIONS_RELATIVE_PATH = "automations/permear_agent.yaml"
+# v9.17 — the standing rules: the integration's own data, nothing outside it.
+STANDING_RULES_RELATIVE_PATH = "memory/standing_rules.json"
+# v9.19 — did the message go out? Counted in data, because a WARNING only exists
+# for whoever runs at that log level.
+DELIVERY_STATS_RELATIVE_PATH = "memory/delivery_stats.json"
+SIGNAL_RULES_CHANGED = "permear_rules_changed"
+SIGNAL_LAST_MESSAGE = "permear_last_message"
+RULE_COOLDOWN_MINUTES = 10  # a flapping trigger must not turn a rule into noise
 
 # User-facing PT day names — index matches datetime.weekday() (Monday=0).
 DAYS_PT = (
@@ -304,7 +311,7 @@ RESTRICTION_SCOPE_EVENTS = "events"          # lowers salience of an entity/subj
 RESTRICTION_SCOPE_SUGGESTION = "suggestion"  # rejects one Systems insight, never ARAS
 RESTRICTION_SUGGESTION_MIN_TOKENS = 2        # overlap needed to call it a suggestion refusal
 # v9.9 — a rule keeps the last phrasings that created/reinforced it
-# (metadata.mentions). mention_count alone could not be audited: an
+# (metadata.mentions). mention_count alone could not be audited: on 17/09 an
 # unrelated refusal reinforced another rule and nothing recorded what was said.
 RULE_MENTION_HISTORY_MAX = 5
 
@@ -316,6 +323,24 @@ RULE_MENTION_HISTORY_MAX = 5
 CONVERSATION_MEMORY_MAX_RULES = 6
 CONVERSATION_MEMORY_MAX_ROUTINES = 8
 CONVERSATION_MEMORY_MAX_CHARS = 1500
+
+# v9.13 — "it matters, except when": a condition taught in speech, captured in
+# a CLOSED schema of three qualifiers. Evaluated from HA state, never by the
+# LLM. Captured only: no cycle consumes it yet, so a conditional rule is its own
+# kind, which every reader of 'behavior_rule' (ARAS included) ignores by
+# construction. What does not fit is discarded and counted, never stored.
+CONDITIONAL_RULE_KIND = "conditional_rule"
+CONDITION_Q_PRESENCE = "presenca"     # nobody home for at least N minutes
+CONDITION_Q_DURATION = "duracao"      # the event's own state held at least/at most N s
+CONDITION_Q_COMPANION = "companheira" # another entity is in a given state
+CONDITION_WHEN_MATTERS = "matters"    # the event matters only while it holds
+CONDITION_WHEN_IGNORED = "ignored"    # the event does not matter while it holds
+# Spoken durations without a number ("poucos segundos", "alguns minutos").
+CONDITION_VAGUE_SECONDS = {"poucos_segundos": 30, "alguns_minutos": 180}
+CONDITION_MAX_SECONDS = 86400
+# A companion "ligado" is any live state of its domain (a climate reads
+# cool/heat, a media_player playing), so "on" means not one of these.
+CONDITION_INACTIVE_STATES = ("off", "idle", "standby")
 
 # v9.10 — what the system said ON ITS OWN reaches the conversation turn. The
 # cycles deliver through notify, the resident answers through the handler, and
@@ -335,6 +360,19 @@ OUTBOUND_BLOCK_MAX_CHARS = 1500
 # Engagement-based priority learning (weekly, Systems Consolidation).
 ENGAGEMENT_MIN_ALERTS = 4       # minimum alerts to have confidence
 EMIT_HISTORY_MAX = 30           # emission/reaction timestamps kept per item
+# v9.14 — words of a device name that identify nothing ("Sensor da janela").
+# A gray subject counts as communicated when a strict majority of the REST of
+# its name appears in the delivered text.
+SUBJECT_NOISE_TOKENS = frozenset({
+    "sensor", "das", "dos", "com", "para", "battery", "level",
+})
+# v9.14 — a reinforce keeps what a later mention said differently, on the row
+# itself. No reader yet: this is raw material, bounded per subject.
+EVIDENCE_MAX_PER_SUBJECT = 5
+EVIDENCE_MAX_CHARS = 200
+# v9.15 — origins that are the system talking about itself: never evidence of
+# anything, whatever the words happen to match.
+MEMORY_SYSTEM_SOURCES = frozenset({"heartbeat", "systems"})
 # v9.7.2 — the reaction RATE thresholds (UP 0.66 / DOWN 0.33) are retired.
 # A "reaction" is the resident sending ANY Telegram message within
 # REACTION_WINDOW_MINUTES, blanket-marked onto every row the cycle touched —
@@ -464,14 +502,15 @@ TELEGRAM_REJECT_WORDS = frozenset(
 CONVERSATION_RETRY_DELAYS = (0, 5, 15)  # 3 attempts per provider
 REACTION_WINDOW_MINUTES = 15  # user reply marks recent emits as reacted
 
-# Agent automations (CRUD over automations/permear_agent.yaml).
+# Standing rules (CRUD in agent_automations.py).
 MAX_AGENT_AUTOMATIONS = 20
-# Action domains an agent-created automation may call. Closed allowlist —
-# the action_service comes from the LLM; anything outside (homeassistant.*,
-# shell_command.*, python_script.*, …) is rejected before the spec is built.
-AGENT_ACTION_DOMAINS = frozenset({
-    "light", "switch", "climate", "cover", "media_player", "fan", "lock",
-})
+# v9.16 — a suggestion stays answerable for two Systems cycles: one week to read
+# it, one more if the resident missed that Sunday.
+SUGGESTION_PENDING_DAYS = 14
+SUGGESTION_REFUSAL_DAYS = 90  # the subject stays out of the suggestions this long
+# Closed action vocabulary of a suggestion's subject (entity + action type). It
+# holds only what a standing rule can do: PERMEAR tells, it never actuates.
+SUGGESTION_ACTIONS = frozenset({"notificar"})
 SPEC_ENTITY_DOMAINS = (  # entity list injected into the spec-creation prompt
     "light", "switch", "climate", "media_player",
     "cover", "sensor", "binary_sensor",
@@ -480,3 +519,10 @@ SPEC_ENTITY_DOMAINS = (  # entity list injected into the spec-creation prompt
 # HA update cards — daily check (was attached to the shell Sleep block; now
 # scheduled right after Wake, morning slot).
 UPDATES_TIME = "09:05"
+
+# Closed lexical guard: consented conditions must survive spec translation.
+RULE_CONDITION_MARKERS = ("se", "quando", "caso", "enquanto", "desde que", "a menos que", "só se")
+CONF_TELEGRAM_BOT = "telegram_bot_entry_id"
+
+# Bound each rule summary while leaving space for other recorder attributes.
+RULE_ALIAS_MAX_BYTES = 128

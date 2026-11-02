@@ -7,7 +7,7 @@ in-memory state machine.
 
 State machine (was input_text.permear_pending_auto_spec + a JSON file):
   ""             → regular conversation
-  awaiting_new   → next text is an automation description → ai_task spec
+  awaiting_new   → next text describes a standing rule → ai_task spec
   awaiting_edit  → next text edits the pending spec → ai_task spec
   pending        → a built spec waits for sim/não or the card buttons
 The state now lives in memory — an HA restart simply drops an unfinished
@@ -17,7 +17,7 @@ Conversation goes to the 'conversation' provider of the config entry
 (conversation.process, with tools — NEVER ai_task), 3 retries (0/15/45s),
 then the conversation_fallback with the same retries; both failing → honest
 PT error, no degraded mode (Reading B). Internal agent tokens (LIST_AUTOS,
-REMOVE_AUTO) are intercepted and never reach the user. Dedup by message_id
+REMOVE_AUTO, CREATE_AUTO) are intercepted and never reach the user. Dedup by message_id
 (in-memory, 24h TTL — replaces the daily_ DB flags). User replies mark the
 last 15 min of emits as reacted (engagement signal).
 
@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 
 from homeassistant.core import HomeAssistant, callback
@@ -78,36 +79,42 @@ _LIST_KEYWORDS = (
     "minhas automacoes", "minhas automações",
 )
 _INTERNAL_TOKENS = ("LIST_AUTOS", "NO_AUTOMATIONS", "CREATE_AUTO:", "REMOVE_AUTO:")
+# v9.16 — an answer to a suggestion: a verb, optionally the #id it refers to.
+_SUGGESTION_ANSWER = re.compile(
+    r"^(sim|aceito|aceitar|aceita|nao|não|recuso|recusar|recusa)\b[^\d]*#?(\d+)?"
+)
+_OFFERED_ID = re.compile(r"#(\d+)")
+_SUGGESTION_NAMED = re.compile(r"sugest[aã]o\b|automa[cç]")
 _CONV_ERROR_MARKERS = ("Sorry, I had a problem", "503", "UNAVAILABLE")
 
 SPEC_STRUCTURE = {
     "alias": {
-        "description": "Nome curto da automacao em PT-BR. Vazio se impossivel de mapear.",
+        "description": "Nome curto do aviso em PT-BR. Vazio se o pedido nao for um aviso.",
         "required": True,
         "selector": {"text": {}},
     },
     "trigger_type": {
-        "description": "Tipo do gatilho: time, state, numeric_state ou time_pattern",
+        "description": "Tipo do gatilho: time ou state",
         "required": True,
-        "selector": {"select": {"options": ["time", "state", "numeric_state", "time_pattern"]}},
+        "selector": {"select": {"options": ["time", "state"]}},
     },
     "trigger_config": {
-        "description": 'JSON string do trigger compativel com HA. Ex: {"platform":"time","at":"18:00:00"}',
+        "description": 'JSON do gatilho. Ex: {"at":"18:00:00"} ou {"entity_id":"x","to":"on"}',
         "required": True,
         "selector": {"text": {}},
     },
-    "action_service": {
-        "description": "Service HA. Ex: light.turn_on, switch.turn_on, climate.turn_on, cover.open_cover, media_player.turn_on",
-        "required": True,
-        "selector": {"text": {}},
-    },
-    "action_entity": {
-        "description": "Entity ID da lista de entidades disponiveis. Use EXATAMENTE o entity_id da lista.",
+    "action_message": {
+        "description": "Texto do aviso ao morador.",
         "required": True,
         "selector": {"text": {}},
     },
     "condition_text": {
         "description": "Condicao em linguagem natural ou vazio",
+        "required": False,
+        "selector": {"text": {}},
+    },
+    "condition_config": {
+        "description": 'JSON da condicao, ou vazio. Ex: {"condition":"state","entity_id":"x","state":"on"}',
         "required": False,
         "selector": {"text": {}},
     },
@@ -140,6 +147,9 @@ class PermearTelegramHandler:
         # v9.10 — timestamps of the system's own deliveries already shown to
         # the LIVE HA chat session; reset whenever that session is gone.
         self._outbound_seen: set = set()
+        # v9.16 — when the conversation last spoke; anything the system offered
+        # before that has been talked past.
+        self._last_turn_at: datetime | None = None
 
     @callback
     def start(self) -> None:
@@ -230,7 +240,92 @@ class PermearTelegramHandler:
             await self._spec_creation_flow(text)
             return
 
+        if await self._suggestion_turn(lower):
+            return
+
         await self._conversation_flow(text)
+
+    # ------------------------------------------------------------------
+    # Answering a suggestion (v9.16)
+    # ------------------------------------------------------------------
+
+    async def _suggestion_turn(self, lower: str) -> bool:
+        """True when this message answered a suggestion. Nothing here chooses
+        for the resident: 'aceito'/'recuso' or a #id are explicit; a bare
+        sim/não only counts over what the system has just offered, because a
+        week-long 'sim' would also catch the reply to any other question."""
+        match = _SUGGESTION_ANSWER.match(lower)
+        if not match:
+            return False
+        word, number = match.group(1), match.group(2)
+        explicit = word not in ("sim", "nao", "não")
+        pending = await self._storage.async_pending_suggestions()
+        if number:
+            target = [p for p in pending if p["id"] == int(number)]
+            if not target:
+                if not explicit:
+                    return False
+                await async_send_telegram(
+                    self._hass, f"Nao ha sugestao #{number} pendente."
+                )
+                return True
+        elif explicit:
+            # A sentence that merely opens with the verb is not an answer.
+            if lower != word and not _SUGGESTION_NAMED.search(lower):
+                return False
+            target = pending
+            if not target:
+                await async_send_telegram(
+                    self._hass, "Nao ha sugestao pendente."
+                )
+                return True
+        else:
+            if lower not in TELEGRAM_CONFIRM_WORDS | TELEGRAM_REJECT_WORDS:
+                return False
+            offered = self._offered_ids()
+            target = [p for p in pending if p["id"] in offered]
+            if not target:
+                return False
+        if len(target) > 1:
+            lines = [f"#{p['id']}: {p['content']}" for p in target]
+            lines.append("Responda: aceito N ou recuso N.")
+            await async_send_telegram(self._hass, "\n".join(lines))
+            return True
+        if word.startswith(("sim", "aceit")):
+            await self._accept_suggestion(target[0])
+        else:
+            await self._storage.async_answer_suggestion(target[0]["id"], False)
+            await async_send_telegram(
+                self._hass, f"Sugestao #{target[0]['id']} recusada."
+            )
+        return True
+
+    def _offered_ids(self) -> set:
+        """The #ids in the system's last message, unless the conversation has
+        spoken since. The ring is in memory: after a restart nothing is on
+        offer, and a bare sim falls through to the conversation."""
+        said = recent_outbound(self._hass)
+        if not said:
+            return set()
+        last = said[-1]
+        if self._last_turn_at and self._last_turn_at >= last["ts"]:
+            return set()
+        return {int(n) for n in _OFFERED_ID.findall(last["text"])}
+
+    async def _accept_suggestion(self, suggestion: dict) -> None:
+        """The yes is the authorization: build, write, answer in one line."""
+        spec, error = await self._spec_from_text(suggestion["content"])
+        if spec is None:
+            await async_send_telegram(
+                self._hass,
+                f"Sugestao #{suggestion['id']} nao virou aviso: "
+                f"{error or 'so sei avisar, nao aciono aparelhos'}.",
+            )
+            return
+        result = await self._autos.async_create(spec)
+        if result.startswith("Aviso criado"):
+            await self._storage.async_answer_suggestion(suggestion["id"], True)
+        await async_send_telegram(self._hass, result)
 
     # ------------------------------------------------------------------
     # Automation-spec creation (awaiting_* → ONE ai_task call)
@@ -240,38 +335,29 @@ class PermearTelegramHandler:
         is_edit = (
             self._pending_state == "awaiting_edit" and self._pending_spec is not None
         )
-        entities_text = await self._hass.async_add_executor_job(
-            self._monitored_entities_text
-        )
-        prompt = self._build_spec_prompt(text, entities_text, is_edit)
-
-        data = await self._llm.async_generate(
-            "HA automation creation", prompt, SPEC_STRUCTURE
-        )
-        alias = str((data or {}).get("alias") or "").strip()
-        if len(alias) < 3:
+        spec, error = await self._spec_from_text(text, is_edit)
+        if spec is None and not error:
             self._set_state("", None)
             await async_send_telegram(
                 self._hass,
                 "⚠️ Nao consegui interpretar a descricao.\n\n"
                 'Tente reformular com mais detalhes, ex:\n'
-                '"ligar o ar-condicionado todo dia as 18h"',
+                '"me avise as 18h se a porta estiver aberta"',
             )
             return
 
-        spec, error = build_spec(data)
         if spec is None:
             # State stays awaiting — the user can rephrase and retry
             await async_send_telegram(
                 self._hass,
-                f"❌ Erro ao montar a automacao.\n\n{error[:200]}",
+                f"❌ Erro ao montar o aviso.\n\n{error[:200]}",
             )
             return
 
         self._set_state("pending", spec)
         await async_send_telegram(
             self._hass,
-            "✨ Nova automacao\n\n"
+            "✨ Novo aviso\n\n"
             f"📌 {spec['alias']}\n\n"
             f"Quando: {describe_trigger(spec)}\n"
             f"O que faz: {describe_action(spec)}",
@@ -281,6 +367,25 @@ class PermearTelegramHandler:
             ],
         )
 
+    async def _spec_from_text(
+        self, text: str, is_edit: bool = False
+    ) -> tuple[dict | None, str]:
+        """Text → validated rule: (rule, ""), (None, reason), or (None, "") when
+        the text is not something to be told. One ai_task call."""
+        entities_text = await self._hass.async_add_executor_job(
+            self._monitored_entities_text
+        )
+        data = await self._llm.async_generate(
+            "HA automation creation",
+            self._build_spec_prompt(text, entities_text, is_edit),
+            SPEC_STRUCTURE,
+        )
+        if data is None:
+            return None, "provedor indisponivel"
+        if len(str(data.get("alias") or "").strip()) < 3:
+            return None, ""
+        return build_spec(data, consented_text=text)
+
     def _build_spec_prompt(self, text: str, entities_text: str, is_edit: bool) -> str:
         if is_edit:
             head = (
@@ -289,25 +394,27 @@ class PermearTelegramHandler:
                 "Produza uma nova especificacao completa aplicando a modificacao solicitada."
             )
         else:
-            head = f'Crie uma automacao do Home Assistant baseada na descricao:\n"{text}"'
+            head = f'Crie um aviso ao morador baseado na descricao:\n"{text}"'
         return f"""{head}
+
+O aviso so fala: nunca aciona aparelho. Se a descricao pedir para ligar, desligar,
+abrir, fechar ou ajustar algo, retorne alias vazio.
 
 Regras:
 - alias: nome curto em PT-BR, sem aspas especiais
-- trigger_type: time | state | numeric_state | time_pattern
-- trigger_config: JSON string do trigger no formato HA. Exemplos:
-  time: {{"platform":"time","at":"HH:MM:SS"}}
-  state: {{"platform":"state","entity_id":"x","to":"estado"}}
-  numeric_state: {{"platform":"numeric_state","entity_id":"sensor.x","above":N}}
-  time_pattern: {{"platform":"time_pattern","hours":"/1"}}
-- action_service: domain.servico (ex: light.turn_on, climate.turn_on, switch.turn_on, switch.turn_off, cover.open_cover, cover.close_cover, media_player.turn_on)
-- action_entity: use SOMENTE entity_ids da lista abaixo — nenhum outro sera aceito
+- trigger_type e trigger_config:
+  time: {{"at":"HH:MM:SS"}}
+  state: {{"entity_id":"x","to":"estado"}}
+- action_message: o texto do aviso. O estado de uma entidade entra so como {{{{ states('sensor.x') }}}}
 - condition_text: condicao em linguagem natural ou deixe vazio
+- condition_config: se houver condicao, o JSON dela, de um destes tipos:
+  outra entidade em um estado: {{"condition":"state","entity_id":"x","state":"on"}}
+  ninguem em casa: {{"condition":"presenca"}}
+  o proprio estado mantido por N segundos (so com gatilho state): {{"condition":"duracao","min_seconds":N}}
+  negacao de uma delas: {{"condition":"not","conditions":[{{"condition":"state","entity_id":"x","state":"y"}}]}}
 
-Entidades disponiveis nesta casa (use EXATAMENTE estes entity_ids):
-{entities_text}
-
-Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio."""
+Use SOMENTE estes entity_ids:
+{entities_text}"""
 
     def _monitored_entities_text(self) -> str:
         """Ports get_monitored_entities_text.py — monitored entities grouped
@@ -372,6 +479,7 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
         ]
         said = outbound_block(unseen)
         prompt = self._build_conversation_prompt(text, conv_id, memory, said)
+        self._last_turn_at = datetime.now()
 
         speech = None
         if self._config.conversation:
@@ -414,6 +522,10 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
         if "LIST_AUTOS" in speech:
             await async_send_telegram(self._hass, await self._autos.async_list_text())
             return
+        request = speech.split("CREATE_AUTO:")[1].strip() if "CREATE_AUTO:" in speech else ""
+        if request:
+            await self._spec_creation_flow(request.split("\n")[0].strip())
+            return
         if speech in _INTERNAL_TOKENS or speech.startswith(("CREATE_AUTO:", "REMOVE_AUTO:")):
             await async_send_telegram(
                 self._hass,
@@ -422,8 +534,8 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
             return
 
         # The reply is already in HA's chat log — not remembered as outbound.
-        await async_send_telegram(self._hass, speech, remember=False)
-        await async_set_last_message(self._hass, speech)
+        if await async_send_telegram(self._hass, speech, remember=False):
+            await async_set_last_message(self._hass, speech)
 
     def _chat_session_alive(self, conv_id: str) -> bool:
         """True while HA still holds this conversation's chat log (it drops a
@@ -458,6 +570,7 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
             parts.append(
                 "[INSTRUCAO OBRIGATORIA: Responda APENAS com uma linha no "
                 "formato exato abaixo, sem nenhum outro texto:\n"
+                "Para criar: CREATE_AUTO: o que avisar e quando\n"
                 "Para remover: REMOVE_AUTO: alias\n"
                 "Para listar: LIST_AUTOS\n"
                 "NAO escreva nada alem dessa linha. NAO confirme, NAO explique.]"
@@ -504,9 +617,9 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
             if command == "/nova_automacao":
                 await async_send_telegram(
                     self._hass,
-                    "Nova automacao\n\n"
-                    "Descreva o que ela deve fazer.\n"
-                    'Ex: "ligar o ar-condicionado as 18h se a temperatura passar de 25 graus"',
+                    "Novo aviso\n\n"
+                    "Descreva quando e o que devo te avisar.\n"
+                    'Ex: "me avise as 18h se a porta estiver aberta"',
                 )
                 self._set_state("awaiting_new", None)
             elif command == "/listar_automacoes":
@@ -520,12 +633,12 @@ Se a descricao nao mapear para nenhuma entidade da lista, retorne alias vazio.""
         if not autos:
             await async_send_telegram(
                 self._hass,
-                "🤖 Suas automacoes\n\n"
-                "Nenhuma automacao criada pelo agente ainda.\n"
-                "Use /nova_automacao para criar uma.",
+                "🤖 Seus avisos\n\n"
+                "Nenhum aviso criado ainda.\n"
+                "Use /nova_automacao para criar um.",
             )
             return
-        lines = [f"🤖 Suas automacoes ({listing['count']})", ""]
+        lines = [f"🤖 Seus avisos ({listing['count']})", ""]
         lines += [f"{i}. {a['alias']}" for i, a in enumerate(autos, 1)]
         lines += ["", "Toque em Remover N para excluir."]
         keyboard = [

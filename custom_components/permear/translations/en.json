@@ -9,20 +9,25 @@
           "data": "Data provider (primary)",
           "conversation_fallback": "Conversation provider (fallback)",
           "data_fallback": "Data provider (fallback)",
-          "telegram_chat_id": "Telegram chat ID"
+          "telegram_chat_id": "Telegram chat ID",
+          "telegram_bot_entry_id": "Telegram bot"
         },
         "data_description": {
           "conversation": "Conversation agent used for dialogue (with tools).",
           "data": "AI Task entity used by the cycles (gray zone, briefing, weekly compile).",
           "conversation_fallback": "Takes over with tools when the primary conversation provider fails.",
           "data_fallback": "Takes over when the primary data provider fails.",
-          "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot."
+          "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot.",
+          "telegram_bot_entry_id": "Required when more than one Telegram bot is configured. PERMEAR sends and replies through the one selected here."
         }
       }
     },
     "error": {
       "entity_not_found": "This entity was not found in Home Assistant.",
-      "invalid_chat_id": "The chat ID must be a number (e.g. 123456789)."
+      "invalid_chat_id": "The chat ID must be a number (e.g. 123456789).",
+      "telegram_bot_missing": "No telegram_bot entry found. Set up the Telegram integration first.",
+      "telegram_bot_not_selected": "More than one telegram_bot entry found. Select which one PERMEAR should use.",
+      "telegram_bot_invalid": "The selected telegram_bot entry is invalid: it no longer exists in Home Assistant. Select another one."
     },
     "abort": {
       "single_instance_allowed": "Already configured. Only a single instance is allowed."
@@ -37,6 +42,7 @@
           "sensitivity": "How much the house tells you",
           "daily_briefing_delivery": "Send the daily summary (08:00)",
           "telegram_chat_id": "Telegram chat ID",
+          "telegram_bot_entry_id": "Telegram bot",
           "primary_resident": "Primary resident",
           "agent_name": "Name the assistant uses",
           "heartbeat_start": "Start listening at",
@@ -53,6 +59,7 @@
           "sensitivity": "The only attention knob. Quieter means fewer events reach you; the emit threshold self-regulates inside the band you pick.",
           "daily_briefing_delivery": "The morning summary of the previous day. Turning it off stops the message only — the nightly cycle keeps running and keeps feeding memory, priorities and restrictions. The weekly summary is sent either way.",
           "telegram_chat_id": "Optional. Leave empty to use the first chat allowed by the Telegram bot.",
+          "telegram_bot_entry_id": "Required when more than one Telegram bot is configured. PERMEAR sends and replies through the one selected here.",
           "primary_resident": "The resident PERMEAR centers on. Pick a person from Home Assistant, or type a name for a resident without a person entry.",
           "agent_name": "What the assistant calls itself in conversation. Leave empty for the neutral name (PERMEAR).",
           "heartbeat_start": "Before this time the house stays silent, whatever happens.",
@@ -69,7 +76,10 @@
     },
     "error": {
       "entity_not_found": "This entity was not found in Home Assistant.",
-      "invalid_chat_id": "The chat ID must be a number (e.g. 123456789)."
+      "invalid_chat_id": "The chat ID must be a number (e.g. 123456789).",
+      "telegram_bot_missing": "No telegram_bot entry found. Set up the Telegram integration first.",
+      "telegram_bot_not_selected": "More than one telegram_bot entry found. Select which one PERMEAR should use.",
+      "telegram_bot_invalid": "The selected telegram_bot entry is invalid: it no longer exists in Home Assistant. Select another one."
     }
   },
   "selector": {
@@ -84,7 +94,7 @@
   "issues": {
     "system_log_fire_event": {
       "title": "PERMEAR error monitor is inactive",
-      "description": "The error monitor needs the system_log integration to fire events. Add the following to configuration.yaml and restart:\n\n```yaml\nsystem_log:\n  fire_event: true\n```\n\nWithout it, no error cards will be sent to Telegram."
+      "description": "PERMEAR could not turn on Home Assistant's log events, so the error monitor is inactive. There is nothing to configure: this needs a PERMEAR update."
     }
   }
 }

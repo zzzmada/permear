@@ -35,8 +35,15 @@ import unicodedata
 from datetime import datetime, timedelta
 
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_change,
+    async_track_time_interval,
+)
 
+from .agent_automations import render_message
 from .ai_client import AiTaskClient
 from .aras import evaluate_salience
 from .config import PermearConfig
@@ -50,6 +57,11 @@ from .const import (
     ARAS_STATS_RELATIVE_PATH,
     ARAS_SUPPRESS_THRESHOLD,
     ARCHIVED_ERRORS_RELATIVE_PATH,
+    CONDITION_INACTIVE_STATES,
+    CONDITION_Q_COMPANION,
+    CONDITION_Q_DURATION,
+    CONDITION_Q_PRESENCE,
+    CONDITION_WHEN_MATTERS,
     AVAILABILITY_RELATIVE_PATH,
     BATTERY_DEVICE_CLASSES,
     BATTERY_ENTITY_PATTERNS,
@@ -60,10 +72,14 @@ from .const import (
     MONITORED_ENTITIES_RELATIVE_PATH,
     PRESENCE_DEVICE_CLASSES,
     PRESENCE_RECENT_MINUTES,
+    RULE_COOLDOWN_MINUTES,
+    SIGNAL_RULES_CHANGED,
     REVERTIBLE_BINARY_DEVICE_CLASSES,
     REVERTIBLE_STATE_DOMAINS,
     SILENT_IGNORE_DOMAINS,
     SILENT_STATES,
+    STANDING_RULES_RELATIVE_PATH,
+    SUBJECT_NOISE_TOKENS,
     SPIKE_MIN_ANOMALY,
     SPIKE_MIN_PRIORITY,
 )
@@ -171,6 +187,31 @@ def is_silence(resposta: str | None) -> bool:
     return silence_kind(resposta) is not None
 
 
+def communicated_keys(resposta: str, grays: list, states: dict) -> set:
+    """Keys of the gray candidates the delivered text actually talks about
+    (v9.14). PURE. One gray reply covers a whole batch, and what it left out
+    never reached the resident, so it cannot be an emission.
+
+    Matches the device's NAME, accent-free and on whole words, by strict
+    majority of its identifying words: "A luz da cozinha" names "Luz da
+    cozinha", not "Luz da sala". The reply is only asked whether a name is in
+    it; nothing of it is stored (fact #3). A paraphrase that drops the name
+    matches nothing: a missing record loses one reinforce, an extra one
+    corrupts engagement."""
+    said = set(re.findall(r"\w+", _strip_accents(resposta or "")))
+    keys = set()
+    for cand, _ in grays:
+        eid = cand.get("entity_id")
+        name = _friendly(eid, states) if eid else cand.get("content", "")
+        words = {
+            w for w in re.findall(r"\w+", _strip_accents(name))
+            if len(w) > 2 and w not in SUBJECT_NOISE_TOKENS
+        }
+        if words and len(words & said) * 2 > len(words):
+            keys.add(cand.get("key"))
+    return keys
+
+
 def is_spike(decision: str, scores: dict) -> bool:
     """Orienting-reflex gate (v9.2) — PURE, deterministic. True ONLY for the
     'unexpected AND relevant' emit: anomaly (the event broke the expected
@@ -188,6 +229,43 @@ def is_spike(decision: str, scores: dict) -> bool:
         and scores.get("anomaly", 0) >= SPIKE_MIN_ANOMALY
         and scores.get("priority", 0) >= SPIKE_MIN_PRIORITY
     )
+
+def _condition_holds(condition: dict, ctx: dict) -> bool | None:
+    """Whether the qualifier is true now. None when the context cannot tell."""
+    q = condition.get("q")
+    if q == CONDITION_Q_PRESENCE:
+        idle = ctx.get("presence_idle_minutes")
+        return None if idle is None else idle >= condition["minutes"]
+    if q == CONDITION_Q_DURATION:
+        held = ctx.get("state_held_seconds")
+        if held is None:
+            return None
+        if "min_seconds" in condition:
+            return held >= condition["min_seconds"]
+        return held <= condition["max_seconds"]
+    if q == CONDITION_Q_COMPANION:
+        state = (ctx.get("states") or {}).get(condition["entity_id"])
+        if state is None or state in SILENT_STATES:
+            return None
+        if condition["state"] == "on":
+            return state not in CONDITION_INACTIVE_STATES
+        return state == condition["state"]
+    return None
+
+
+def condition_matters(condition: dict, ctx: dict) -> bool:
+    """Does the event still matter under this condition (v9.13)? PURE, and with
+    its one call site is the standing rules (v9.17), where the resident
+    authorized the condition. It is NOT wired into ARAS.
+
+    ctx = {presence_idle_minutes, state_held_seconds, states: {entity_id: state}},
+    filled by the caller from HA state. What the context cannot tell answers
+    True: swallowing a true alert is the worse of the two failures (rule #19)."""
+    holds = _condition_holds(condition, ctx)
+    if holds is None:
+        return True
+    return holds if condition.get("when") == CONDITION_WHEN_MATTERS else not holds
+
 
 # Legacy curated trigger-id suffixes ("tv_sala_ligou") — kept for events
 # recorded by the old shell capture during coexistence.
@@ -283,6 +361,15 @@ class PermearHeartbeat:
         # safe: a mid-day restart that re-fires the extended scan re-emits
         # nothing, because already-emitted night keys are deduped by recent_keys.
         self._extended_scan_date: str | None = None
+        self._unsub_rules_changed = None
+        self._stopped = False
+        self._rule_generation = 0
+        self._rule_bind_tasks: set = set()
+        self._rule_busy: set = set()
+        self._rule_tasks: set = set()
+        self._rule_unsubs: list = []
+        self._rule_fired: dict = {}  # rule id -> when it last spoke
+        self._rule_waits: dict = {}  # rule id -> cancel of its duration wait
 
     # ------------------------------------------------------------------
     # Scheduling
@@ -290,6 +377,7 @@ class PermearHeartbeat:
 
     @callback
     def start(self) -> None:
+        self._stopped = False
         self._unsub = async_track_time_interval(
             self._hass,
             self._on_interval,
@@ -301,17 +389,181 @@ class PermearHeartbeat:
             self._config.heartbeat_start,
             self._config.heartbeat_end,
         )
+        self._unsub_rules_changed = async_dispatcher_connect(
+            self._hass, SIGNAL_RULES_CHANGED, self._on_rules_changed
+        )
+        self._on_rules_changed()
 
     @callback
     def stop(self) -> None:
+        self._stopped = True
+        self._rule_generation += 1
+        for task in (*self._rule_bind_tasks, *self._rule_tasks):
+            task.cancel()
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        if self._unsub_rules_changed is not None:
+            self._unsub_rules_changed()
+            self._unsub_rules_changed = None
+        self._unbind_rules()
         if self._task is not None:
             # Cancel an in-flight cycle (jitter sleep / LLM call) — an options
             # reload must not leave the old instance racing the new one.
             self._task.cancel()
             self._task = None
+
+    # ------------------------------------------------------------------
+    # Standing rules (v9.17) — what the resident asked to be told. Outside
+    # the attentional cycle on purpose: ARAS filters what the system decides
+    # to say on its own, and this was requested. So no score, no threshold,
+    # no window, no emission record and no LLM. HA's own time and state
+    # subscriptions: exact, and nothing runs between triggers.
+    # ------------------------------------------------------------------
+
+    @callback
+    def _on_rules_changed(self) -> None:
+        if self._stopped:
+            return
+        task = self._hass.async_create_task(self._async_bind_rules())
+        self._rule_bind_tasks.add(task)
+        task.add_done_callback(self._rule_bind_tasks.discard)
+
+    def _unbind_rules(self) -> None:
+        for unsub in (*self._rule_unsubs, *self._rule_waits.values()):
+            unsub()
+        self._rule_unsubs = []
+        self._rule_waits = {}
+
+    async def _async_bind_rules(self) -> None:
+        if self._stopped:
+            return
+        self._rule_generation += 1
+        generation = self._rule_generation
+        path = self._hass.config.path(STANDING_RULES_RELATIVE_PATH)
+        rules = await self._hass.async_add_executor_job(load_json, path, [])
+        if self._stopped or generation != self._rule_generation:
+            return
+        self._unbind_rules()
+        for rule in rules if isinstance(rules, list) else []:
+            trigger = rule.get("trigger") or {}
+            if "at" in trigger:
+                hour, minute, *second = trigger["at"].split(":")
+                self._rule_unsubs.append(async_track_time_change(
+                    self._hass, self._rule_time_action(rule),
+                    hour=int(hour), minute=int(minute),
+                    second=int(second[0]) if second else 0,
+                ))
+            elif trigger.get("entity_id"):
+                self._rule_unsubs.append(async_track_state_change_event(
+                    self._hass, [trigger["entity_id"]],
+                    self._rule_state_action(rule),
+                ))
+
+    def _rule_time_action(self, rule: dict):
+        generation = self._rule_generation
+
+        async def _action(_now) -> None:
+            if self._stopped or generation != self._rule_generation:
+                return
+            await self._async_fire_rule(rule)
+        return _action
+
+    def _rule_state_action(self, rule: dict):
+        generation = self._rule_generation
+
+        async def _action(event) -> None:
+            if self._stopped or generation != self._rule_generation:
+                return
+            new, old = event.data.get("new_state"), event.data.get("old_state")
+            trigger = rule["trigger"]
+            if new is None or new.state != trigger["to"]:
+                return
+            if old is not None and old.state == new.state:
+                return  # attribute-only update
+            condition = rule.get("condition") or {}
+            if condition.get("q") != CONDITION_Q_DURATION:
+                await self._async_fire_rule(rule)
+                return
+
+            async def _held(_now) -> None:
+                if self._stopped or generation != self._rule_generation:
+                    return
+                self._rule_waits.pop(rule["id"], None)
+                state = self._hass.states.get(trigger["entity_id"])
+                if state is not None and state.state == trigger["to"]:
+                    await self._async_fire_rule(rule)
+
+            # A flapping state restarts the wait; it never stacks them.
+            waiting = self._rule_waits.pop(rule["id"], None)
+            if waiting:
+                waiting()
+            self._rule_waits[rule["id"]] = async_call_later(
+                self._hass, condition["min_seconds"], _held
+            )
+        return _action
+
+    async def _async_fire_rule(self, rule: dict) -> None:
+        """Speak, if the condition the resident authorized holds. A failing
+        rule must never reach the cycle or the other rules."""
+        rule_id = rule["id"]
+        if self._stopped or rule_id in self._rule_busy:
+            return
+        self._rule_busy.add(rule_id)
+        task = asyncio.current_task()
+        self._rule_tasks.add(task)
+        try:
+            now = datetime.now()
+            last = self._rule_fired.get(rule_id)
+            if last and now - last < timedelta(minutes=RULE_COOLDOWN_MINUTES):
+                return
+            condition = rule.get("condition")
+            if condition and not condition_matters(
+                condition, await self._rule_context(rule)
+            ):
+                return
+            message = render_message(rule, self._state_of)
+            if not message:
+                _LOGGER.info("Rule %s skipped: a state it reads is unavailable",
+                             rule["id"])
+                return
+            if await self._deliver(message, about=[rule.get("alias", "")]):
+                self._rule_fired[rule["id"]] = now
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Standing rule %s failed", rule.get("id"))
+        finally:
+            self._rule_busy.discard(rule_id)
+            self._rule_tasks.discard(task)
+
+    def _state_of(self, entity_id: str) -> str | None:
+        state = self._hass.states.get(entity_id)
+        return state.state if state is not None else None
+
+    async def _rule_context(self, rule: dict) -> dict:
+        """The ctx of condition_matters, read now from HA and the event log."""
+        condition = rule.get("condition") or {}
+        ctx: dict = {}
+        if condition.get("q") == CONDITION_Q_COMPANION:
+            eid = condition["entity_id"]
+            ctx["states"] = {eid: self._state_of(eid)}
+        elif condition.get("q") == CONDITION_Q_PRESENCE:
+            sensors = [
+                s for s in self._hass.states.async_all("binary_sensor")
+                if s.attributes.get("device_class") in PRESENCE_DEVICE_CLASSES
+            ]
+            ctx["presence_idle_minutes"] = (
+                0.0 if any(s.state == "on" for s in sensors)
+                else await self._storage.async_presence_idle_minutes(
+                    s.entity_id for s in sensors
+                )
+            )
+        elif condition.get("q") == CONDITION_Q_DURATION:
+            state = self._hass.states.get(rule["trigger"]["entity_id"])
+            if state is not None:
+                ctx["state_held_seconds"] = (
+                    datetime.now().astimezone() - state.last_changed
+                ).total_seconds()
+        return ctx
 
     def _in_window(self) -> bool:
         try:
@@ -414,11 +666,13 @@ class PermearHeartbeat:
             if is_spike(result["decision"], result["scores"]):
                 spikes += 1
                 content = await self._orient_or_narrate(cand, content)
-            await self._deliver(content, about=[cand["content"]])
-            await self._storage.async_record_emit(
-                content, cand.get("key"),
-                self._emit_metadata(cand.get("metadata"), result["salience"]),
-            )
+            # v9.19 — a message that did not leave is not an emission: no record,
+            # no dedup key, no chance to read the resident's silence about it.
+            if await self._deliver(content, about=[cand["content"]]):
+                await self._storage.async_record_emit(
+                    content, cand.get("key"),
+                    self._emit_metadata(cand.get("metadata"), result["salience"]),
+                )
 
         # Each spike orientation is one ai_task call (rare by construction).
         llm_called = spikes
@@ -442,14 +696,23 @@ class PermearHeartbeat:
             if kind is None:
                 # v9.10 — the paraphrase may drop the device's name; the batch's
                 # dry lines travel with it so the conversation can resolve it.
-                await self._deliver(resposta, about=[c["content"] for c, _ in grays])
-                # Record the batch under each candidate's OWN key and dry
-                # content — deterministic, never parsed from the LLM text.
-                # The keys enter today's recent_keys (novelty dedup for the
-                # gray path), and bot text stays out of the interaction
-                # stream Sleep reads as resident speech.
-                for c, r in grays:
-                    await self._storage.async_record_emit(
+                delivered = await self._deliver(
+                    resposta, about=[c["content"] for c, _ in grays]
+                )
+                # Record under each candidate's OWN key and dry content; bot
+                # text stays out of the interaction stream Sleep reads as
+                # resident speech. v9.14 — evaluated is not communicated: only
+                # the subjects the text names are emissions. The rest of the
+                # batch is marked seen, which keeps today's novelty dedup
+                # exactly as it was and adds no emission and no reinforce.
+                said = communicated_keys(resposta, grays, states)
+                for c, r in grays if delivered else ():
+                    record = (
+                        self._storage.async_record_emit
+                        if c.get("key") in said
+                        else self._storage.async_record_seen
+                    )
+                    await record(
                         c["content"], c.get("key"),
                         self._emit_metadata(c.get("metadata"), r["salience"]),
                     )
@@ -981,12 +1244,14 @@ Responda em portugues no campo 'resposta'."""
     # Delivery + stats
     # ------------------------------------------------------------------
 
-    async def _deliver(self, message: str, about: list[str] | None = None) -> None:
+    async def _deliver(self, message: str, about: list[str] | None = None) -> bool:
         """Telegram (PT, chat_id from the config entry) + last-message holder.
-        Best-effort each (notify.py logs failures, never raises). `about` = the
-        dry lines the message was written from (v9.10, conversation context)."""
-        await async_send_telegram(self._hass, message, about=about)
-        await async_set_last_message(self._hass, message)
+        True when the message left. `about` = the dry lines the message was
+        written from (v9.10, conversation context)."""
+        delivered = await async_send_telegram(self._hass, message, about=about)
+        if delivered:
+            await async_set_last_message(self._hass, message)
+        return delivered
 
     def _mute_days(self) -> int:
         """Calendar days since the last day with a deterministic emission
@@ -1065,6 +1330,8 @@ Responda em portugues no campo 'resposta'."""
             "spike": day_stats.get("spike", 0),
             "non_messages": day_stats.get("non_messages", 0),
             "emit_threshold": day_stats.get("emit_threshold"),
+            "cond_captured": day_stats.get("cond_captured", 0),
+            "cond_discarded": day_stats.get("cond_discarded", 0),
         }, ensure_ascii=False)
         try:
             with open(path, "a", encoding="utf-8") as fh:

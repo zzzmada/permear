@@ -36,6 +36,7 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_TELEGRAM_BOT,
     CONF_AGENT_NAME,
     CONF_DAILY_BRIEFING_DELIVERY,
     CONF_CHAT_ID,
@@ -79,6 +80,35 @@ USER_SCHEMA = vol.Schema(
         vol.Optional(CONF_CHAT_ID, default=""): TextSelector(),
     }
 )
+
+
+def _bot_schema(hass, schema):
+    """Only multi-bot installations need an explicit choice."""
+    bots = hass.config_entries.async_entries("telegram_bot")
+    if len(bots) <= 1:
+        return schema
+    return schema.extend({
+        vol.Required(CONF_TELEGRAM_BOT): SelectSelector(SelectSelectorConfig(
+            options=[{"value": b.entry_id, "label": b.title} for b in bots],
+            mode=SelectSelectorMode.DROPDOWN,
+        ))
+    })
+
+
+def _validate_bot(hass, data, errors):
+    """One error per real cause: no bot, no choice among several, stale choice."""
+    bots = hass.config_entries.async_entries("telegram_bot")
+    chosen = data.get(CONF_TELEGRAM_BOT)
+    if not bots:
+        # The field is not on the form in this case, so the error goes to base.
+        errors["base"] = "telegram_bot_missing"
+    elif len(bots) == 1:
+        data[CONF_TELEGRAM_BOT] = bots[0].entry_id
+    elif not chosen:
+        errors[CONF_TELEGRAM_BOT] = "telegram_bot_not_selected"
+    elif not any(b.entry_id == chosen for b in bots):
+        errors[CONF_TELEGRAM_BOT] = "telegram_bot_invalid"
+
 
 def _options_schema(resident_options: list[str]) -> vol.Schema:
     """Options schema, ordered essential → accessory (v9.8).
@@ -178,6 +208,7 @@ class PermearConfigFlow(ConfigFlow, domain=DOMAIN):
 
         errors: dict[str, str] = {}
         if user_input is not None:
+            _validate_bot(self.hass, user_input, errors)
             for field, _domain in _PROVIDER_FIELDS:
                 if self.hass.states.get(user_input[field]) is None:
                     errors[field] = "entity_not_found"
@@ -193,7 +224,7 @@ class PermearConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             data_schema=self.add_suggested_values_to_schema(
-                USER_SCHEMA, user_input or {}
+                _bot_schema(self.hass, USER_SCHEMA), user_input or {}
             ),
             errors=errors,
         )
@@ -212,6 +243,7 @@ class PermearOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
+            _validate_bot(self.hass, user_input, errors)
             # RODADA E: validate the (now editable) providers + chat_id, reusing
             # the same error keys as the install flow.
             for field, _domain in _PROVIDER_FIELDS:
@@ -229,7 +261,7 @@ class PermearOptionsFlow(OptionsFlow):
         # Seed the provider + chat_id suggestions from entry.data when options
         # has not stored them yet (first time the flow is opened).
         for key in (CONF_CONVERSATION, CONF_DATA, CONF_CONVERSATION_FALLBACK,
-                    CONF_DATA_FALLBACK, CONF_CHAT_ID):
+                    CONF_DATA_FALLBACK, CONF_CHAT_ID, CONF_TELEGRAM_BOT):
             if not current.get(key):
                 current[key] = self.config_entry.data.get(key, "")
         # Default: first person.* when nothing is configured yet
@@ -244,7 +276,7 @@ class PermearOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                _options_schema(options), current
+                _bot_schema(self.hass, _options_schema(options)), current
             ),
             errors=errors,
         )

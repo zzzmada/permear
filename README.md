@@ -88,15 +88,9 @@ their quality — PERMEAR is agnostic to the choice.
   primary output surface. PERMEAR will warn you if it is missing. See the
   Home Assistant docs to set it up:
   https://www.home-assistant.io/integrations/telegram_bot/
-- Optionally, for the error monitor to see Home Assistant errors, enable
-  event firing in your `configuration.yaml`:
-
-  ```yaml
-  system_log:
-    fire_event: true
-  ```
-
-  PERMEAR will create a Repair notification if this is off.
+- Nothing in `configuration.yaml`: the error monitor turns on Home Assistant's
+  log events by itself, in memory. A `system_log: fire_event: true` entry is no
+  longer needed and can be removed.
 
 ---
 
@@ -130,7 +124,7 @@ household events
        │
        ▼
   Systems Consolidation (weekly)
-  detect recurring co-occurrences → suggest an automation
+  detect recurring co-occurrences → suggest a notice
   learn from engagement → adjust priorities
 ```
 
@@ -278,7 +272,7 @@ Being blind is graver than being on a fallback, and the system tells you.
   message you to say it has nothing to say.
 - It will not act on your devices. Even the orienting reflex only brings the
   rare, relevant thing to your attention and leaves the decision with you.
-- It will not declare automations; it suggests, and you decide. A suggestion
+- It will not create automations; it suggests a notice, and you decide. A suggestion
   you never answer retires on its own — silence is treated as an answer.
 - It does not use embeddings, a vector database, or any always-on assistant
   loop.

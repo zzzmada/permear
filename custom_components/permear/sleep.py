@@ -27,26 +27,38 @@ from datetime import datetime
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_change
-from homeassistant.util.yaml import load_yaml
 
 from .ai_client import AiTaskClient, circuit_health_summary
 from .config import PermearConfig, parse_hhmm
 from .const import (
-    AGENT_AUTOMATIONS_RELATIVE_PATH,
+    CONDITION_MAX_SECONDS,
+    CONDITION_Q_COMPANION,
+    CONDITION_Q_DURATION,
+    CONDITION_Q_PRESENCE,
+    CONDITION_VAGUE_SECONDS,
+    CONDITION_WHEN_IGNORED,
+    CONDITION_WHEN_MATTERS,
     DAYS_PT,
     DEFAULT_SLEEP_TIME,
     EVENT_SLEEP_COMPLETE,
     MONITORED_ENTITIES_RELATIVE_PATH,
+    PRESENCE_RECENT_MINUTES,
     SLEEP_EXTRACTION_DELAY_SECONDS,
     SLEEP_EXTRACTION_MAX_EVENTS,
     SLEEP_THIN_DAY_MIN_ENTITIES,
+    STANDING_RULES_RELATIVE_PATH,
 )
-from .notify import async_defer_message, async_set_last_message
+from .notify import async_defer_message
 from .storage import PermearStorage, load_json
 
 _LOGGER = logging.getLogger(__name__)
 
 ENTITY_TAG = re.compile(r"\[entity:([^\]]*)\]")
+CONDITION_TAG = re.compile(r"\[cond:([^\]]*)\]")
+_CONDITION_WHEN = {
+    "importa": CONDITION_WHEN_MATTERS,
+    "ignora": CONDITION_WHEN_IGNORED,
+}
 
 BRIEFING_STRUCTURE = {
     "briefing": {
@@ -72,7 +84,55 @@ MEMORIES_STRUCTURE = {
         "required": False,
         "selector": {"text": {"multiple": True}},
     },
+    # v9.13 — the LLM translates a conditional sentence into the closed tag
+    # grammar; the code validates it and owns the entity check.
+    "condicoes": {
+        "description": (
+            "Sentences where the resident said WHEN something matters, each "
+            "as a short PT-BR phrase with its [entity:…] and [cond:…] tags. "
+            "Empty if none."
+        ),
+        "required": False,
+        "selector": {"text": {"multiple": True}},
+    },
 }
+
+
+def parse_condition(raw: str, valid_ids) -> tuple:
+    """(content, entity_id, condition) from one 'condicoes' line, or None when
+    it does not fit the closed schema. PURE. The rule's entity comes from its
+    [entity:…] tag and must be a monitored entity; only a companion may name a
+    second one, under the same check. No third path: what fails here is
+    discarded by the caller and no prose is kept."""
+    tags = CONDITION_TAG.findall(raw)
+    content, entity_id = PermearSleep._parse_memory(CONDITION_TAG.sub(" ", raw))
+    content = " ".join(content.split())
+    if len(tags) != 1 or not content or entity_id not in valid_ids:
+        return None
+    parts = [p.strip() for p in tags[0].split(":")]
+    when = _CONDITION_WHEN.get(parts[0])
+    if when is None or len(parts) < 2:
+        return None
+    qualifier, args = parts[1], parts[2:]
+    condition = None
+    if qualifier == CONDITION_Q_PRESENCE and not args:
+        condition = {"minutes": PRESENCE_RECENT_MINUTES}
+    elif qualifier in ("duracao_min", "duracao_max") and len(args) == 1:
+        seconds = CONDITION_VAGUE_SECONDS.get(args[0])
+        if seconds is None and args[0].isdigit():
+            seconds = int(args[0])
+        if seconds and seconds <= CONDITION_MAX_SECONDS:
+            bound = "min_seconds" if qualifier == "duracao_min" else "max_seconds"
+            condition = {bound: seconds}
+            qualifier = CONDITION_Q_DURATION
+    elif qualifier == CONDITION_Q_COMPANION and len(args) == 2:
+        companion, state = args
+        if (companion in valid_ids and companion != entity_id
+                and re.fullmatch(r"[a-z_]+", state)):
+            condition = {"entity_id": companion, "state": state}
+    if condition is None:
+        return None
+    return content, entity_id, {"q": qualifier, "when": when, **condition}
 
 
 class PermearSleep:
@@ -202,7 +262,8 @@ class PermearSleep:
         extraction = await self._llm.async_generate(
             "Memory extraction",
             self._build_extraction_prompt(
-                daily["eventos"][-SLEEP_EXTRACTION_MAX_EVENTS:], interacoes
+                daily["eventos"][-SLEEP_EXTRACTION_MAX_EVENTS:], interacoes,
+                await self._hass.async_add_executor_job(self._monitored_entity_ids),
             ),
             MEMORIES_STRUCTURE,
         )
@@ -216,8 +277,12 @@ class PermearSleep:
             restricoes = [restricoes]
         restrictions_applied = await self._apply_restrictions(restricoes)
 
+        condicoes = (extraction or {}).get("condicoes") or []
+        if isinstance(condicoes, str):
+            condicoes = [condicoes]
+        await self._apply_conditions(condicoes)
+
         maintenance = await self._storage.async_run_maintenance()
-        await self._storage.async_set_flag("daily_briefing_enviado", "true")
         self._hass.bus.async_fire(EVENT_SLEEP_COMPLETE)
         _LOGGER.info(
             "Sleep Consolidation done: %d memories (%d new, %d reinforced), "
@@ -252,7 +317,6 @@ class PermearSleep:
             )
             return False
         await async_defer_message(self._hass, "sleep", briefing)
-        await async_set_last_message(self._hass, briefing)
         return True
 
     # ------------------------------------------------------------------
@@ -260,17 +324,11 @@ class PermearSleep:
     # ------------------------------------------------------------------
 
     def _load_prompt_files(self) -> tuple:
-        agent_autos = []
-        path = self._hass.config.path(AGENT_AUTOMATIONS_RELATIVE_PATH)
-        try:
-            raw = load_yaml(path)
-            if isinstance(raw, list):
-                agent_autos = raw
-        except (FileNotFoundError, OSError):
-            pass
-        except Exception as exc:  # noqa: BLE001 — malformed YAML must not kill the cycle
-            _LOGGER.warning("Cannot parse %s: %s", path, exc)
-        return agent_autos, circuit_health_summary(self._hass)
+        rules = load_json(self._hass.config.path(STANDING_RULES_RELATIVE_PATH), [])
+        return (
+            rules if isinstance(rules, list) else [],
+            circuit_health_summary(self._hass),
+        )
 
     @staticmethod
     def _thin_day_briefing(n_events: int, n_entities: int, n_inter: int) -> str:
@@ -385,12 +443,37 @@ INSTRUCOES:
    Nao complete o texto com conteudo de outros dias para deixa-lo mais cheio."""
 
     @staticmethod
-    def _build_extraction_prompt(eventos, interacoes) -> str:
+    def _build_extraction_prompt(eventos, interacoes, entidades=()) -> str:
         eventos_slim = [
             {"ts": e.get("ts", ""), "detalhe": e.get("detalhe", ""),
              "entity_id": e.get("entity_id")}
             for e in eventos
         ]
+        # v9.13 — only a day with speech can teach a condition. The entity list
+        # is here because the subject of a condition is often not in today's
+        # events ("a porta só importa com o ar ligado" on a day the air was off).
+        condicoes = ""
+        if interacoes:
+            condicoes = f"""
+CONDITIONS (separate field 'condicoes'): when an interaction explains WHEN
+something matters, return ONE short PT-BR phrase naming the subject, then
+[entity:<entity_id>] of that subject and exactly one [cond:...] tag:
+  [cond:<sense>:presenca]  nobody at home for a while
+  [cond:<sense>:duracao_min:<seconds>]  the event's own state held at least this
+  [cond:<sense>:duracao_max:<seconds>]  the event's own state held at most this
+  [cond:<sense>:companheira:<entity_id>:<state>]  another entity is in a state
+<sense> is 'importa' (it matters only when this is true) or 'ignora' (it does
+not matter when this is true). <seconds> is a number, or poucos_segundos /
+alguns_minutos when the resident gave no number. <state> is the HA state, or
+'on' for "ligado". Every entity_id must come from the list below.
+Examples:
+"Porta só importa com o ar ligado [entity:binary_sensor.door_example] [cond:importa:companheira:climate.ac_example:on]"
+"Janela não importa com gente na cozinha [entity:binary_sensor.window_example] [cond:ignora:companheira:binary_sensor.kitchen_example:on]"
+If the sentence states a condition that none of these can express, or its
+subject is not ONE entity of the list, return the phrase with [cond:fora].
+Never drop a conditional sentence and never answer the resident about it.
+Entities: {json.dumps(sorted(entidades))}
+"""
         return f"""Analyze today's events and interactions and extract up to 5
 relevant memories (not trivialities). Short, factual phrases
 that make sense to re-read days later, in Brazilian Portuguese.
@@ -423,7 +506,7 @@ silence about it; turning that into a restriction would silence the whole
 subject. Leave such sentences out of 'restricoes'.
 Never invent restrictions — only what the resident actually expressed.
 Return an empty list when there is none.
-
+{condicoes}
 Today's events: {json.dumps(eventos_slim, ensure_ascii=False)}
 Interactions: {json.dumps(interacoes, ensure_ascii=False)}
 
@@ -507,6 +590,28 @@ If nothing is relevant, return an empty list."""
                 applied += 1
         return applied
 
+    async def _apply_conditions(self, condicoes: list) -> int:
+        """Conditions taught today → conditional rules (v9.13). Whatever does
+        not fit the closed schema is counted and dropped: no row, no prose, and
+        nothing said to the resident."""
+        lines = [str(raw or "").strip() for raw in condicoes]
+        lines = [raw for raw in lines if raw]
+        if not lines:
+            return 0
+        valid_ids = await self._hass.async_add_executor_job(
+            self._monitored_entity_ids
+        )
+        captured = 0
+        for raw in lines:
+            parsed = parse_condition(raw, valid_ids)
+            if parsed is None:
+                _LOGGER.info("Condition discarded: %r", raw)
+                continue
+            result = await self._storage.async_add_conditional_rule(*parsed)
+            captured += 1 if result.get("id") is not None else 0
+        await self._storage.async_count_conditions(captured, len(lines) - captured)
+        return captured
+
     @staticmethod
     def _parse_memory(raw: str) -> tuple:
         """(content, entity_id). Every [entity:...] tag is stripped wherever it
@@ -516,6 +621,17 @@ If nothing is relevant, return an empty list."""
         tagged = {t.strip() for t in ENTITY_TAG.findall(raw) if t.strip()}
         content = " ".join(ENTITY_TAG.sub(" ", raw).split())
         return content, (tagged.pop() if len(tagged) == 1 else None)
+
+    def _monitored_entity_ids(self) -> set:
+        data = load_json(
+            self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH),
+            {"entities": []},
+        )
+        return {
+            e["entity_id"]
+            for e in data.get("entities", [])
+            if isinstance(e, dict) and e.get("entity_id") and e.get("monitor")
+        }
 
     def _valid_entity_ids(self) -> set:
         data = load_json(

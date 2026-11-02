@@ -1,8 +1,14 @@
 {
   "domain": "permear",
   "name": "PERMEAR",
-  "after_dependencies": ["telegram_bot", "ai_task", "conversation", "automation"],
-  "codeowners": ["@zzzmada"],
+  "after_dependencies": [
+    "telegram_bot",
+    "ai_task",
+    "conversation"
+  ],
+  "codeowners": [
+    "@zzzmada"
+  ],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/zzzmada/permear",
@@ -11,5 +17,5 @@
   "issue_tracker": "https://github.com/zzzmada/permear/issues",
   "requirements": [],
   "single_config_entry": true,
-  "version": "9.10.0"
+  "version": "9.23.0"
 }

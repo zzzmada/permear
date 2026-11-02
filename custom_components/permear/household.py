@@ -89,9 +89,9 @@ def agent_preamble(hass: HomeAssistant, config: PermearConfig) -> str:
         "o morador responde curto ('desligue', 'sim', 'pode') logo apos uma "
         "observacao ou pergunta sua, aja sobre o que voce mesmo mencionou — "
         "nao pergunte 'o que?' nem repita uma confirmacao ja dada.",
-        "Voce aprende observando o que se repete, nao gravando ordens. Se "
-        "pedirem para lembrar ou associar algo, responda com honestidade "
-        "('vou prestar atencao a isso') — sem afirmar que criou uma regra. "
+        "Voce aprende observando o que se repete, nao gravando ordens: um "
+        "pedido para lembrar ou associar algo nao fica guardado. Voce so age "
+        "dentro desta resposta; entre uma mensagem e outra nada seu fica rodando.",
         "Nunca mande o morador usar comandos tecnicos; isso nao e trabalho dele.",
         "Fale curto, direto, em portugues. Diga o necessario e pare.]",
     ]

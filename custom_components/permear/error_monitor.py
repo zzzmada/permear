@@ -143,15 +143,18 @@ class PermearErrorMonitor:
 
     @callback
     def _check_fire_event(self) -> None:
-        """system_log only fires the event with `fire_event: true` in YAML —
-        without it the monitor is a silent no-op. Raise a Repair issue."""
+        """system_log only fires the event when fire_event is on, and its YAML
+        default is off. PERMEAR never asks for a configuration.yaml edit, so it
+        turns the flag on in memory (v9.18). The Repair issue stays for the day
+        the handler stops honouring it."""
         handler = self._hass.data.get("system_log")
+        if getattr(handler, "fire_event", None) is False:
+            handler.fire_event = True
         fire_event = getattr(handler, "fire_event", None)
         if fire_event is False:
             _LOGGER.warning(
-                "system_log fire_event is disabled — the PERMEAR error "
-                "monitor will receive no events. Add 'system_log: "
-                "fire_event: true' to configuration.yaml."
+                "system_log did not accept fire_event — the PERMEAR error "
+                "monitor will receive no events."
             )
             ir.async_create_issue(
                 self._hass,

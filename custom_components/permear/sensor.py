@@ -1,13 +1,14 @@
 """Native PERMEAR status sensors (v8.9) — replace the command_line sensors.
 
-Five entities, same object_ids, states and attributes as the shell versions
+Six entities, same object_ids, states and attributes as the shell versions
 (consumers in cycles.yaml/telegram.yaml read them via state_attr):
 
   sensor.permear_attention      — suppression rate % + ARAS daily stats
-  sensor.permear_health         — tudo_ok | fallback_ativo | percepcao_reduzida (PT)
+  sensor.permear_health         — tudo_ok | fallback_ativo | entrega_falhando | percepcao_reduzida (PT)
   sensor.permear_config         — providers + cycle schedules from permear.yaml
   sensor.permear_daily_memory   — today's events/interactions/flags from the DB
   sensor.permear_household_data — residents (HA persons) + action_items (DB)
+  sensor.permear_last_message   — the last message delivered (v9.18, pushed)
 
 All file/DB reads run in the executor. Polling every 5 minutes (the config
 sensor is an in-memory snapshot and effectively static until reload).
@@ -20,8 +21,9 @@ from datetime import datetime, timedelta
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .config import PermearConfig
@@ -30,13 +32,18 @@ from .const import (
     ARAS_STATS_RELATIVE_PATH,
     ARCHIVED_ERRORS_RELATIVE_PATH,
     AVAILABILITY_RELATIVE_PATH,
+    DELIVERY_STATS_RELATIVE_PATH,
     DOMAIN,
     HEALTH_FALLBACK_WINDOW_MINUTES,
     MONITORED_ENTITIES_RELATIVE_PATH,
     PERCEPTION_MIN_ENTITIES,
     PERCEPTION_SILENT_MIN_HOURS,
     PERCEPTION_SILENT_SHARE,
+    SIGNAL_LAST_MESSAGE,
+    SIGNAL_RULES_CHANGED,
+    STANDING_RULES_RELATIVE_PATH,
 )
+from .agent_automations import describe_condition, describe_when
 from .household import get_residents
 from .storage import PermearStorage, load_json
 
@@ -64,6 +71,7 @@ async def async_setup_entry(
             PermearConfigSensor(config),
             PermearDailyMemorySensor(storage),
             PermearHouseholdDataSensor(hass, storage),
+            PermearLastMessageSensor(),
         ],
         update_before_add=True,
     )
@@ -85,6 +93,27 @@ class PermearSensorBase(SensorEntity):
         self._attr_unique_id = f"{DOMAIN}_{key}"
         self._attr_name = name
         self.entity_id = f"sensor.{DOMAIN}_{key}"
+
+
+class PermearLastMessageSensor(PermearSensorBase):
+    """The last message PERMEAR delivered (v9.18). Pushed by notify, never
+    polled; unknown until the first delivery after a start."""
+
+    _attr_should_poll = False
+
+    def __init__(self) -> None:
+        super().__init__("last_message", "Last Message")
+        self._attr_icon = "mdi:message-text-outline"
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, SIGNAL_LAST_MESSAGE, self._on_message
+        ))
+
+    @callback
+    def _on_message(self, message: str) -> None:
+        self._attr_native_value = message
+        self.async_write_ha_state()
 
 
 class PermearAttentionSensor(PermearSensorBase):
@@ -123,7 +152,7 @@ class PermearAttentionSensor(PermearSensorBase):
 
 
 class PermearHealthSensor(PermearSensorBase):
-    """tudo_ok | fallback_ativo | percepcao_reduzida (user-facing PT).
+    """tudo_ok | fallback_ativo | entrega_falhando | percepcao_reduzida (PT).
     The live fallback signal stays agent_circuit.json.last_fallback_at.
 
     percepcao_reduzida (v9.5): availability is global health, never an event
@@ -131,7 +160,11 @@ class PermearHealthSensor(PermearSensorBase):
     sensor read tudo_ok throughout. When most monitored entities have been
     silent for hours, the gravest fact about the system is that it is blind,
     so that state outranks fallback_ativo. Deterministic, from the existing
-    availability snapshot; nothing is emitted to the resident."""
+    availability snapshot; nothing is emitted to the resident.
+
+    entrega_falhando (v9.19): the last send failed and none has worked since.
+    It outranks fallback (a message that does not leave matters more than which
+    provider wrote it) and clears on the next delivered message."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__("health", "Health")
@@ -139,8 +172,8 @@ class PermearHealthSensor(PermearSensorBase):
         self._hass = hass
 
     async def async_update(self) -> None:
-        circuit, archived, perception = await self._hass.async_add_executor_job(
-            self._read
+        circuit, archived, perception, delivery = (
+            await self._hass.async_add_executor_job(self._read)
         )
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
@@ -168,6 +201,9 @@ class PermearHealthSensor(PermearSensorBase):
                 "entidades monitoradas sem responder ha mais de "
                 f"{PERCEPTION_SILENT_MIN_HOURS}h."
             )
+        elif delivery.get("last_failure_at", "") > delivery.get("last_success_at", ""):
+            state = "entrega_falhando"
+            resumo = "A ultima mensagem nao saiu pelo Telegram."
         elif recent:
             state = "fallback_ativo"
             resumo = "Operando com provedor secundario agora."
@@ -182,6 +218,10 @@ class PermearHealthSensor(PermearSensorBase):
             "erros_silenciados_ativos": len(archived.get("errors", {})),
             "entidades_silenciosas": silent_count,
             "entidades_monitoradas": watched_count,
+            "falhas_entrega_hoje": (
+                delivery.get("failures", 0) if delivery.get("date") == today else 0
+            ),
+            "ultima_falha_entrega_em": delivery.get("last_failure_at"),
         }
 
     @staticmethod
@@ -202,7 +242,8 @@ class PermearHealthSensor(PermearSensorBase):
         archived = load_json(
             self._hass.config.path(ARCHIVED_ERRORS_RELATIVE_PATH), {"errors": {}}
         )
-        return circuit, archived, self._perception_counts()
+        delivery = load_json(self._hass.config.path(DELIVERY_STATS_RELATIVE_PATH), {})
+        return circuit, archived, self._perception_counts(), delivery
 
     def _perception_counts(self) -> tuple:
         """(silent, watched) over monitor=true entities present in the
@@ -298,10 +339,28 @@ class PermearHouseholdDataSensor(PermearSensorBase):
         self._hass = hass
         self._storage = storage
 
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, SIGNAL_RULES_CHANGED, self._on_rules_changed
+        ))
+
+    @callback
+    def _on_rules_changed(self) -> None:
+        self.async_schedule_update_ha_state(True)
+
     async def async_update(self) -> None:
         insights = await self._storage.async_system_insights()
+        rules = await self._hass.async_add_executor_job(
+            load_json, self._hass.config.path(STANDING_RULES_RELATIVE_PATH), []
+        )
         self._attr_native_value = "ok"
         self._attr_extra_state_attributes = {
             "residents": get_residents(self._hass),
             "action_items": insights,
+            "avisos_permanentes": [
+                {"id": r.get("id"), "apelido": r.get("alias"),
+                 "gatilho": describe_when(r),
+                 "condicao": describe_condition(r) or "sem condicao"}
+                for r in (rules if isinstance(rules, list) else [])
+            ],
         }

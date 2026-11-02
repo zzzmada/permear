@@ -14,18 +14,22 @@ from collections import deque
 from datetime import datetime, timedelta
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
+    CONF_TELEGRAM_BOT,
+    DELIVERY_STATS_RELATIVE_PATH,
     DOMAIN,
     OUTBOUND_CONTEXT_HOURS,
     OUTBOUND_MEMORY_MAX,
     PENDING_MESSAGE_PATH,
+    SIGNAL_LAST_MESSAGE,
 )
 from .storage import load_json, locked_json_update
 
 _LOGGER = logging.getLogger(__name__)
 
-LAST_MESSAGE_ENTITY = "input_text.permear_last_message"
+LAST_MESSAGE_MAX_CHARS = 255  # the state limit of an HA entity
 # Stable drain order (Sleep before Systems when both are pending the same day).
 _PENDING_KEYS = ("sleep", "systems")
 # v9.10 — its own key, NOT under hass.data[DOMAIN] (whose values are the
@@ -40,6 +44,18 @@ def _configured_chat_id(hass: HomeAssistant) -> str:
         if chat_id:
             return chat_id
     return ""
+
+
+def telegram_bot_entry_id(hass: HomeAssistant) -> str:
+    """Resolve legacy single-bot installs or the explicit UI selection."""
+    entries = hass.config_entries.async_entries("telegram_bot")
+    if len(entries) == 1:
+        return entries[0].entry_id
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        chosen = entry.options.get(CONF_TELEGRAM_BOT) or entry.data.get(CONF_TELEGRAM_BOT)
+        if chosen and any(bot.entry_id == chosen for bot in entries):
+            return chosen
+    raise ValueError("Selecione o bot Telegram nas opcoes do PERMEAR")
 
 
 async def async_send_telegram(
@@ -69,15 +85,37 @@ async def async_send_telegram(
     if inline_keyboard:
         data["inline_keyboard"] = inline_keyboard
     try:
+        data["config_entry_id"] = telegram_bot_entry_id(hass)
         await hass.services.async_call(
             "telegram_bot", "send_message", data, blocking=True
         )
     except Exception as exc:  # noqa: BLE001
         _LOGGER.warning("Telegram delivery failed: %s", exc)
+        await hass.async_add_executor_job(_note_delivery, hass, False)
         return False
+    await hass.async_add_executor_job(_note_delivery, hass, True)
     if remember:
         _remember_outbound(hass, message, about)
     return True
+
+
+def _note_delivery(hass: HomeAssistant, delivered: bool) -> None:
+    """Executor. The last result and today's failures, for the health sensor.
+    Counting must never become a failure of its own."""
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    try:
+        path = hass.config.path(DELIVERY_STATS_RELATIVE_PATH)
+        with locked_json_update(path, {}) as stats:
+            if stats.get("date") != today:
+                stats.update(date=today, failures=0)
+            if delivered:
+                stats["last_success_at"] = now.isoformat()
+            else:
+                stats["failures"] += 1
+                stats["last_failure_at"] = now.isoformat()
+    except OSError as exc:
+        _LOGGER.debug("delivery stats not written: %s", exc)
 
 
 def _remember_outbound(
@@ -135,6 +173,20 @@ async def async_drain_pending(hass: HomeAssistant) -> None:
             drained.append(key)  # malformed entry → drop, never retry forever
             continue
         if await async_send_telegram(hass, text):
+            if key == "sleep":
+                # Delivery belongs to today, not to the night's generation.
+                # A bookkeeping failure must not requeue an already sent text.
+                for entry_data in (hass.data.get(DOMAIN) or {}).values():
+                    storage = entry_data.get("storage")
+                    if storage is not None:
+                        try:
+                            await storage.async_set_flag(
+                                "daily_briefing_enviado", "true"
+                            )
+                        except Exception:  # noqa: BLE001
+                            _LOGGER.exception("Delivered briefing flag not saved")
+                        break
+            await async_set_last_message(hass, text)
             drained.append(key)
     if not drained:
         return
@@ -155,7 +207,8 @@ async def async_answer_callback(
         await hass.services.async_call(
             "telegram_bot",
             "answer_callback_query",
-            {"callback_query_id": callback_query_id, "message": message},
+            {"callback_query_id": callback_query_id, "message": message,
+             "config_entry_id": telegram_bot_entry_id(hass)},
             blocking=True,
         )
     except Exception as exc:  # noqa: BLE001
@@ -172,6 +225,7 @@ async def async_edit_message(
             "edit_message",
             {
                 "chat_id": chat_id,
+                "config_entry_id": telegram_bot_entry_id(hass),
                 "message_id": message_id,
                 "message": message,
                 "parse_mode": "plain_text",
@@ -224,16 +278,5 @@ async def async_speak(hass: HomeAssistant, message: str) -> None:
 
 
 async def async_set_last_message(hass: HomeAssistant, message: str) -> None:
-    """Legacy last-message holder — written only when the helper entity
-    exists (author setup); public installs have no such input_text."""
-    if hass.states.get(LAST_MESSAGE_ENTITY) is None:
-        return
-    try:
-        await hass.services.async_call(
-            "input_text",
-            "set_value",
-            {"entity_id": LAST_MESSAGE_ENTITY, "value": message[:255]},
-            blocking=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _LOGGER.debug("last_message update failed: %s", exc)
+    """Hand the last delivered message to PERMEAR's own sensor (v9.18)."""
+    async_dispatcher_send(hass, SIGNAL_LAST_MESSAGE, message[:LAST_MESSAGE_MAX_CHARS])

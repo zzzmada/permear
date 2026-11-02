@@ -9,20 +9,25 @@
           "data": "Provedor de dados (primário)",
           "conversation_fallback": "Provedor de conversação (reserva)",
           "data_fallback": "Provedor de dados (reserva)",
-          "telegram_chat_id": "Chat ID do Telegram"
+          "telegram_chat_id": "Chat ID do Telegram",
+          "telegram_bot_entry_id": "Bot do Telegram"
         },
         "data_description": {
           "conversation": "Agente de conversação usado no diálogo (com ferramentas).",
           "data": "Entidade AI Task usada pelos ciclos (zona cinzenta, briefing, compilação semanal).",
           "conversation_fallback": "Assume com ferramentas quando o provedor de conversação primário falha.",
           "data_fallback": "Assume quando o provedor de dados primário falha.",
-          "telegram_chat_id": "Opcional. Deixe vazio para usar o primeiro chat permitido pelo bot do Telegram."
+          "telegram_chat_id": "Opcional. Deixe vazio para usar o primeiro chat permitido pelo bot do Telegram.",
+          "telegram_bot_entry_id": "Obrigatório quando há mais de um bot do Telegram configurado. O PERMEAR envia e responde pelo bot selecionado aqui."
         }
       }
     },
     "error": {
       "entity_not_found": "Esta entidade não foi encontrada no Home Assistant.",
-      "invalid_chat_id": "O chat ID deve ser um número (ex.: 123456789)."
+      "invalid_chat_id": "O chat ID deve ser um número (ex.: 123456789).",
+      "telegram_bot_missing": "Nenhuma entrada telegram_bot encontrada. Configure a integração do Telegram primeiro.",
+      "telegram_bot_not_selected": "Há mais de uma entrada telegram_bot. Selecione qual o PERMEAR deve usar.",
+      "telegram_bot_invalid": "A entrada telegram_bot selecionada é inválida: ela não existe mais no Home Assistant. Selecione outra."
     },
     "abort": {
       "single_instance_allowed": "Já configurado. Apenas uma instância é permitida."
@@ -37,6 +42,7 @@
           "sensitivity": "O quanto a casa fala com você",
           "daily_briefing_delivery": "Enviar o resumo diário (08:00)",
           "telegram_chat_id": "Chat ID do Telegram",
+          "telegram_bot_entry_id": "Bot do Telegram",
           "primary_resident": "Morador principal",
           "agent_name": "Nome que o assistente usa",
           "heartbeat_start": "Começar a prestar atenção às",
@@ -53,6 +59,7 @@
           "sensitivity": "O único ajuste de atenção. Mais quieto significa menos eventos chegando até você; o limiar de emissão se autorregula dentro da faixa escolhida.",
           "daily_briefing_delivery": "O resumo do dia anterior, enviado de manhã. Desligar interrompe só a mensagem — o ciclo noturno continua rodando e continua alimentando memória, prioridades e restrições. O resumo semanal é enviado de qualquer forma.",
           "telegram_chat_id": "Opcional. Deixe vazio para usar o primeiro chat permitido pelo bot do Telegram.",
+          "telegram_bot_entry_id": "Obrigatório quando há mais de um bot do Telegram configurado. O PERMEAR envia e responde pelo bot selecionado aqui.",
           "primary_resident": "O morador no qual o PERMEAR se centra. Escolha uma pessoa do Home Assistant, ou digite um nome para um morador sem cadastro de pessoa.",
           "agent_name": "Como o assistente se identifica na conversa. Deixe vazio para usar o nome neutro (PERMEAR).",
           "heartbeat_start": "Antes deste horário a casa fica em silêncio, aconteça o que acontecer.",
@@ -69,7 +76,10 @@
     },
     "error": {
       "entity_not_found": "Esta entidade não foi encontrada no Home Assistant.",
-      "invalid_chat_id": "O chat ID deve ser um número (ex.: 123456789)."
+      "invalid_chat_id": "O chat ID deve ser um número (ex.: 123456789).",
+      "telegram_bot_missing": "Nenhuma entrada telegram_bot encontrada. Configure a integração do Telegram primeiro.",
+      "telegram_bot_not_selected": "Há mais de uma entrada telegram_bot. Selecione qual o PERMEAR deve usar.",
+      "telegram_bot_invalid": "A entrada telegram_bot selecionada é inválida: ela não existe mais no Home Assistant. Selecione outra."
     }
   },
   "selector": {
@@ -84,7 +94,7 @@
   "issues": {
     "system_log_fire_event": {
       "title": "Monitor de erros do PERMEAR está inativo",
-      "description": "O monitor de erros precisa que a integração system_log dispare eventos. Adicione o seguinte ao configuration.yaml e reinicie:\n\n```yaml\nsystem_log:\n  fire_event: true\n```\n\nSem isso, nenhum card de erro será enviado ao Telegram."
+      "description": "O PERMEAR não conseguiu ligar os eventos de log do Home Assistant, então o monitor de erros está inativo. Não há nada para configurar: isso depende de uma atualização do PERMEAR."
     }
   }
 }

@@ -6,6 +6,49 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.23.0] — November 2026
+
+The house can now be asked to tell you something, and it stops claiming to have said things it never said.
+
+### Added
+
+- **Standing notices.** Accept one of the weekly suggestions and the house starts telling you about it on its own trigger — a time of day, or a device changing state — with an optional condition attached ("only if nobody has been home for two hours", "only if the air conditioning is on", "only if it stayed that way for a few minutes"). A notice only ever speaks: it never switches anything on or off. Notices are kept by the integration itself, need nothing added to your configuration, and are listed in `sensor.permear_household_data`. Ask the assistant to list or remove them at any time.
+- **Suggestions can be answered.** The weekly summary now shows each suggestion in full with a number. Reply "aceito 2" to have it built, or "recuso 2" to decline. A declined subject stays out of future summaries for 90 days, even if the wording changes. Answering "sim" right after a suggestion works too.
+- **Failed deliveries are visible.** When Telegram refuses a message, `sensor.permear_health` reports `entrega_falhando` and counts the failures of the day, instead of the failure passing unnoticed. The state clears on the next successful send.
+- **A sensor for the last message sent.** `sensor.permear_last_message` holds what the house last told you, exposed by the integration itself.
+
+### Changed
+
+- **The filter's sense of maturity is honest now.** The system's own housekeeping notes were being counted as things the house had taught it, which inflated its confidence and held the threshold at the top of its range. Only what the house actually taught counts. The practical effect is that the filter speaks a little more readily until real memory accumulates — see *Before you update* if you run it on the most sensitive setting.
+- **Creating device automations is gone.** Earlier versions offered to write Home Assistant automations that acted on devices. They were written to a file Home Assistant only read in some installations, so most of them never ran. The feature was replaced by standing notices, which work everywhere and only speak.
+- **Error cards no longer need configuration.** The "ERRO HA" cards used to require a line in `configuration.yaml`. The integration now enables that itself, and the line can be removed.
+- **Telegram messages name the bot explicitly**, so installations with more than one Telegram bot can be told which to use.
+
+### Fixed
+
+- **The house no longer learns from things it never told you.** One reply often covered several candidate events, and every one of them was recorded as having been said. So the system watched for your reaction to subjects that never reached you, read the silence as disinterest, and quietly lowered the attention it paid them. Only subjects actually named in a delivered message count.
+- **A message that fails to send is no longer recorded as sent.** It used to be marked as delivered and never raised again, so the information was lost rather than delayed. The subject now comes back on the next cycle, restated against the current state of the house.
+- **The nightly summary counts as sent only once it is delivered.**
+- **The system's own words no longer end up in the house's memory.** A weekly suggestion could reinforce — and even bring back — a memory of something you had said, by sharing a word with it. What the house says and what the system says are kept apart.
+- **Repeating something no longer throws away the new wording.** A memory reinforced by a differently worded observation used to keep only a counter; it now keeps the distinct wordings, with their dates.
+- **A suggestion you accepted stops appearing as open**, and two suggestions about the same device at different times are no longer treated as the same one.
+- **A notice you remove stops firing**, and reloading the integration no longer leaves old ones running alongside the new.
+- **A notice is built only from what you agreed to.** If the suggestion you accepted carried a condition, the notice must carry it too, or the request is declined with a reason — rather than quietly becoming an unconditional alert.
+- **Instruction names in the settings form.** The field for choosing a Telegram bot had no label, and its error message named the wrong problem.
+
+### Before you update
+
+- **If "how much the house tells you" is set to the most sensitive level, change it to the balanced level before updating.** With the honest maturity described above, the most sensitive range drops to its floor and the contextualised middle ground disappears, leaving only short factual lines — in the reference installation about 13 messages a day instead of about 3. The balanced and quiet levels need no action; they also speak somewhat more, and keep the middle ground.
+- **If you have more than one Telegram bot configured, open the integration's options and choose the bot.** Sending fails until you do, and `sensor.permear_health` will say so. A single bot needs no action.
+- **Automations created by earlier versions are not migrated.** They remain in `automations/permear_agent.yaml` and keep running only if Home Assistant was loading that file. PERMEAR no longer lists or removes them, so remove them by hand if you no longer want them.
+- **If you created an `input_text.permear_last_message` helper by hand**, it is no longer written to. Use `sensor.permear_last_message` instead.
+- **"ERRO HA" cards may be new to you.** Installations that never enabled the Home Assistant setting for them will start receiving them. There is no switch to turn them off; they are rate-limited.
+- **Attention levels settle over about four weeks.** Records written before this update still carry the inflated counts described above, and they leave the four-week window gradually.
+- **Anything you built on `sensor.permear_health`** should expect the new `entrega_falhando` state.
+- No database change, and no migration. Downgrading is untested.
+
+---
+
 ## [9.10.0] — October 2026
 
 The assistant now remembers what it just told you.

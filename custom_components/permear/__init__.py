@@ -3,7 +3,7 @@
 v8.8: in-process event capture (state-change listener → SQLite dual write).
 v8.9: in-process Heartbeat + ARAS + native status sensors.
 v8.10: in-process Sleep, Systems and Wake cycles (the shell automations stay
-until Hermes validates and cuts over — coexistence by design).
+until validated and cut over — coexistence by design).
 v9.0: config lives in the config entry (config_flow + options_flow); error
 monitor, Telegram handler (conversation + callbacks + agent automations CRUD)
 and the HA update cards are in-process — ZERO runtime shell remains. Saving
