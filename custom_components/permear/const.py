@@ -322,22 +322,62 @@ RULE_MENTION_HISTORY_MAX = 5
 # conversation — never the corpus.
 CONVERSATION_MEMORY_MAX_RULES = 6
 CONVERSATION_MEMORY_MAX_ROUTINES = 8
+# v9.26b — declared conditions in the memory block: their own cap, so they never
+# push the routines out of the 1500-char budget (the card lists them all).
+CONVERSATION_MEMORY_MAX_CONDITIONS = 5
 CONVERSATION_MEMORY_MAX_CHARS = 1500
 
 # v9.13 — "it matters, except when": a condition taught in speech, captured in
-# a CLOSED schema of three qualifiers. Evaluated from HA state, never by the
-# LLM. Captured only: no cycle consumes it yet, so a conditional rule is its own
-# kind, which every reader of 'behavior_rule' (ARAS included) ignores by
-# construction. What does not fit is discarded and counted, never stored.
+# a CLOSED schema (three qualifiers in v9.13, four since v9.26). Evaluated from
+# HA state, never by the LLM. A conditional rule is its own kind, which every
+# reader of 'behavior_rule' (ARAS included) ignores by construction; the cycle
+# reads it in _condition_restrictions (v9.24). What does not fit is discarded
+# and counted, never stored. v9.26 — a DECLARED condition does not fade by time:
+# it leaves only when contradicted (same entity and qualifier) or removed.
 CONDITIONAL_RULE_KIND = "conditional_rule"
 CONDITION_Q_PRESENCE = "presenca"     # nobody home for at least N minutes
 CONDITION_Q_DURATION = "duracao"      # the event's own state held at least/at most N s
 CONDITION_Q_COMPANION = "companheira" # another entity is in a given state
+# v9.26 — the fourth and last qualifier: the event HAPPENED inside a local time
+# range (start, end; end <= start crosses midnight). Declared conditions only:
+# the standing rules (rule #31) build theirs from their own closed list and
+# never receive it.
+CONDITION_Q_TIME = "horario"
 CONDITION_WHEN_MATTERS = "matters"    # the event matters only while it holds
 CONDITION_WHEN_IGNORED = "ignored"    # the event does not matter while it holds
 # Spoken durations without a number ("poucos segundos", "alguns minutos").
 CONDITION_VAGUE_SECONDS = {"poucos_segundos": 30, "alguns_minutos": 180}
+# v9.26 — spoken periods without hours, same idea: the same words always mean
+# the same range, decided here and not by the model on the night it heard them.
+CONDITION_VAGUE_PERIODS = {
+    "dia": ("06:00", "18:00"),
+    "noite": ("18:00", "06:00"),
+    "madrugada": ("00:00", "06:00"),
+    "almoco": ("11:00", "14:00"),
+}
 CONDITION_MAX_SECONDS = 86400
+# v9.26 — what describes NORMALITY ("é normal", "é comum", "tem interferência")
+# is a condition, never a refusal and never prose (R5). Closed, accent-free,
+# whole PHRASES, not bare words: "área comum" or "modo normal" name a thing and
+# say nothing about normality. A line that STARTS with "normal" ("normal e
+# irrelevante", 09/08) counts too. Measured on the corpus of 21/11: 4 of 195
+# messages match (all four are normality statements), 0 of 137 Sleep memories.
+CONDITION_NORMALITY_MARKERS = (
+    "e normal", "eh normal", "sao normais", "e comum", "sao comuns",
+    "e esperado", "e esperada", "sao esperados", "sao esperadas",
+    "e habitual", "sao habituais", "costuma", "costumam",
+    "interferencia", "interferencias",
+)
+# v9.26 — states that END an active span when measuring a duration (event_span):
+# the companion "off" states plus the closed edge of covers, locks and vacuums.
+# Kept apart from CONDITION_INACTIVE_STATES, whose meaning for a companion
+# ("ligado") must not move.
+CONDITION_SPAN_INACTIVE_STATES = (
+    "off", "idle", "standby", "closed", "locked", "docked",
+)
+# Cards: how many declared conditions get a Remover button (every one is
+# listed in text with its #id, which "remover condição #N" accepts).
+CONDITION_LIST_MAX = 20
 # A companion "ligado" is any live state of its domain (a climate reads
 # cool/heat, a media_player playing), so "on" means not one of these.
 CONDITION_INACTIVE_STATES = ("off", "idle", "standby")
@@ -472,6 +512,11 @@ TRANSIENT_MSG_KEYWORDS = (
     "clientconnectionreseterror",
     "cannot write to closing transport",
     "connectionreseterror",
+    # v9.25 — HA open_router json_parse_error: the model's reply to a
+    # structured request did not parse. One response, external, resolved by the
+    # retry/fallback choreography. Today it only reaches the log as PERMEAR's
+    # own WARNING (never a card); this keeps it so if it is ever logged at ERROR.
+    "error with openrouter structured response",
 )
 # Gemini content-policy blocks (the integration logs e.g. "Error in Google
 # Generative AI response: FinishReason.SAFETY, see: ..."). These are EXTERNAL
@@ -489,6 +534,8 @@ GOOGLE_BLOCK_FINISH_REASONS = (
     "finishreason.spii",
 )
 ERROR_ARCHIVE_EXPIRATION_HOURS = 24
+# v9.25 — pause before the single retry of a primary data provider that raised.
+AI_PRIMARY_RETRY_DELAY_SECONDS = 2
 # Flood guard — ports the shell's queued(max 5) + 10-min tail delay.
 ERROR_CARD_WINDOW_SECONDS = 600
 ERROR_CARD_MAX_PER_WINDOW = 5

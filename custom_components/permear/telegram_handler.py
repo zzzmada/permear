@@ -43,6 +43,7 @@ from .agent_automations import (
 from .ai_client import AiTaskClient
 from .config import PermearConfig
 from .const import (
+    CONDITION_LIST_MAX,
     CONVERSATION_RETRY_DELAYS,
     MONITORED_ENTITIES_RELATIVE_PATH,
     REACTION_WINDOW_MINUTES,
@@ -54,6 +55,7 @@ from .const import (
 from .error_monitor import archive_error
 from .household import (
     agent_preamble,
+    describe_condition_pt,
     get_resident_names,
     memory_block,
     outbound_block,
@@ -79,6 +81,37 @@ _LIST_KEYWORDS = (
     "minhas automacoes", "minhas automações",
 )
 _INTERNAL_TOKENS = ("LIST_AUTOS", "NO_AUTOMATIONS", "CREATE_AUTO:", "REMOVE_AUTO:")
+# v9.26 — the declared conditions have a permanent way out (R2), in the same
+# shape as the standing rules: a list card with one Remover button each.
+# v9.26b — any message that names "condição" with a verb of listing or of
+# removing is routed here, before the conversation (which can only talk). A
+# removal names "#id" or the card's own number; without one, the card answers.
+# v9.26b — intents, not words: "não tenho condição", "condições do tempo" are
+# ordinary Portuguese and go to the conversation. A list names "minhas/suas
+# condições", a listing verb, "quais condições … guardou/tem/valem", or is
+# just "condições?". A removal needs a removal verb and a stored condition: a
+# determiner ("a/essa/aquela condição") or a number right after "condição".
+_COND_PLURAL = r"condi(?:c|ç)(?:oes|ões)"
+_COND_SINGULAR = r"condi(?:c|ç)(?:ao|ão)"
+_CONDITION_LIST = re.compile(
+    rf"\b(?:minhas|suas) {_COND_PLURAL}\b"
+    rf"|\b(?:listar|liste|lista|listem|mostrar|mostra|mostre)\b.*\b{_COND_PLURAL}\b"
+    rf"|\bquais\b.*\b{_COND_PLURAL}\b.*\b(?:guard\w*|tem|existem|valem|vigor|salv\w*)\b"
+    rf"|\b{_COND_PLURAL} (?:guardadas|salvas|em vigor)\b"
+    rf"|^\s*{_COND_PLURAL}\s*\??\s*$"
+)
+_CONDITION_REMOVE_VERB = re.compile(
+    r"\b(?:remover|remova|remove|apagar|apague|apaga|excluir|exclua|exclui|"
+    r"tirar|tira|tire|retirar|retire|esquecer|esquece|esque(?:c|ç)a|deletar|"
+    r"delete|cancelar|cancele|cancela|desativar|desative|desativa)\b"
+    r"|\bn(?:a|ã)o quero mais\b"
+)
+_CONDITION_TARGET = re.compile(
+    rf"\b(?:a|as|essa|essas|esta|estas|aquela|aquelas) (?:{_COND_SINGULAR}|{_COND_PLURAL})\b"
+    rf"|\b{_COND_SINGULAR}\s*(?:n(?:º|o|°|\.)\s*)?#?\s*\d+"
+)
+_CONDITION_ID = re.compile(rf"{_COND_SINGULAR}\s*#\s*(\d+)|#\s*(\d+)")
+_CONDITION_NUMBER = re.compile(rf"\b{_COND_SINGULAR}\s*(?:n(?:º|o|°|\.)\s*)?(\d+)\b")
 # v9.16 — an answer to a suggestion: a verb, optionally the #id it refers to.
 _SUGGESTION_ANSWER = re.compile(
     r"^(sim|aceito|aceitar|aceita|nao|não|recuso|recusar|recusa)\b[^\d]*#?(\d+)?"
@@ -238,6 +271,15 @@ class PermearTelegramHandler:
 
         if self._pending_state in ("awaiting_new", "awaiting_edit"):
             await self._spec_creation_flow(text)
+            return
+
+        # v9.26b — after the standing-rule flows: "tira a condição" while a
+        # proposal is being edited is about the proposal.
+        if _CONDITION_REMOVE_VERB.search(lower) and _CONDITION_TARGET.search(lower):
+            await self._condition_removal_turn(lower)
+            return
+        if _CONDITION_LIST.search(lower):
+            await self._send_conditions_card()
             return
 
         if await self._suggestion_turn(lower):
@@ -464,10 +506,15 @@ Use SOMENTE estes entity_ids:
         memory = ""
         if conv_id != self._context_conv_id:
             try:
+                learned = await self._storage.async_conversation_memory()
+                learned["conditions"] = [
+                    {**c, "text": describe_condition_pt(c, self._friendly)}
+                    for c in learned.get("conditions") or []
+                ]
                 memory = memory_block(
                     get_resident_names(self._hass),
                     self._config.primary_resident,
-                    await self._storage.async_conversation_memory(),
+                    learned,
                 )
             except Exception:  # noqa: BLE001 — memory must never block a reply
                 _LOGGER.exception("Conversation memory block failed")
@@ -624,6 +671,8 @@ Use SOMENTE estes entity_ids:
                 self._set_state("awaiting_new", None)
             elif command == "/listar_automacoes":
                 await self._send_list_card()
+            elif command == "/listar_condicoes":
+                await self._send_conditions_card()
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Telegram command handling failed")
 
@@ -647,6 +696,84 @@ Use SOMENTE estes entity_ids:
         await async_send_telegram(
             self._hass, "\n".join(lines), inline_keyboard=keyboard
         )
+
+    # ------------------------------------------------------------------
+    # Declared conditions (v9.26, R2): list and remove
+    # ------------------------------------------------------------------
+
+    def _friendly(self, entity_id: str) -> str:
+        state = self._hass.states.get(entity_id)
+        name = state.attributes.get("friendly_name") if state is not None else None
+        if name:
+            return str(name)
+        return entity_id.split(".", 1)[-1].replace("_", " ")
+
+    def describe_declared_condition(self, item: dict) -> str:
+        return describe_condition_pt(item, self._friendly)
+
+    async def _send_conditions_card(self, ask_which: bool = False) -> None:
+        conditions = await self._storage.async_list_conditions()
+        if not conditions:
+            await async_send_telegram(
+                self._hass,
+                "🧭 Suas condições\n\n"
+                "Nenhuma condição guardada.\n"
+                "Elas nascem do que você me explica, como \"a porta só importa "
+                "com o ar ligado\".",
+            )
+            return
+        # Every condition is listed with its #id; the first CONDITION_LIST_MAX
+        # also get a button. The numbers are the card's, the same ones
+        # "remover condição N" accepts.
+        lines = [f"🧭 Suas condições ({len(conditions)})", ""]
+        if ask_which:
+            lines = ["Qual delas? Toque em Remover N ou diga \"remover condição N\".", "", *lines]
+        for i, item in enumerate(conditions, 1):
+            since = str(item.get("first_seen") or "")[:10]
+            since = f"{since[8:10]}/{since[5:7]}" if len(since) == 10 else "?"
+            lines.append(
+                f"{i}. {self.describe_declared_condition(item)}"
+                f" (#{item['id']}, desde {since})"
+            )
+        lines += ["", "Valem até você mudar ou remover. Toque em Remover N para excluir."]
+        keyboard = [
+            f"Remover {i}:/crmv_confirm_{item['id']}"
+            for i, item in enumerate(conditions[:CONDITION_LIST_MAX], 1)
+        ]
+        # The numbers of THIS card, for "remover condição N" until the next one:
+        # a removal does not renumber what the resident is reading.
+        self._condition_card_ids = [item["id"] for item in conditions]
+        await async_send_telegram(
+            self._hass, "\n".join(lines), inline_keyboard=keyboard
+        )
+
+    async def _condition_removal_turn(self, lower: str) -> None:
+        """'#N' is an id. 'condição N' is the number on the LAST card shown
+        (kept in memory; a restart forgets it). Anything else, or no card yet:
+        the card, asking which one. Numbers elsewhere in the sentence ('a da
+        TV de 2 min 30 s') are not read."""
+        by_id = _CONDITION_ID.search(lower)
+        target = None
+        if by_id:
+            target = int(by_id.group(1) or by_id.group(2))
+        else:
+            number = _CONDITION_NUMBER.search(lower)
+            shown = getattr(self, "_condition_card_ids", None) or []
+            if number is not None and 1 <= int(number.group(1)) <= len(shown):
+                target = shown[int(number.group(1)) - 1]
+        if target is None:
+            await self._send_conditions_card(ask_which=True)
+            return
+        await async_send_telegram(self._hass, await self._remove_condition(target))
+
+    async def _remove_condition(self, item_id: int) -> str:
+        removed = await self._storage.async_remove_condition(item_id)
+        if removed is None:
+            return (f"Não achei a condição #{item_id} em vigor. "
+                    "Use /listar_condicoes para ver as que existem.")
+        return (f"Condição #{item_id} removida: "
+                f"{self.describe_declared_condition(removed)}. "
+                "Se você disser de novo, ela volta a valer a partir de amanhã.")
 
     # ------------------------------------------------------------------
     # telegram_callback (inline keyboard buttons)
@@ -726,6 +853,15 @@ Use SOMENTE estes entity_ids:
         elif "drmv_confirm_" in cb_data:
             ident = cb_data.split("drmv_confirm_")[1]
             result = await self._autos.async_remove(ident)
+            await answer("Removida")
+            await edit(result)
+
+        elif "crmv_confirm_" in cb_data:
+            try:
+                item_id = int(cb_data.split("crmv_confirm_")[1])
+            except ValueError:
+                return
+            result = await self._remove_condition(item_id)
             await answer("Removida")
             await edit(result)
 

@@ -31,8 +31,12 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from .const import (
+    CONDITION_Q_DURATION,
+    CONDITION_Q_COMPANION,
     SCHEMA_VERSION,
     ARAS_STATS_RELATIVE_PATH,
+    CAPTURE_DOMAINS,
+    SUBJECT_NOISE_TOKENS,
     CONDITIONAL_RULE_KIND,
     BATTERY_RENOTIFY_DAYS,
     DRY_BOOST_EXCLUDED_DOMAINS,
@@ -205,6 +209,62 @@ def _subject_tokens(text: str) -> set:
         and tok not in _RESTRICTION_FILLER_TOKENS
         and tok not in _RESTRICTION_ACT_TOKENS
     }
+
+
+# v9.25 — short PT function words; device words may be two letters ("tv", "ar").
+_SHORT_FUNCTION_WORDS = frozenset({
+    "da", "do", "de", "em", "no", "na", "os", "as", "um", "ao", "se",
+})
+
+
+def _device_word(word: str) -> str:
+    """Accent-free, lowercase, PT plural folded to the singular the registry
+    uses: luzes→luz, paineis→painel, cortinas→cortina, dimmers→dimmer."""
+    w = "".join(
+        c for c in unicodedata.normalize("NFD", word.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    if len(w) > 4 and w.endswith("eis"):
+        return w[:-3] + "el"
+    if len(w) > 4 and w.endswith("oes"):
+        return w[:-3] + "ao"
+    if len(w) > 4 and w.endswith("es") and w[-3] in "rzs":
+        return w[:-2]
+    if len(w) > 3 and w.endswith("ns"):
+        return w[:-2] + "m"
+    if len(w) > 3 and w.endswith("s"):
+        return w[:-1]
+    return w
+
+
+def _text_words(text: str) -> set:
+    return {_device_word(w) for w in re.findall(r"[^\W\d_]+", text or "")}
+
+
+def device_vocabulary(entities) -> frozenset:
+    """The words this house uses to NAME its monitored devices (v9.25), from
+    their own friendly names: rooms and directions out (they name a place, not
+    the device), function words and digits out. Derived, never listed."""
+    vocab: set = set()
+    for e in entities or ():
+        if not isinstance(e, dict) or not e.get("monitor"):
+            continue
+        if str(e.get("entity_id") or "").split(".", 1)[0] not in CAPTURE_DOMAINS:
+            continue
+        vocab |= {
+            w for w in _text_words(e.get("friendly_name") or "")
+            if len(w) >= 2
+            and w not in _SHORT_FUNCTION_WORDS
+            and w not in SUBJECT_NOISE_TOKENS
+            and w not in _RESTRICTION_FILLER_TOKENS
+        }
+    return frozenset(vocab)
+
+
+def named_subject(text: str, vocabulary: frozenset) -> frozenset:
+    """Which devices a sentence talks about, as the house's device words it
+    contains. PURE. Empty = it names no device: the subject is unknown."""
+    return frozenset(_text_words(text) & vocabulary)
 
 
 def _engagement_delta(ent: dict, floor: int, current: int) -> int:
@@ -529,6 +589,13 @@ class PermearStorage:
                 "SELECT content, key, metadata FROM memory_items"
                 " WHERE kind = 'behavior_rule' AND tier != 'faded'"
             ).fetchall()
+            # v9.24 — live conditions (rule #27). Only handed to the caller:
+            # whether one applies is read from HA state there, never here.
+            cond_rows = self._conn.execute(
+                "SELECT id, metadata FROM memory_items"
+                " WHERE kind = ? AND tier != 'faded'",
+                (CONDITIONAL_RULE_KIND,),
+            ).fetchall()
             # Nocturnal habituation (v9.2.2) — only needed on the first cycle
             # (the one whose window reaches the night). ONE deterministic query
             # over the existing event_log: entities with small-hours activity on
@@ -590,11 +657,20 @@ class PermearStorage:
             restrictions.append(
                 {"content": r["content"], "entity_id": entity_id}
             )
+        conditions = []
+        for r in cond_rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if meta.get("entity_id") and isinstance(meta.get("condition"), dict):
+                conditions.append(
+                    {"id": r["id"], "entity_id": meta["entity_id"],
+                     "condition": meta["condition"]}
+                )
         return {
             "events": events,
             "recent_keys": recent_keys,
             "consolidated_count": consolidated,
             "restrictions": restrictions,
+            "conditions": conditions,
             "nocturnal_habitual": nocturnal_habitual,
             "presence_recent": presence_recent,
         }
@@ -717,7 +793,7 @@ class PermearStorage:
         with self._lock:
             if key:
                 hit = self._conn.execute(
-                    "SELECT id, tier, first_seen FROM memory_items WHERE key = ?"
+                    "SELECT id, tier, first_seen, kind FROM memory_items WHERE key = ?"
                     " ORDER BY last_seen DESC LIMIT 1",
                     (key,),
                 ).fetchone()
@@ -758,10 +834,21 @@ class PermearStorage:
                     self._conn.commit()
                     return hit["id"], False, "subject"
             rows = []
-            if not key and kind != "behavior_rule":
+            # v9.25 — similar words do not prove the same SUBJECT either. A
+            # Sleep episode about two light switches reinforced a TV
+            # row (#301, 03/11), and a TV evening resurrected a faded note about
+            # the kitchen (#136, 09/11). FTS still ranks; it may only land on a
+            # row that names the same devices. No device named means no subject
+            # to compare, and the text is born as its own row.
+            fts_eligible = not key and kind != "behavior_rule"
+            subject = (
+                named_subject(content, self._device_vocabulary())
+                if fts_eligible else frozenset()
+            )
+            if fts_eligible and subject:
                 try:
                     rows = self._conn.execute(
-                        "SELECT m.id, m.tier, m.first_seen, m.key,"
+                        "SELECT m.id, m.tier, m.first_seen, m.key, m.content,"
                         " bm25(memory_fts) AS score"
                         " FROM memory_fts JOIN memory_items m"
                         " ON m.id = memory_fts.rowid"
@@ -772,11 +859,17 @@ class PermearStorage:
                         # v9.14 — since v9.11 the counters are 'observation' too;
                         # a Sleep memory must not vanish into a bare device name.
                         f" AND NOT {_BOOKKEEPING_SQL}"
-                        " ORDER BY score LIMIT 1",
+                        " ORDER BY score LIMIT 10",
                         (_fts_query(content), kind, source),
                     ).fetchall()
                 except sqlite3.OperationalError:
                     rows = []  # FTS query parse issue -> treat as no match
+                vocab = self._device_vocabulary()
+                rows = [
+                    r for r in rows
+                    if r["score"] <= MEMORY_FTS_MIN_SCORE
+                    and named_subject(r["content"], vocab) == subject
+                ]
             if rows and rows[0]["score"] <= MEMORY_FTS_MIN_SCORE:
                 self._reinforce_row_locked(rows[0], now, content, source)
                 self._conn.commit()
@@ -790,6 +883,20 @@ class PermearStorage:
             )
             self._conn.commit()
             return cur.lastrowid, True, "new"
+
+    def _device_vocabulary(self) -> frozenset:
+        """Executor only. Re-read when monitored_entities.json changes."""
+        path = self._hass.config.path(MONITORED_ENTITIES_RELATIVE_PATH)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        cached = getattr(self, "_vocab_cache", None)
+        if cached is None or cached[0] != mtime:
+            data = load_json(path, {"entities": []}) or {}
+            cached = (mtime, device_vocabulary(data.get("entities") or []))
+            self._vocab_cache = cached
+        return cached[1]
 
     def _same_subject_rule_locked(self, content: str, metadata: dict):
         """The keyless behavior_rule that says the same thing, or None (v9.9).
@@ -844,8 +951,13 @@ class PermearStorage:
         v9.14 — `content` stays frozen (rule #22), but a mention that says
         something new is no longer thrown away: see _note_evidence_locked.
         """
+        # v9.26b — a declared condition never promotes, so the promotion epoch
+        # means nothing for it: a restatement 30+ days later used to reset
+        # first_seen and mention_count, and the card's "desde" with them.
+        declared = "kind" in row.keys() and row["kind"] == CONDITIONAL_RULE_KIND
         stale_ephemeral = (
-            row["tier"] == "ephemeral"
+            not declared
+            and row["tier"] == "ephemeral"
             and (datetime.now() - _parse_iso(row["first_seen"])).days
             > MEMORY_ACTIVE_PROMOTE_WINDOW
         )
@@ -979,14 +1091,27 @@ class PermearStorage:
     # ------------------------------------------------------------------
 
     async def async_add_restriction(
-        self, content: str, entity_id: str | None
+        self, content: str, entity_id: str | None, speech: str | None = None
     ) -> dict:
-        """Persist one restriction intent, scoped. Returns what was decided."""
+        """Persist one restriction intent, scoped. Returns what was decided.
+        speech (v9.25): the resident's own words of the day, to ground a
+        keyless refusal in what he actually said."""
         return await self._hass.async_add_executor_job(
-            self._add_restriction, content, entity_id
+            self._add_restriction, content, entity_id, speech
         )
 
-    def _add_restriction(self, content: str, entity_id: str | None) -> dict:
+    @staticmethod
+    def grounded_subject(content: str, speech: str) -> set:
+        """The refusal's subject that the resident actually SAID (v9.25). PURE.
+        The extraction paraphrases: "irrelevante" (09/11) came back as "Não
+        avisar sobre nenhum assunto mencionado como irrelevante", whose words
+        are the model's, not his, and that was enough to pass the v9.9 check
+        and become a live rule (#333). The subject has to be in his speech."""
+        return _subject_tokens(content) & _subject_tokens(speech or "")
+
+    def _add_restriction(
+        self, content: str, entity_id: str | None, speech: str | None = None
+    ) -> dict:
         # v9.9 — a refusal must name what it refuses. "irrelevante" alone
         # (extracted twice from a CONDITIONAL sentence) has no subject left
         # once the refusal verbs are stripped: it can match nothing on purpose
@@ -997,6 +1122,20 @@ class PermearStorage:
             )
             return {"id": None, "scope": None, "insight_id": None}
         scope, insight_id = self._classify_restriction(content, entity_id)
+        # v9.25 — judged on the resident's words, not the paraphrase. Only for
+        # what would reach the ARAS by word: an [entity:…] tag and a match to a
+        # real Systems insight are structural evidence of their own. No speech
+        # handed in (None) keeps the old behaviour.
+        if (
+            speech is not None and not entity_id
+            and scope == RESTRICTION_SCOPE_EVENTS
+            and not self.grounded_subject(content, speech)
+        ):
+            _LOGGER.info(
+                "Restriction dropped — its subject is not in the resident's "
+                "speech: %r", content,
+            )
+            return {"id": None, "scope": None, "insight_id": None}
         metadata = {"restriction": True, "scope": scope}
         if entity_id:
             metadata["entity_id"] = entity_id
@@ -1032,9 +1171,9 @@ class PermearStorage:
     async def async_add_conditional_rule(
         self, content: str, entity_id: str, condition: dict
     ) -> dict:
-        """Persist one rule that carries its condition (v9.13). Inert until a
-        cycle consumes it: its own kind, so nothing that reads 'behavior_rule'
-        sees it."""
+        """Persist one rule that carries its condition (v9.13). Its own kind,
+        so nothing that reads 'behavior_rule' sees it; the cycle reads it in
+        _condition_restrictions (v9.24)."""
         return await self._hass.async_add_executor_job(
             self._add_conditional_rule, content, entity_id, condition
         )
@@ -1046,38 +1185,224 @@ class PermearStorage:
         refusal of the same entity (key 'restriction:<eid>') must never land on
         this row and go inert with it. source='daily' because the 'interaction'
         readers feed Sleep and engagement as if it were the resident's speech.
-        A re-statement keeps the row and takes the latest condition: the key
-        already says it is the same subject and the same qualifier."""
+
+        v9.26 — the newest statement IS the condition (R1). The key already
+        says it is the same subject and the same qualifier, so a re-statement
+        replaces both the condition and its words; what it replaced stays in
+        metadata.mentions. A condition the resident removed comes back only
+        this way: said again, it is declared again."""
+        self._converge_condition_keys()
+        key = self.condition_key(entity_id, condition)
+        assert self._conn is not None
+        # v9.26b — the resident's removal today is his latest act on it: the
+        # Sleep of the same day reads ALL of today's speech, the sentence the
+        # condition came from included, and cannot tell before from after.
+        with self._lock:
+            prior = self._conn.execute(
+                "SELECT id, tier, metadata FROM memory_items WHERE key = ?"
+                " ORDER BY last_seen DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        if prior is not None and prior["tier"] == "faded":
+            prior_meta = json.loads(prior["metadata"]) if prior["metadata"] else {}
+            removed = str(prior_meta.get("removed_at") or "")
+            # Only the SAME condition is held back: a different one on the same
+            # key the same day ("na verdade, depois de 5 minutos") is a new
+            # declaration, not the removed one coming back.
+            if removed[:10] == _today_local() and prior_meta.get("condition") == condition:
+                _LOGGER.info(
+                    "Conditional rule %s not restored: removed by the resident "
+                    "today (%s): %r", prior["id"], removed, content,
+                )
+                return {"id": None, "new": False, "replaced": None,
+                        "blocked": "removed_today"}
         item_id, was_new, _via = self._add_or_reinforce(
             content, kind=CONDITIONAL_RULE_KIND, source="daily",
-            key=f"condition:{entity_id}:{condition['q']}",
+            key=key,
             metadata={"entity_id": entity_id, "condition": condition},
         )
-        self._update_metadata(item_id, {"condition": condition})
-        self._note_rule_mention(item_id, content, None, None)
-        _LOGGER.info(
-            "Conditional rule %s %s: %r %s", item_id,
-            "created" if was_new else "reinforced", content, condition,
+        replaced = None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, metadata FROM memory_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
+            if not was_new and meta.get("condition") != condition:
+                replaced = meta.get("condition")
+            meta["entity_id"] = entity_id
+            meta["condition"] = condition
+            meta.pop("removed_at", None)
+            self._conn.execute(
+                "UPDATE memory_items SET content = ?, metadata = ? WHERE id = ?",
+                (content, json.dumps(meta, ensure_ascii=False), item_id),
+            )
+            self._conn.commit()
+        self._note_rule_mention(
+            item_id, content, None, None, extra={"condition": condition},
         )
-        return {"id": item_id, "new": was_new}
+        _LOGGER.info(
+            "Conditional rule %s %s: %r %s%s", item_id,
+            "created" if was_new else "restated", content, condition,
+            f" (replaced {replaced})" if replaced is not None else "",
+        )
+        return {"id": item_id, "new": was_new, "replaced": replaced}
 
-    async def async_count_conditions(self, captured: int, discarded: int) -> None:
+    @staticmethod
+    def condition_key(entity_id: str, condition: dict) -> str:
+        """The identity of a declared condition (v9.26b): what a new statement
+        REPLACES. Entity + qualifier, plus the companion entity for
+        'companheira' (a door that matters only with the air on and does not
+        matter with someone in the kitchen holds two conditions, not one) and
+        the bound for 'duracao' (at least / at most are not the same claim)."""
+        q = condition.get("q")
+        if q == CONDITION_Q_COMPANION:
+            return f"condition:{entity_id}:{q}:{condition.get('entity_id')}"
+        if q == CONDITION_Q_DURATION:
+            bound = "min" if "min_seconds" in condition else "max"
+            return f"condition:{entity_id}:{q}_{bound}"
+        return f"condition:{entity_id}:{q}"
+
+    def _converge_condition_keys(self) -> int:
+        """Convergence (v9.26b, idempotent): rows keyed the v9.13 way
+        ('condition:<eid>:<q>') take the key condition_key gives them now, so
+        a restatement finds them (#322). A row whose new key is already taken
+        is left alone and logged: two rows never share a key."""
+        assert self._conn is not None
+        moved = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, key, metadata FROM memory_items WHERE kind = ?",
+                (CONDITIONAL_RULE_KIND,),
+            ).fetchall()
+            taken = {r["key"] for r in rows}
+            for r in rows:
+                meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                eid, cond = meta.get("entity_id"), meta.get("condition")
+                if not eid or not isinstance(cond, dict):
+                    continue
+                target = self.condition_key(eid, cond)
+                if r["key"] == target:
+                    continue
+                if target in taken:
+                    _LOGGER.info(
+                        "Conditional rule %s keeps key %s: %s is taken",
+                        r["id"], r["key"], target,
+                    )
+                    continue
+                self._conn.execute(
+                    "UPDATE memory_items SET key = ? WHERE id = ?", (target, r["id"])
+                )
+                taken.discard(r["key"])
+                taken.add(target)
+                moved += 1
+            self._conn.commit()
+        return moved
+
+    async def async_list_conditions(self) -> list:
+        """The declared conditions in force, oldest first (v9.26, R2)."""
+        return await self._hass.async_add_executor_job(self._list_conditions)
+
+    def _list_conditions(self) -> list:
+        assert self._conn is not None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content, first_seen, last_seen, mention_count, metadata"
+                " FROM memory_items WHERE kind = ? AND tier != 'faded'"
+                " ORDER BY first_seen",
+                (CONDITIONAL_RULE_KIND,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            if not meta.get("entity_id") or not isinstance(meta.get("condition"), dict):
+                continue
+            out.append({
+                "id": r["id"], "content": r["content"],
+                "entity_id": meta["entity_id"], "condition": meta["condition"],
+                "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+                "mention_count": r["mention_count"],
+            })
+        return out
+
+    async def async_remove_condition(self, item_id: int) -> dict | None:
+        """The resident's own removal of one declared condition (v9.26, R2)."""
+        return await self._hass.async_add_executor_job(
+            self._remove_condition, item_id
+        )
+
+    def _remove_condition(self, item_id: int) -> dict | None:
+        """Out of force, not deleted: tier faded and `removed_at`, the row and
+        its mentions stay. None when there is no such condition in force."""
+        assert self._conn is not None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, content, tier, metadata FROM memory_items"
+                " WHERE id = ? AND kind = ?",
+                (item_id, CONDITIONAL_RULE_KIND),
+            ).fetchone()
+            if row is None or row["tier"] == "faded":
+                return None
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            meta["removed_at"] = datetime.now().isoformat()
+            self._conn.execute(
+                "UPDATE memory_items SET tier = 'faded', metadata = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), item_id),
+            )
+            self._conn.commit()
+        _LOGGER.info("Conditional rule %s removed by the resident", item_id)
+        return {"id": row["id"], "content": row["content"],
+                "entity_id": meta.get("entity_id"),
+                "condition": meta.get("condition")}
+
+    async def async_events_before(
+        self, entity_id: str, ts: str, limit: int = 50
+    ) -> list:
+        """The entity's recorded events before `ts`, oldest first (v9.26b)."""
+        return await self._hass.async_add_executor_job(
+            self._events_before, entity_id, ts, limit
+        )
+
+    def _events_before(self, entity_id: str, ts: str, limit: int = 50) -> list:
+        """From event_log (30 days, LOCAL ts — rule #3), at most `limit`:
+        enough to find where an active run began (heartbeat.event_span). Pure
+        SQL; what the spans MEAN is decided by the caller."""
+        assert self._conn is not None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, detalhe, metadata FROM event_log"
+                " WHERE entity_id = ? AND ts < ? ORDER BY ts DESC LIMIT ?",
+                (entity_id, ts, limit),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    async def async_count_conditions(
+        self, captured: int, discarded: int, normality: int = 0
+    ) -> None:
         """Conditions taught today, for the day's ARAS stats (v9.13). The ratio
-        is what validates or refutes the three qualifiers; it is never told to
-        the resident."""
-        if captured or discarded:
+        is what validates or refutes the qualifiers; it is never told to the
+        resident. v9.26 — `normality`: lines that described what is normal but
+        came back as a refusal or as a memory, dropped (R5)."""
+        if captured or discarded or normality:
             await self._hass.async_add_executor_job(
-                self._count_conditions, captured, discarded
+                self._count_conditions, captured, discarded, normality
             )
 
-    def _count_conditions(self, captured: int, discarded: int) -> None:
+    def _count_conditions(
+        self, captured: int, discarded: int, normality: int = 0
+    ) -> None:
         path = self._hass.config.path(ARAS_STATS_RELATIVE_PATH)
         with locked_json_update(path, {}) as s:
             s["cond_captured"] = s.get("cond_captured", 0) + captured
             s["cond_discarded"] = s.get("cond_discarded", 0) + discarded
+            if normality:
+                s["cond_normality_dropped"] = (
+                    s.get("cond_normality_dropped", 0) + normality
+                )
 
     def _note_rule_mention(
-        self, item_id: int, content: str, scope: str, insight_id
+        self, item_id: int, content: str, scope: str, insight_id,
+        extra: dict | None = None,
     ) -> None:
         """Record the phrasing behind this mention and fill a MISSING scope.
 
@@ -1098,7 +1423,9 @@ class PermearStorage:
                 if insight_id is not None:
                     meta["insight_id"] = insight_id
             mentions = list(meta.get("mentions") or [])
-            mentions.append({"at": datetime.now().isoformat(), "text": content})
+            mentions.append({
+                "at": datetime.now().isoformat(), "text": content, **(extra or {}),
+            })
             meta["mentions"] = mentions[-RULE_MENTION_HISTORY_MAX:]
             self._conn.execute(
                 "UPDATE memory_items SET metadata = ? WHERE id = ?",
@@ -1434,6 +1761,9 @@ class PermearStorage:
         return {
             "rules": rules[:CONVERSATION_MEMORY_MAX_RULES],
             "routines": [dict(r) for r in routine_rows],
+            # v9.26b — D4: what the resident declared and is in force, so the
+            # agent stops denying it (same rows as the Telegram card).
+            "conditions": self._list_conditions(),
         }
 
     async def async_add_or_reinforce(
@@ -1469,10 +1799,13 @@ class PermearStorage:
         assert self._conn is not None
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         with self._lock:
+            # v9.26b — D3 (PM decision): a declared condition is not a memory
+            # of the week, in force or removed. Its words would reach the
+            # Systems prompt as "Memorias extraidas da semana".
             rows = self._conn.execute(
                 "SELECT content FROM memory_items WHERE source=? AND last_seen >= ?"
-                " ORDER BY last_seen DESC",
-                (source, cutoff),
+                " AND kind != ? ORDER BY last_seen DESC",
+                (source, cutoff, CONDITIONAL_RULE_KIND),
             ).fetchall()
         return [r["content"] for r in rows]
 
@@ -1597,13 +1930,68 @@ class PermearStorage:
     def _run_maintenance(self, binary_device_classes: dict | None = None) -> dict:
         scoped = self._converge_restriction_scopes()
         reclassified = self._reclassify_system_evidence()
+        ungrounded = self._retire_ungrounded_rules()
+        condition_keys = self._converge_condition_keys()
         counts = self._tier_maintenance()
         changes = self._update_priority_from_memory(binary_device_classes or {})
         report = {"tiers": counts, "priority_changes": changes,
                   "restrictions_scoped": scoped,
-                  "evidence_reclassified": reclassified}
+                  "evidence_reclassified": reclassified,
+                  "rules_ungrounded": ungrounded,
+                  "condition_keys": condition_keys}
         _LOGGER.info("Memory maintenance: %s", report)
         return report
+
+    def _retire_ungrounded_rules(self) -> int:
+        """Convergence (v9.25, idempotent): a live keyless event rule whose
+        subject the resident never said leaves vigour. Faded, not deleted, and
+        marked `ungrounded_at` so the v9.7 calibration un-fade does not bring
+        it back. Judged on the speech of the days the rule was stated (its
+        mentions, else its birth); no speech found for those days ⇒ kept, in
+        doubt the rule stays as it is."""
+        assert self._conn is not None
+        retired = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content, first_seen, metadata FROM memory_items"
+                " WHERE kind = 'behavior_rule' AND key IS NULL"
+                " AND tier != 'faded'"
+            ).fetchall()
+            for r in rows:
+                meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                if (meta.get("scope") or RESTRICTION_SCOPE_EVENTS) != RESTRICTION_SCOPE_EVENTS:
+                    continue
+                if meta.get("entity_id"):
+                    continue
+                days = {
+                    str(m.get("at") or "")[:10] for m in meta.get("mentions") or []
+                } - {""} or {str(r["first_seen"])[:10]}
+                ph = ",".join("?" * len(days))
+                speech = [
+                    s["content"] for s in self._conn.execute(
+                        "SELECT content FROM memory_items WHERE kind = 'interaction'"
+                        f" AND (substr(first_seen, 1, 10) IN ({ph})"
+                        f" OR substr(last_seen, 1, 10) IN ({ph}))",
+                        (*days, *days),
+                    )
+                ]
+                if not speech:
+                    continue
+                if self.grounded_subject(r["content"], " ".join(speech)):
+                    continue
+                meta["ungrounded_at"] = datetime.now().isoformat()
+                self._conn.execute(
+                    "UPDATE memory_items SET tier = 'faded', metadata = ?"
+                    " WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=False), r["id"]),
+                )
+                retired += 1
+                _LOGGER.info(
+                    "Rule %s retired — its subject is not in the resident's "
+                    "speech of %s: %r", r["id"], sorted(days), r["content"],
+                )
+            self._conn.commit()
+        return retired
 
     def _reclassify_system_evidence(self) -> int:
         """Convergence (v9.15, idempotent): system text recorded as evidence of a
@@ -1664,6 +2052,9 @@ class PermearStorage:
 
         A behavior_rule also fades on its own horizon (MEMORY_RULE_FADE_DAYS):
         an instruction is not an observation. Decay is preserved, not removed.
+
+        v9.26 — a conditional_rule is out of this pass entirely: what the
+        resident DECLARED stays until he contradicts or removes it.
         """
         assert self._conn is not None
         now = datetime.now()
@@ -1686,7 +2077,9 @@ class PermearStorage:
             counts["rule_unfaded"] = self._conn.execute(
                 "UPDATE memory_items SET tier = 'ephemeral'"
                 " WHERE kind = 'behavior_rule' AND tier = 'faded'"
-                " AND last_seen >= ?",
+                " AND last_seen >= ?"
+                # v9.25 — a rule retired as ungrounded stays retired.
+                " AND COALESCE(metadata, '') NOT LIKE '%\"ungrounded_at\"%'",
                 (rule_floor,),
             ).rowcount
             # Label convergence (v9.11, idempotent): bookkeeping rows promoted
@@ -1696,8 +2089,13 @@ class PermearStorage:
                 "UPDATE memory_items SET kind = 'observation'"
                 f" WHERE kind = 'pattern' AND {_BOOKKEEPING_SQL}"
             ).rowcount
+            # v9.26 — a DECLARED condition does not move by time (R1): no fade,
+            # no promotion, no demotion. It leaves when the resident contradicts
+            # it (same entity and qualifier, _add_conditional_rule) or removes
+            # it (_remove_condition). A refusal keeps its 30-day horizon below.
             rows = self._conn.execute(
-                "SELECT * FROM memory_items WHERE tier != 'faded'"
+                "SELECT * FROM memory_items WHERE tier != 'faded' AND kind != ?",
+                (CONDITIONAL_RULE_KIND,),
             ).fetchall()
             for r in rows:
                 item = dict(r)
@@ -1707,7 +2105,7 @@ class PermearStorage:
                 mentions = item["mention_count"]
                 new_tier = tier
 
-                is_rule = item["kind"] in ("behavior_rule", CONDITIONAL_RULE_KIND)
+                is_rule = item["kind"] == "behavior_rule"
                 fade_after = (
                     MEMORY_RULE_FADE_DAYS if is_rule
                     else MEMORY_EPHEMERAL_FADE_DAYS

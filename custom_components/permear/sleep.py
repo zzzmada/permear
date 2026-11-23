@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from datetime import datetime
 
 from homeassistant.core import HomeAssistant, callback
@@ -32,9 +33,12 @@ from .ai_client import AiTaskClient, circuit_health_summary
 from .config import PermearConfig, parse_hhmm
 from .const import (
     CONDITION_MAX_SECONDS,
+    CONDITION_NORMALITY_MARKERS,
     CONDITION_Q_COMPANION,
     CONDITION_Q_DURATION,
     CONDITION_Q_PRESENCE,
+    CONDITION_Q_TIME,
+    CONDITION_VAGUE_PERIODS,
     CONDITION_VAGUE_SECONDS,
     CONDITION_WHEN_IGNORED,
     CONDITION_WHEN_MATTERS,
@@ -98,6 +102,72 @@ MEMORIES_STRUCTURE = {
 }
 
 
+_NORMALITY = re.compile(
+    r"\b(?:" + "|".join(re.escape(m) for m in CONDITION_NORMALITY_MARKERS) + r")\b"
+    r"|^\s*normal\b"
+)
+_TIME_RANGE = re.compile(
+    r"^(\d{1,2})(?::(\d{2}))?h?\s*-\s*(\d{1,2})(?::(\d{2}))?h?$"
+)
+
+
+def _flat(text: str) -> str:
+    """Lowercase, accent-free copy, for matching only."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", (text or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+# v9.26b — what makes a message a REFUSAL, accent-free stems: a refusal must be
+# backed by one of these, not just by a shared subject word.
+_REFUSAL_ACTS = (
+    "avis", "notific", "ignor", "esquec", "irrelevant", "nao importa",
+    "nao precisa", "chega", "para de", "pare de", "nao quero saber",
+)
+_NEGATED = re.compile(r"\bnao (?:e|eh|sao) (?:normal|normais|comum|comuns|esperad|habitua)")
+
+
+def is_refusal_message(text: str) -> bool:
+    """Does this message ask for silence (v9.26b)? PURE, closed stems."""
+    flat = _flat(text)
+    return any(stem in flat for stem in _REFUSAL_ACTS)
+
+
+def describes_normality(text: str) -> bool:
+    """Does this line say what is NORMAL or EXPECTED (v9.26, R5)? PURE. Such a
+    line is a condition in the making: it tells WHEN an event does not matter.
+    As a refusal it silences the whole subject ("Movimento diurno na cozinha é
+    normal" became rule #258), as prose it is a pattern declared instead of
+    accumulated. Whole phrases, accent-free: "área comum", "modo normal",
+    "anormal" and "incomum" are not it; a line that starts with "normal"
+    ("normal e irrelevante", 09/08) is. v9.26b — a question ("é normal a TV
+    ligar sozinha?") or a negation ("não é normal…") states nothing normal."""
+    flat = _flat(text)
+    if "?" in flat or _NEGATED.search(flat):
+        return False
+    return bool(_NORMALITY.search(flat))
+
+
+def parse_time_range(raw: str) -> tuple | None:
+    """('HH:MM', 'HH:MM') from "08:00-18:00", "8h-18h", "22-6", or one of the
+    closed spoken periods (dia, noite, madrugada, almoco). None otherwise, and
+    for a range that starts where it ends (it would say nothing). PURE."""
+    flat = _flat(raw).strip().replace(" ", "")
+    if flat in CONDITION_VAGUE_PERIODS:
+        return CONDITION_VAGUE_PERIODS[flat]
+    m = _TIME_RANGE.match(flat)
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(m.group(1)), int(m.group(2) or 0),
+                      int(m.group(3)), int(m.group(4) or 0))
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59):
+        return None
+    if (h1, m1) == (h2, m2):
+        return None
+    return f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}"
+
+
 def parse_condition(raw: str, valid_ids) -> tuple:
     """(content, entity_id, condition) from one 'condicoes' line, or None when
     it does not fit the closed schema. PURE. The rule's entity comes from its
@@ -130,6 +200,11 @@ def parse_condition(raw: str, valid_ids) -> tuple:
         if (companion in valid_ids and companion != entity_id
                 and re.fullmatch(r"[a-z_]+", state)):
             condition = {"entity_id": companion, "state": state}
+    elif qualifier == CONDITION_Q_TIME and args:
+        # "08:00-18:00" arrives split on its own colons; rejoin before reading.
+        period = parse_time_range(":".join(args))
+        if period is not None:
+            condition = {"start": period[0], "end": period[1]}
     if condition is None:
         return None
     return content, entity_id, {"q": qualifier, "when": when, **condition}
@@ -275,7 +350,14 @@ class PermearSleep:
         restricoes = (extraction or {}).get("restricoes") or []
         if isinstance(restricoes, str):
             restricoes = [restricoes]
-        restrictions_applied = await self._apply_restrictions(restricoes)
+        # v9.26 — a message that describes normality grounds no refusal: what
+        # the resident said there is a condition (R5).
+        restrictions_applied, normality_r = await self._apply_restrictions(
+            restricoes, [str(i.get("content") or "") for i in interacoes],
+        )
+        normality_dropped = applied.get("normality", 0) + normality_r
+        if normality_dropped:
+            await self._storage.async_count_conditions(0, 0, normality_dropped)
 
         condicoes = (extraction or {}).get("condicoes") or []
         if isinstance(condicoes, str):
@@ -459,16 +541,27 @@ CONDITIONS (separate field 'condicoes'): when an interaction explains WHEN
 something matters, return ONE short PT-BR phrase naming the subject, then
 [entity:<entity_id>] of that subject and exactly one [cond:...] tag:
   [cond:<sense>:presenca]  nobody at home for a while
-  [cond:<sense>:duracao_min:<seconds>]  the event's own state held at least this
-  [cond:<sense>:duracao_max:<seconds>]  the event's own state held at most this
+  [cond:<sense>:duracao_min:<seconds>]  the device stayed on (ligado, aberto,
+      ocupado) at least this long
+  [cond:<sense>:duracao_max:<seconds>]  the device stayed on at most this long
   [cond:<sense>:companheira:<entity_id>:<state>]  another entity is in a state
+  [cond:<sense>:horario:<HH:MM>-<HH:MM>]  the event happened inside this local
+      time range (an end before the start crosses midnight)
 <sense> is 'importa' (it matters only when this is true) or 'ignora' (it does
 not matter when this is true). <seconds> is a number, or poucos_segundos /
-alguns_minutos when the resident gave no number. <state> is the HA state, or
-'on' for "ligado". Every entity_id must come from the list below.
+alguns_minutos when the resident gave no number. A time range is given in
+hours, or dia / noite / madrugada / almoco when the resident named the period
+without hours. <state> is the HA state, or 'on' for "ligado". Every entity_id
+must come from the list below.
+A sentence saying what is NORMAL or EXPECTED for a subject ("é normal", "é
+comum", "costuma", "tem interferência") is a CONDITION too: it says when an
+event of that subject does not matter. It goes here, never in 'restricoes'
+and never in the memories.
 Examples:
 "Porta só importa com o ar ligado [entity:binary_sensor.door_example] [cond:importa:companheira:climate.ac_example:on]"
 "Janela não importa com gente na cozinha [entity:binary_sensor.window_example] [cond:ignora:companheira:binary_sensor.kitchen_example:on]"
+"Movimento na cozinha de dia é normal [entity:binary_sensor.kitchen_example] [cond:ignora:horario:dia]"
+"TV só conta como ligada depois de alguns minutos [entity:media_player.tv_example] [cond:importa:duracao_min:alguns_minutos]"
 If the sentence states a condition that none of these can express, or its
 subject is not ONE entity of the list, return the phrase with [cond:fora].
 Never drop a conditional sentence and never answer the resident about it.
@@ -490,6 +583,8 @@ For each memory about a specific HA entity, append
 [entity:<entity_id>] at the end of the memory text
 (e.g. "Cortina fechada automaticamente à noite [entity:cover.curtain_example]").
 Only for single-entity memories — not for general summaries.
+A memory describes what HAPPENED. What the resident says is normal or expected
+is not a memory (see CONDITIONS).
 
 RESTRICTIONS (separate field 'restricoes'): when an interaction shows the
 resident asking NOT to be notified about something or saying a subject is
@@ -501,9 +596,11 @@ de exemplo") — never a bare judgement like "irrelevante".
 A CONDITION or a technical correction is NOT a restriction and must NOT be
 returned here: "só considere a TV ligada depois de alguns minutos", "se tem
 gente na cozinha a janela não importa", "luz só está esquecida se não houver
-presença". The resident is explaining WHEN something matters, not asking for
-silence about it; turning that into a restriction would silence the whole
-subject. Leave such sentences out of 'restricoes'.
+presença", and neither is a sentence saying what is normal ("movimento na
+cozinha de dia é normal", "é comum ligar a churrasqueira no almoço"). The
+resident is explaining WHEN something matters, not asking for silence about
+it; turning that into a restriction would silence the whole subject. Leave
+such sentences out of 'restricoes'.
 Never invent restrictions — only what the resident actually expressed.
 Return an empty list when there is none.
 {condicoes}
@@ -535,7 +632,7 @@ If nothing is relevant, return an empty list."""
 
     async def _apply_memories(self, memorias: list) -> dict:
         valid_ids = await self._hass.async_add_executor_job(self._valid_entity_ids)
-        new_c = reinforced = skipped = 0
+        new_c = reinforced = skipped = normality = 0
         for raw in memorias:
             raw = str(raw or "").strip()
             if not raw:
@@ -543,6 +640,11 @@ If nothing is relevant, return an empty list."""
             content, entity_id = self._parse_memory(raw)
             if not content:
                 skipped += 1
+                continue
+            # v9.26 — normality is a condition, never prose (R5).
+            if describes_normality(content):
+                normality += 1
+                _LOGGER.info("Memory dropped — it describes normality: %r", content)
                 continue
             # Key only when the extraction names ONE valid entity (rule: never
             # synthetic-keyed — invalid/absent tag falls back to FTS, keyless)
@@ -554,9 +656,12 @@ If nothing is relevant, return an empty list."""
                 new_c += 1
             else:
                 reinforced += 1
-        return {"new": new_c, "reinforced": reinforced, "skipped": skipped}
+        return {"new": new_c, "reinforced": reinforced, "skipped": skipped,
+                "normality": normality}
 
-    async def _apply_restrictions(self, restricoes: list) -> int:
+    async def _apply_restrictions(
+        self, restricoes: list, messages: list | None = None
+    ) -> tuple:
         """Persist restriction intents as Organic Memory (v9.0.2).
 
         kind='behavior_rule', source='interaction' (never promotes — a
@@ -574,9 +679,21 @@ If nothing is relevant, return an empty list."""
         already in the DB. The LLM still only translates speech→intent here.
         """
         if not restricoes:
-            return 0
+            return 0, 0
         valid_ids = await self._hass.async_add_executor_job(self._valid_entity_ids)
-        applied = 0
+        applied = normality = 0
+        # v9.26 — the resident's words, split by what they describe. A normality
+        # message grounds no refusal (R5). None = no speech handed in: the
+        # grounding of keyless refusals keeps its pre-v9.25 behaviour.
+        speech = normal_speech = None
+        refusals: list = []
+        if messages is not None:
+            speech = " ".join(m for m in messages if not describes_normality(m))
+            normal_speech = " ".join(m for m in messages if describes_normality(m))
+            refusals = [
+                m for m in messages
+                if not describes_normality(m) and is_refusal_message(m)
+            ]
         for raw in restricoes:
             raw = str(raw or "").strip()
             if not raw:
@@ -584,11 +701,34 @@ If nothing is relevant, return an empty list."""
             content, entity_id = self._parse_memory(raw)
             if not content:
                 continue
+            # v9.26 — what describes normality is a condition, never a refusal
+            # (R5): #258 "Movimento diurno na cozinha é normal" silenced the
+            # kitchen for a month. Dropped and counted, keyed or not.
+            # v9.26b — and, keyed or not, a refusal whose subject comes from a
+            # normality message and from no message that asks for silence
+            # ("Não avisar sobre movimento diurno na cozinha [entity:…]" from
+            # "movimento em cozinha em horário diurno é normal" would bring
+            # #258 back). A shared word in a question ("teve movimento na
+            # sala?") or a command ("desliga a churrasqueira") is not a refusal.
+            if describes_normality(content) or (
+                normal_speech
+                and PermearStorage.grounded_subject(content, normal_speech)
+                and not any(
+                    PermearStorage.grounded_subject(content, m) for m in refusals
+                )
+            ):
+                normality += 1
+                _LOGGER.info(
+                    "Restriction dropped — it describes normality: %r", content
+                )
+                continue
             eid = entity_id if entity_id in valid_ids else None
-            result = await self._storage.async_add_restriction(content, eid)
+            # v9.25 — the day's speech travels with it: a keyless refusal is
+            # judged on the resident's words, not on the paraphrase.
+            result = await self._storage.async_add_restriction(content, eid, speech)
             if result.get("id") is not None:
                 applied += 1
-        return applied
+        return applied, normality
 
     async def _apply_conditions(self, condicoes: list) -> int:
         """Conditions taught today → conditional rules (v9.13). Whatever does

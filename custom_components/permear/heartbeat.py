@@ -61,6 +61,8 @@ from .const import (
     CONDITION_Q_COMPANION,
     CONDITION_Q_DURATION,
     CONDITION_Q_PRESENCE,
+    CONDITION_Q_TIME,
+    CONDITION_SPAN_INACTIVE_STATES,
     CONDITION_WHEN_MATTERS,
     AVAILABILITY_RELATIVE_PATH,
     BATTERY_DEVICE_CLASSES,
@@ -230,9 +232,145 @@ def is_spike(decision: str, scores: dict) -> bool:
         and scores.get("priority", 0) >= SPIKE_MIN_PRIORITY
     )
 
+def _hhmm_minutes(value) -> int | None:
+    """'HH:MM' → minutes since local midnight, None when it is not one."""
+    try:
+        hour_s, minute_s = str(value).split(":")
+        hour, minute = int(hour_s), int(minute_s)
+    except (ValueError, AttributeError):
+        return None
+    return hour * 60 + minute if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
+def in_time_range(minute: int, start: str, end: str) -> bool | None:
+    """Is a local minute-of-day inside [start, end)? PURE. end <= start crosses
+    midnight ("18:00"-"06:00" is the night). start == end says nothing: None."""
+    a, b = _hhmm_minutes(start), _hhmm_minutes(end)
+    if a is None or b is None or a == b:
+        return None
+    return a <= minute < b if a < b else (minute >= a or minute < b)
+
+
+def _span_active(state: str | None) -> bool | None:
+    """Is a recorded state part of an ACTIVE span (v9.26b)? None when the
+    state cannot be read (a legacy detalhe): nothing is concluded from it."""
+    if not state:
+        return None
+    return state not in CONDITION_SPAN_INACTIVE_STATES
+
+
+def _run_start(history: list, j: int) -> tuple:
+    """(index, ts, known) of the first active event of the run holding
+    history[j]. known=False when the run began before the oldest event read."""
+    k = j
+    while k > 0:
+        before = _span_active(history[k - 1][0])
+        if before is None:
+            return k, history[k][1], False
+        if not before:
+            return k, history[k][1], True
+        k -= 1
+    return 0, history[0][1], False
+
+
+def _measured(meta: dict) -> float | None:
+    """The capture's own measure of the span a clearing closes, if any."""
+    for key in ("occupied_for_s", "duration_s"):
+        value = (meta or {}).get(key)
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value >= 0):
+            return float(value)
+    return None
+
+
+def event_span(history: list, index: int, current_state: str | None,
+               now: datetime) -> tuple:
+    """(seconds, mode) of the ACTIVE RUN an event belongs to (v9.26b). PURE.
+
+    history = the entity's recorded events [(state, ts, meta)], oldest first.
+    A run is the stretch of contiguous ACTIVE states: dry -> cool -> off is ONE
+    session of an air conditioner (20/11: 1605 s, which v9.26 read as the 15 s
+    of its last sub-span), on -> playing -> paused -> off one session of a TV,
+    and an 'on' re-recorded after a restart changes nothing. "TV só conta como
+    ligada depois de alguns minutos" is about that session and both of its
+    edges: a 153-second session never counted, so its "desligada" is not news.
+    An ACTIVE event belongs to its run: from the run's first active event to the
+    first inactive event after it, or to now while the entity is still active.
+    An INACTIVE event (off/idle/standby, closed/locked/docked) belongs to the
+    run it closes; the capture's own measure (occupied_for_s, duration_s) wins.
+    mode: 'closed' exact; 'ongoing' exact start, still running (grows);
+    'partial' the run began before what was read (a lower bound).
+    (None, None) when nothing can be measured, and that never restricts."""
+    state, ts, meta = history[index]
+    active = _span_active(state)
+    if active is None:
+        return None, None
+    if not active:
+        measured = _measured(meta)
+        if index == 0:
+            return (measured, "closed") if measured is not None else (None, None)
+        if _span_active(history[index - 1][0]) is not True:
+            return None, None
+        first, start, known = _run_start(history, index - 1)
+        # One clock per run (v9.26b): the capture measures a single-state run
+        # from HA's own last_changed (a presence arrival is recorded 10 s after
+        # it happened), and both edges of that run must read the same number.
+        if measured is not None and first == index - 1:
+            return measured, "closed"
+        return max((ts - start).total_seconds(), 0.0), (
+            "closed" if known else "partial"
+        )
+    first, start, known = _run_start(history, index)
+    for k in range(index + 1, len(history)):
+        after = _span_active(history[k][0])
+        if after is None:
+            return None, None
+        if not after:
+            measured = _measured(history[k][2])
+            if measured is not None and first == k - 1:
+                return measured, "closed"
+            return max((history[k][1] - start).total_seconds(), 0.0), (
+                "closed" if known else "partial"
+            )
+    if current_state in SILENT_STATES or _span_active(current_state) is not True:
+        return None, None
+    return max((now - start).total_seconds(), 0.0), (
+        "ongoing" if known else "partial"
+    )
+
+
+def duration_verdict(condition: dict, span: float | None, mode: str | None,
+                     reread: bool) -> str:
+    """'matters' | 'ignored' | 'pending' for one event under a duracao
+    condition (v9.26b). PURE. 'pending' = it does not count YET: a session
+    still running below its minimum, re-read for sure by a later cycle. Without
+    that guarantee "not yet" would be "never", so it is unknown (it matters).
+    What cannot be known before the span ends is unknown too (rule #19)."""
+    if span is None or mode is None:
+        return "matters"
+    if "min_seconds" not in condition and "max_seconds" not in condition:
+        return "matters"  # a broken row says nothing
+    held, provisional = span, False
+    if "min_seconds" in condition:
+        if mode != "closed" and span < condition["min_seconds"]:
+            if mode != "ongoing" or not reread:
+                return "matters"
+            provisional = True
+    elif mode != "closed" and span <= condition["max_seconds"]:
+        return "matters"
+    if condition_matters(condition, {"state_held_seconds": held}):
+        return "matters"
+    return "pending" if provisional else "ignored"
+
+
 def _condition_holds(condition: dict, ctx: dict) -> bool | None:
     """Whether the qualifier is true now. None when the context cannot tell."""
     q = condition.get("q")
+    if q == CONDITION_Q_TIME:
+        minute = ctx.get("event_minute")
+        if minute is None:
+            return None
+        return in_time_range(minute, condition.get("start"), condition.get("end"))
     if q == CONDITION_Q_PRESENCE:
         idle = ctx.get("presence_idle_minutes")
         return None if idle is None else idle >= condition["minutes"]
@@ -254,13 +392,15 @@ def _condition_holds(condition: dict, ctx: dict) -> bool | None:
 
 
 def condition_matters(condition: dict, ctx: dict) -> bool:
-    """Does the event still matter under this condition (v9.13)? PURE, and with
-    its one call site is the standing rules (v9.17), where the resident
-    authorized the condition. It is NOT wired into ARAS.
+    """Does the event still matter under this condition (v9.13)? PURE. Two
+    call sites, both in this module: the standing rules (v9.17) and
+    _condition_restrictions (v9.24), which feeds the restriction list ARAS
+    reads. ARAS itself never calls it.
 
-    ctx = {presence_idle_minutes, state_held_seconds, states: {entity_id: state}},
-    filled by the caller from HA state. What the context cannot tell answers
-    True: swallowing a true alert is the worse of the two failures (rule #19)."""
+    ctx = {presence_idle_minutes, state_held_seconds, states: {entity_id: state},
+    event_minute}, filled by the caller from HA state and the event itself. What
+    the context cannot tell answers True: swallowing a true alert is the worse
+    of the two failures (rule #19)."""
     holds = _condition_holds(condition, ctx)
     if holds is None:
         return True
@@ -361,6 +501,11 @@ class PermearHeartbeat:
         # safe: a mid-day restart that re-fires the extended scan re-emits
         # nothing, because already-emitted night keys are deduped by recent_keys.
         self._extended_scan_date: str | None = None
+        # v9.25 — a gray batch nobody answered (both providers down) did not
+        # happen: {"date", "since", "entities"} so the NEXT cycle reads those
+        # entities' events again from the failed window's start. In-memory, same
+        # day only; a restart forgets it (one lost re-evaluation, like before).
+        self._gray_retry: dict | None = None
         self._unsub_rules_changed = None
         self._stopped = False
         self._rule_generation = 0
@@ -566,6 +711,9 @@ class PermearHeartbeat:
         return ctx
 
     def _in_window(self) -> bool:
+        return self._in_window_at(datetime.now().time())  # LOCAL time
+
+    def _in_window_at(self, now_t) -> bool:
         try:
             start = datetime.strptime(self._config.heartbeat_start, "%H:%M").time()
             end = datetime.strptime(self._config.heartbeat_end, "%H:%M").time()
@@ -575,10 +723,21 @@ class PermearHeartbeat:
                 self._config.heartbeat_start, self._config.heartbeat_end,
             )
             return False
-        now_t = datetime.now().time()  # LOCAL time
         if start <= end:
             return start <= now_t < end
         return now_t >= start or now_t < end  # window crosses midnight
+
+    def _reread_guaranteed(self, event_ts: datetime, now: datetime) -> bool:
+        """Will the next cycle read this event again (v9.26b)? Only when it is
+        young enough to stay inside the next 90-min window whatever the jitter
+        (90 - 60 - 4 = 26 min) and the next cycle runs today, inside the
+        daytime window (the buffer is cleared after midnight)."""
+        slack = (HEARTBEAT_JITTER_SECONDS[1] - HEARTBEAT_JITTER_SECONDS[0]) / 60
+        age = (now - event_ts).total_seconds() / 60
+        if age > HEARTBEAT_WINDOW_MINUTES - HEARTBEAT_INTERVAL_MINUTES - slack:
+            return False
+        nxt = now + timedelta(minutes=HEARTBEAT_INTERVAL_MINUTES)
+        return nxt.date() == now.date() and self._in_window_at(nxt.time())
 
     async def _on_interval(self, _now) -> None:
         if self._running:  # mode: single
@@ -631,9 +790,23 @@ class PermearHeartbeat:
             if eid.startswith("binary_sensor.")
             and s.attributes.get("device_class") in PRESENCE_DEVICE_CLASSES
         }
+        retry = self._gray_retry
+        if retry and retry["date"] != datetime.now().strftime("%Y-%m-%d"):
+            retry = self._gray_retry = None
+        # A carried window that reaches the night needs the nocturnal-habit
+        # query too, or the night events it re-reads lose their habituation.
         db_ctx = await self._storage.async_heartbeat_context(
-            window_start, first_cycle, presence_ids
+            min(window_start, retry["since"]) if retry else window_start,
+            first_cycle or bool(retry and retry["night"]), presence_ids,
         )
+        if retry:
+            # Only the failed batch's entities reach back past this window; the
+            # rest of the cycle reads exactly what it would have read.
+            db_ctx["events"] = [
+                e for e in db_ctx["events"]
+                if e.get("ts", "") >= window_start
+                or e.get("entity_id") in retry["entities"]
+            ]
         monitored, circuit_health = await self._hass.async_add_executor_job(
             self._load_cycle_files
         )
@@ -644,10 +817,27 @@ class PermearHeartbeat:
             self._build_candidates,
             health_summary, monitored, states, db_ctx["events"], circuit_health,
         )
+        cond_restrictions = await self._condition_restrictions(
+            db_ctx.get("conditions", []), candidates, db_ctx["events"], states,
+        )
+        db_ctx["restrictions"] = [
+            *db_ctx.get("restrictions", []), *cond_restrictions,
+        ]
+        restricted_ids = {r["entity_id"] for r in cond_restrictions}
+        cond_restricted = sum(
+            1 for c in candidates if c.get("entity_id") in restricted_ids
+        )
+        # v9.26b — D1: what a condition DEFINITELY lowered is recorded as seen
+        # when it ends suppressed (below). A provisional lowering ("ainda não
+        # conta", re-read next cycle for sure) is not: it may still count.
+        definitive_ids = {
+            r["entity_id"] for r in cond_restrictions if not r.get("provisional")
+        }
         user_state = self._build_user_state(monitored, db_ctx, mute_days)
 
         emits, grays, suppressed = [], [], 0
         non_messages = 0
+        quieted = []
         for cand in candidates:
             result = evaluate_salience(cand, user_state)
             if result["decision"] == "emit":
@@ -656,6 +846,8 @@ class PermearHeartbeat:
                 grays.append((cand, result))
             else:
                 suppressed += 1
+                if cand.get("entity_id") in definitive_ids and cand.get("key"):
+                    quieted.append((cand, result))
 
         spikes = 0
         for cand, result in emits:
@@ -676,6 +868,8 @@ class PermearHeartbeat:
 
         # Each spike orientation is one ai_task call (rare by construction).
         llm_called = spikes
+        gray_delivered = gray_silenced = gray_failed = 0
+        gray_lost = False
         if grays:
             llm_called += 1
             prompt = self._build_gray_prompt(
@@ -683,6 +877,9 @@ class PermearHeartbeat:
             )
             resposta = await self._gray_zone_llm(prompt)
             kind = silence_kind(resposta)
+            # v9.25 — no reply at all (both providers failed, or an empty one)
+            # is not the model choosing silence: the batch was never judged.
+            gray_lost = kind == "empty"
             if kind in ("paraphrase", "prose"):
                 # A suppression that is not the bare sentinel is a JUDGEMENT,
                 # and a judgement that widens silently is how a real alert
@@ -705,6 +902,10 @@ class PermearHeartbeat:
                 # the subjects the text names are emissions. The rest of the
                 # batch is marked seen, which keeps today's novelty dedup
                 # exactly as it was and adds no emission and no reinforce.
+                if delivered:
+                    gray_delivered = len(grays)
+                else:
+                    gray_failed = len(grays)
                 said = communicated_keys(resposta, grays, states)
                 for c, r in grays if delivered else ():
                     record = (
@@ -716,6 +917,57 @@ class PermearHeartbeat:
                         c["content"], c.get("key"),
                         self._emit_metadata(c.get("metadata"), r["salience"]),
                     )
+            elif gray_lost:
+                gray_failed = len(grays)
+            else:
+                gray_silenced = len(grays)
+                # v9.26b — D1 also covers a lowered candidate that reached gray
+                # (priority 2: 2 + 2 - 2) and that the model judged silent: it
+                # was weighed and not said. A LOST batch stays out (v9.25: it was
+                # never judged, and it is carried to the next cycle).
+                quieted += [
+                    (c, r) for c, r in grays
+                    if c.get("entity_id") in definitive_ids and c.get("key")
+                ]
+
+        # v9.26b — D1 (PM decision): the key of what a condition silenced goes
+        # into today's dedup as SEEN, never as an emission (no mention, no
+        # emits, nothing for engagement). Without it the day's novelty of that
+        # entity survived to its first event outside the condition: the 3.1
+        # replay moved the kitchen's daily line from 08:50 to 18:50, and the
+        # v9.24 replay turned a silenced "Janela aberta" into "Janela fechada".
+        # After every delivery, and a failed write never ends the cycle.
+        for cand, result in quieted:
+            try:
+                await self._storage.async_record_seen(
+                    cand["content"], cand.get("key"),
+                    self._emit_metadata(cand.get("metadata"), result["salience"]),
+                )
+            except Exception:  # noqa: BLE001 — bookkeeping must not cost a cycle
+                _LOGGER.exception("Seen record for %s failed", cand.get("key"))
+
+        # v9.25 — a lost batch records nothing (no emit, no seen: it already
+        # did not) and its entities are carried to the next cycle, which
+        # re-evaluates them against the state THEN. Any judged batch, or a
+        # cycle with no gray at all, ends the carry.
+        if gray_lost:
+            prev = self._gray_retry or {
+                "since": window_start, "entities": set(), "night": False,
+            }
+            self._gray_retry = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "since": min(prev["since"], window_start),
+                "night": prev["night"] or first_cycle,
+                "entities": prev["entities"] | {
+                    c["entity_id"] for c, _ in grays if c.get("entity_id")
+                },
+            }
+            _LOGGER.warning(
+                "Gray batch of %d lost (no provider answered) — carried to the "
+                "next cycle: %s", len(grays), sorted(self._gray_retry["entities"]),
+            )
+        else:
+            self._gray_retry = None
 
         stats = {
             "total": len(candidates),
@@ -727,12 +979,25 @@ class PermearHeartbeat:
             # v9.7.2 — observability only. Never read by _mute_days or by
             # compute_dynamic_threshold; it cannot move emission or the relief.
             "non_messages": non_messages,
+            # v9.25 — what happened to the gray candidates: in a delivered
+            # text, judged silent by the model, or lost (no provider answered,
+            # or the message did not leave). gray = their sum, as before.
+            "gray_delivered": gray_delivered,
+            "gray_silenced": gray_silenced,
+            "gray_failed": gray_failed,
+            # v9.26 — candidates a declared condition lowered this cycle
+            # (observability only: the -2 itself is _user_match's).
+            "cond_restricted": cond_restricted,
+            # v9.26b — of those, suppressed and recorded as seen (D1).
+            "cond_seen": len(quieted),
             "emit_threshold": user_state["emit_threshold"],
         }
         await self._hass.async_add_executor_job(self._log_stats, stats)
         _LOGGER.info(
-            "Heartbeat: %(total)d candidates → %(emit)d emit, %(gray)d gray, "
-            "%(suppress)d suppress (threshold %(emit_threshold)d)", stats,
+            "Heartbeat: %(total)d candidates → %(emit)d emit, %(gray)d gray "
+            "(%(gray_delivered)d delivered, %(gray_silenced)d silenced, "
+            "%(gray_failed)d failed), %(suppress)d suppress "
+            "(threshold %(emit_threshold)d)", stats,
         )
         return stats
 
@@ -804,22 +1069,7 @@ class PermearHeartbeat:
                     "no longer matches", entity_id, detalhe,
                 )
                 continue
-            meta_str = ev.get("metadata", "{}")
-            meta_dict = {}
-            if meta_str and meta_str.strip() not in ("", "{}"):
-                try:
-                    meta_dict = json.loads(meta_str)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            content = self._humanize_event(detalhe, entity_id, states)
-            content = self._enrich_content(content, entity_id, meta_dict, states)
-            candidates.append({
-                "type": "event",
-                "content": content,
-                "entity_id": entity_id,
-                "timestamp": ev.get("ts", now_iso),
-                "metadata": meta_str,
-            })
+            candidates.append(self._event_candidate(ev, states, now_iso))
 
         if "SELF_ERRORS" in health_summary or "ERRORS" in health_summary:
             candidates.append({
@@ -854,6 +1104,27 @@ class PermearHeartbeat:
                 seen.add(c["key"])
                 deduped.append(c)
         return deduped
+
+    def _event_candidate(self, ev: dict, states: dict, now_iso: str) -> dict:
+        """One event -> its ARAS candidate (dry content from the state object)."""
+        entity_id = ev.get("entity_id")
+        detalhe = ev.get("detalhe", "")
+        meta_str = ev.get("metadata", "{}")
+        meta_dict = {}
+        if meta_str and meta_str.strip() not in ("", "{}"):
+            try:
+                meta_dict = json.loads(meta_str)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        content = self._humanize_event(detalhe, entity_id, states)
+        content = self._enrich_content(content, entity_id, meta_dict, states)
+        return {
+            "type": "event",
+            "content": content,
+            "entity_id": entity_id,
+            "timestamp": ev.get("ts", now_iso),
+            "metadata": meta_str,
+        }
 
     @staticmethod
     def _event_reverted(entity_id, detalhe, states) -> bool:
@@ -1056,6 +1327,147 @@ class PermearHeartbeat:
     # ------------------------------------------------------------------
     # User state / ARAS context
     # ------------------------------------------------------------------
+
+    async def _condition_restrictions(
+        self, conditions: list, candidates: list | None = None,
+        events: list | None = None, states: dict | None = None,
+    ) -> list:
+        """v9.24 — a taught condition (rule #27) that says "this does not
+        matter right now" becomes an ordinary entity restriction for this
+        cycle: the same -2 of _user_match, no new score term, ARAS untouched.
+        Read from HA state at evaluation time, no LLM. Anything the state
+        cannot tell (companion missing or unavailable, no history, a broken
+        row) leaves the event scored as usual: silencing on doubt is the worse
+        of the two failures (rule #19).
+
+        v9.26b — the two qualifiers about the EVENT (horario, duracao) are
+        judged on each live event of the entity in this window, all of the
+        entity's event conditions together. When some event matters, nothing
+        is lowered and the entity's candidate is that event, the oldest one that
+        matters (the dedup kept the oldest live one, which on 02/11 was a 04:22
+        TV flap emitted with its night anomaly). When none matters, the entity
+        is lowered; 'provisional' when only "ainda não conta" stood in the way
+        (D1 records nothing for it). No event candidate of the entity, nothing.
+        Each restriction carries 'provisional' (False for state conditions)."""
+        by_entity = {
+            c["entity_id"]: c for c in candidates or ()
+            if c.get("type") == "event" and c.get("entity_id")
+        }
+        out = []
+        event_conds: dict = {}
+        for item in conditions:
+            condition = item["condition"]
+            q = condition.get("q")
+            try:
+                if q in (CONDITION_Q_TIME, CONDITION_Q_DURATION):
+                    if item["entity_id"] in by_entity:
+                        event_conds.setdefault(item["entity_id"], []).append(condition)
+                    continue
+                if not condition_matters(
+                    condition, await self._rule_context({"condition": condition})
+                ):
+                    out.append({"content": "", "entity_id": item["entity_id"],
+                                "provisional": False})
+            except Exception:  # noqa: BLE001 — fail open, never fail the cycle
+                _LOGGER.exception("Condition on %s ignored", item.get("entity_id"))
+        now_iso = datetime.now().isoformat()
+        for eid, conds in event_conds.items():
+            try:
+                verdicts = await self._event_verdicts(
+                    eid, conds, events or [], states or {},
+                )
+                if not verdicts:
+                    continue
+                mattering = [ev for ev, v in verdicts if v == "matters"]
+                if not mattering:
+                    out.append({
+                        "content": "", "entity_id": eid,
+                        "provisional": any(v == "pending" for _, v in verdicts),
+                    })
+                    continue
+                cand = by_entity[eid]
+                if cand.get("timestamp") != mattering[0].get("ts"):
+                    fresh = self._event_candidate(mattering[0], states or {}, now_iso)
+                    cand.update({k: fresh[k] for k in ("content", "timestamp", "metadata")})
+            except Exception:  # noqa: BLE001 — fail open, never fail the cycle
+                _LOGGER.exception("Condition on %s ignored", eid)
+        return out
+
+    async def _event_verdicts(
+        self, eid: str, conds: list, events: list, states: dict,
+    ) -> list:
+        """[(event, 'matters'|'ignored'|'pending')] for the live events of
+        `eid` in this window, oldest first (v9.26b). Live = not an error line
+        and not already reverted, the same test the candidates pass. Several
+        conditions on one event: any 'ignored' wins, then 'pending'."""
+        prefix = eid.split(".", 1)[1] + "_"
+
+        def _state(detalhe) -> str | None:
+            detalhe = str(detalhe or "")
+            return detalhe[len(prefix):] if detalhe.startswith(prefix) else None
+
+        def _meta(raw) -> dict:
+            try:
+                value = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        own = [
+            e for e in events
+            if e.get("entity_id") == eid
+            and not str(e.get("detalhe") or "").startswith("erro:")
+        ]
+        if not own:
+            return []
+        now = datetime.now()
+        history: list = []
+        if any(c.get("q") == CONDITION_Q_DURATION for c in conds):
+            try:
+                history = [
+                    (_state(e.get("detalhe")), datetime.fromisoformat(e["ts"]),
+                     _meta(e.get("metadata")))
+                    for e in await self._storage.async_events_before(
+                        eid, own[0].get("ts", "")
+                    )
+                ]
+            except (TypeError, ValueError, KeyError):
+                history = []  # an unreadable past is no past: the start is unknown
+        offset = len(history)
+        for e in own:
+            try:
+                history.append((_state(e.get("detalhe")),
+                                datetime.fromisoformat(str(e.get("ts"))),
+                                _meta(e.get("metadata"))))
+            except (TypeError, ValueError):
+                return []  # cannot read the window: nothing lowered
+        current = states.get(eid)
+        current_state = current.state if current is not None else None
+        out = []
+        for i, ev in enumerate(own):
+            if self._event_reverted(eid, str(ev.get("detalhe") or ""), states):
+                continue
+            ts = history[offset + i][1]
+            verdict = "matters"
+            for condition in conds:
+                if condition.get("q") == CONDITION_Q_TIME:
+                    one = (
+                        "matters" if condition_matters(
+                            condition, {"event_minute": ts.hour * 60 + ts.minute}
+                        ) else "ignored"
+                    )
+                else:
+                    span, mode = event_span(history, offset + i, current_state, now)
+                    one = duration_verdict(
+                        condition, span, mode, self._reread_guaranteed(ts, now),
+                    )
+                if one == "ignored":
+                    verdict = "ignored"
+                    break
+                if one == "pending":
+                    verdict = "pending"
+            out.append((ev, verdict))
+        return out
 
     def _build_user_state(self, monitored, db_ctx, mute_days=0) -> dict:
         priorities = {}
@@ -1305,11 +1717,15 @@ Responda em portugues no campo 'resposta'."""
                 s.clear()
                 s.update({"data": today, "total": 0, "emit": 0, "gray": 0,
                           "suppress": 0, "spike": 0, "llm_calls": 0,
-                          "non_messages": 0})
+                          "non_messages": 0, "gray_delivered": 0,
+                          "gray_silenced": 0, "gray_failed": 0,
+                          "cond_restricted": 0, "cond_seen": 0})
             # .get(k, 0): the file is external/editable — a missing key must
             # not abort the end of a cycle whose emissions already went out
             for k in ("total", "emit", "gray", "suppress", "spike",
-                      "llm_calls", "non_messages"):
+                      "llm_calls", "non_messages", "gray_delivered",
+                      "gray_silenced", "gray_failed", "cond_restricted",
+                      "cond_seen"):
                 s[k] = s.get(k, 0) + stats[k]
             s["emit_threshold"] = stats["emit_threshold"]  # last seen, not summed
         if rolled:
@@ -1329,9 +1745,15 @@ Responda em portugues no campo 'resposta'."""
             "suppress": day_stats.get("suppress", 0),
             "spike": day_stats.get("spike", 0),
             "non_messages": day_stats.get("non_messages", 0),
+            "gray_delivered": day_stats.get("gray_delivered", 0),
+            "gray_silenced": day_stats.get("gray_silenced", 0),
+            "gray_failed": day_stats.get("gray_failed", 0),
             "emit_threshold": day_stats.get("emit_threshold"),
             "cond_captured": day_stats.get("cond_captured", 0),
             "cond_discarded": day_stats.get("cond_discarded", 0),
+            "cond_normality_dropped": day_stats.get("cond_normality_dropped", 0),
+            "cond_restricted": day_stats.get("cond_restricted", 0),
+            "cond_seen": day_stats.get("cond_seen", 0),
         }, ensure_ascii=False)
         try:
             with open(path, "a", encoding="utf-8") as fh:

@@ -18,6 +18,7 @@ cycles during coexistence. All file I/O runs in the executor.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 
@@ -26,6 +27,7 @@ from homeassistant.core import HomeAssistant
 from .config import PermearConfig
 from .const import (
     AGENT_CIRCUIT_RELATIVE_PATH,
+    AI_PRIMARY_RETRY_DELAY_SECONDS,
     ARCHIVED_ERRORS_RELATIVE_PATH,
     FALLBACK_SKIP_PRIMARY_SECONDS,
 )
@@ -40,6 +42,7 @@ class AiTaskClient:
     def __init__(self, hass: HomeAssistant, config: PermearConfig) -> None:
         self._hass = hass
         self._config = config
+        self._last_call_raised = False
 
     async def async_generate(
         self, task_name: str, instructions: str, structure: dict,
@@ -77,6 +80,21 @@ class AiTaskClient:
                 self._config.data, task_name, instructions, structure,
                 required_field,
             )
+            # v9.25 — ONE retry on the primary when it RAISED. The failures seen
+            # (OpenRouter "structured response": the model's JSON did not parse)
+            # belong to one response, not to the provider's availability, and
+            # going to the fallback also hands it the next hour (skip-primary).
+            # On 14/11 and 20/11 that fallback was exactly what fell too.
+            if data is None and self._last_call_raised:
+                await asyncio.sleep(AI_PRIMARY_RETRY_DELAY_SECONDS)
+                data = await self._call(
+                    self._config.data, f"{task_name} [retry]", instructions,
+                    structure, required_field,
+                )
+                if data is not None:
+                    await self._hass.async_add_executor_job(
+                        self._log_retry_recovered
+                    )
         if data is None and self._config.data_fallback:
             await self._hass.async_add_executor_job(self._log_fallback)
             data = await self._call(
@@ -92,6 +110,7 @@ class AiTaskClient:
         self, entity_id: str, task_name: str, instructions: str, structure: dict,
         required_field: str | None = None,
     ) -> dict | None:
+        self._last_call_raised = False
         try:
             resp = await self._hass.services.async_call(
                 "ai_task",
@@ -107,6 +126,7 @@ class AiTaskClient:
             )
         except Exception as exc:  # noqa: BLE001 — 429/Timeout still propagate
             _LOGGER.warning("ai_task %s via %s failed: %s", task_name, entity_id, exc)
+            self._last_call_raised = True
             return None
         data = (resp or {}).get("data")
         if not isinstance(data, dict) or not data:
@@ -135,16 +155,30 @@ class AiTaskClient:
         delta = (datetime.now() - last_fb).total_seconds()
         return 0 <= delta < FALLBACK_SKIP_PRIMARY_SECONDS
 
+    @staticmethod
+    def _fresh_daily_stats(stats: dict, today: str) -> dict:
+        if stats.get("date") != today:
+            stats = {"date": today, "errors_503_seen": 0,
+                     "retries_recovered": 0, "failures_3x": 0,
+                     "circuit_opens": 0, "fallbacks": 0}
+        return stats
+
+    def _log_retry_recovered(self) -> None:
+        """The primary answered on its retry: no fallback happened, so nothing
+        moves last_fallback_at. Counted where the shell era counted it."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        path = self._hass.config.path(AGENT_CIRCUIT_RELATIVE_PATH)
+        with locked_json_update(path, {}) as circuit:
+            stats = self._fresh_daily_stats(circuit.get("daily_stats") or {}, today)
+            stats["retries_recovered"] = stats.get("retries_recovered", 0) + 1
+            circuit["daily_stats"] = stats
+
     def _log_fallback(self) -> None:
         """Same agent_circuit.json shape as log_fallback.py / heartbeat v8.9."""
         today = datetime.now().strftime("%Y-%m-%d")
         path = self._hass.config.path(AGENT_CIRCUIT_RELATIVE_PATH)
         with locked_json_update(path, {}) as circuit:
-            stats = circuit.get("daily_stats") or {}
-            if stats.get("date") != today:
-                stats = {"date": today, "errors_503_seen": 0,
-                         "retries_recovered": 0, "failures_3x": 0,
-                         "circuit_opens": 0, "fallbacks": 0}
+            stats = self._fresh_daily_stats(circuit.get("daily_stats") or {}, today)
             stats["fallbacks"] = stats.get("fallbacks", 0) + 1
             circuit["daily_stats"] = stats
             circuit["last_fallback_at"] = datetime.now().strftime(

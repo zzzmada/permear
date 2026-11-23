@@ -312,9 +312,9 @@ INSTRUCOES (relevancia > completude):
 
 Analise os 7 dias e identifique APENAS as mudancas mais relevantes da semana.
 Maximo 3 novas_sugestoes (apenas se realmente acionaveis) e novas_pendencias (apenas itens acionaveis da casa, nunca erros do framework).
-Cada sugestao e um AVISO ao morador: voce nao aciona, liga, desliga, abre, fecha, ajusta nem agrupa nada, entao nunca sugira isso.
+Cada sugestao e um AVISO ao morador: o PERMEAR so fala.
 Cada sugestao nomeia o GATILHO (um horario, ou uma entidade mudando de estado) e o que sera avisado: "Avisar sobre a porta" nao e sugestao; "Avisar as 22h se a porta estiver aberta" e. O morador aceita ou recusa exatamente o que estiver escrito.
-Cada sugestao termina com as etiquetas [alvo:<entity_id>] [acao:<tipo>] [gatilho:time:HH:MM:SS] para horario ou [gatilho:state:<entity_id>:<estado>] para mudanca de estado, com os entity_id do alvo separados por virgula. <tipo> e um de: {', '.join(sorted(SUGGESTION_ACTIONS))}. Ex: "Avisar as 22h se a porta estiver aberta [alvo:binary_sensor.door_example] [acao:notificar] [gatilho:time:22:00:00]". Sem essas etiquetas a sugestao e descartada.
+Cada sugestao termina com as etiquetas [alvo:<entity_id>] [acao:<tipo>] [gatilho:time:HH:MM:SS] para horario ou [gatilho:state:<entity_id>:<estado>] para mudanca de estado, com os entity_id do alvo separados por virgula. <tipo> e um de: {', '.join(sorted(SUGGESTION_ACTIONS))}. Ex: "Avisar as 22h se a porta estiver aberta [alvo:binary_sensor.door_example] [acao:notificar] [gatilho:time:22:00:00]". Ex: "Avisar quando a janela abrir [alvo:binary_sensor.window_example] [acao:notificar] [gatilho:state:binary_sensor.window_example:on]". Sem essas etiquetas a sugestao e descartada.
 Entidades da casa: {json.dumps(list(entidades), ensure_ascii=False)}
 Pendencias: SOMENTE itens da casa (temperatura, sensores, dispositivos, eletrodomesticos). NUNCA inclua erros do proprio framework PERMEAR (compilacao_semanal, weekly_compile, byte offset, parse entities, etc).
 Verificar se ja existe na lista atual antes de adicionar.
@@ -331,6 +331,12 @@ Se nao houver mudancas relevantes em uma categoria, retornar lista vazia."""
             "suggestions_dropped": 0,
         }
 
+        # What the model returned BEFORE the parser, so a week with no
+        # suggestion can be told from a week whose suggestions were all dropped.
+        _LOGGER.info(
+            "Systems: model returned %d suggestion(s) before the parser",
+            sum(1 for s in changes.get("novas_sugestoes") or [] if s),
+        )
         ids = []
         for s in changes.get("novas_sugestoes") or []:
             if not s:

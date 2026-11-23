@@ -20,7 +20,13 @@ from homeassistant.helpers import area_registry as ar
 
 from .config import PermearConfig
 from .const import (
+    CONDITION_Q_COMPANION,
+    CONDITION_Q_DURATION,
+    CONDITION_Q_PRESENCE,
+    CONDITION_Q_TIME,
+    CONDITION_WHEN_MATTERS,
     CONVERSATION_MEMORY_MAX_CHARS,
+    CONVERSATION_MEMORY_MAX_CONDITIONS,
     DEFAULT_AGENT_NAME,
     OUTBOUND_ABOUT_MAX_CHARS,
     OUTBOUND_BLOCK_MAX_CHARS,
@@ -89,13 +95,76 @@ def agent_preamble(hass: HomeAssistant, config: PermearConfig) -> str:
         "o morador responde curto ('desligue', 'sim', 'pode') logo apos uma "
         "observacao ou pergunta sua, aja sobre o que voce mesmo mencionou — "
         "nao pergunte 'o que?' nem repita uma confirmacao ja dada.",
-        "Voce aprende observando o que se repete, nao gravando ordens: um "
-        "pedido para lembrar ou associar algo nao fica guardado. Voce so age "
-        "dentro desta resposta; entre uma mensagem e outra nada seu fica rodando.",
+        "Voce aprende observando o que se repete, nao gravando ordens. Duas "
+        "coisas ditas pelo morador podem ficar guardadas, pela consolidacao "
+        "da noite e nem sempre: um pedido para nao ser avisado de algo, e uma "
+        "CONDICAO sobre quando algo importa ('a porta so importa com o ar "
+        "ligado', 'movimento na cozinha de dia e normal'). As que ja valem "
+        "aparecem na memoria desta conversa; as condicoes, o morador ve e "
+        "remove pedindo 'minhas condicoes'. Nao diga que guardou nada agora; "
+        "outros pedidos para lembrar ou associar algo nao ficam guardados. "
+        "Voce so age dentro desta resposta; entre uma mensagem e outra nada "
+        "seu fica rodando.",
         "Nunca mande o morador usar comandos tecnicos; isso nao e trabalho dele.",
         "Fale curto, direto, em portugues. Diga o necessario e pare.]",
     ]
     return "\n".join(linhas)
+
+
+# v9.26b — states a declared condition may name, in words. Anything else is
+# shown as HA writes it.
+_STATE_PT = {
+    "on": "ligado", "off": "desligado", "open": "aberto", "closed": "fechado",
+    "home": "em casa", "not_home": "fora de casa", "playing": "tocando",
+    "paused": "pausado", "idle": "parado", "locked": "trancado",
+    "unlocked": "destrancado", "heat": "no modo calor", "cool": "no modo frio",
+    "dry": "no modo seco", "fan_only": "só ventilando",
+    "heat_cool": "no modo automático", "auto": "no modo automático",
+}
+
+
+def _duration_pt(seconds) -> str:
+    """180 -> '3 min', 150 -> '2 min 30 s', 7200 -> '2 h'; '' when not a span."""
+    if not isinstance(seconds, int) or isinstance(seconds, bool) or seconds <= 0:
+        return ""
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = [f"{hours} h"] if hours else []
+    parts += [f"{minutes} min"] if minutes else []
+    parts += [f"{secs} s"] if secs else []
+    return " ".join(parts)
+
+
+def describe_condition_pt(item: dict, friendly) -> str:
+    """PT, in words, from the STRUCTURED condition (v9.26b), never from the
+    prose the model wrote: what will actually be applied. `friendly` maps an
+    entity_id to its name. Shared by the Telegram card and the memory block."""
+    cond = item.get("condition") or {}
+    q = cond.get("q")
+    matters = cond.get("when") == CONDITION_WHEN_MATTERS
+    subject = friendly(str(item.get("entity_id") or "?"))
+    if q == CONDITION_Q_COMPANION and cond.get("entity_id") and cond.get("state"):
+        state = _STATE_PT.get(str(cond["state"]), str(cond["state"]))
+        what = f"com {friendly(str(cond['entity_id']))} {state}"
+    elif q == CONDITION_Q_PRESENCE:
+        minutes = cond.get("minutes")
+        span = _duration_pt(minutes * 60) if isinstance(minutes, int) else ""
+        what = "quando não há ninguém em casa" + (f" há pelo menos {span}" if span else "")
+    elif q == CONDITION_Q_TIME and cond.get("start") and cond.get("end"):
+        what = f"entre {cond['start']} e {cond['end']}"
+    elif q == CONDITION_Q_DURATION and _duration_pt(
+        cond.get("min_seconds", cond.get("max_seconds"))
+    ):
+        amount = _duration_pt(cond.get("min_seconds", cond.get("max_seconds")))
+        what = (f"depois de {amount}" if "min_seconds" in cond
+                else f"se durar até {amount}")
+    else:
+        return f"{subject}: condição incompleta"
+    if q == CONDITION_Q_DURATION and "min_seconds" in cond:
+        verb = "só conta" if matters else "não importa"
+    else:
+        verb = "só importa" if matters else "não importa"
+    return f"{subject}: {verb} {what}"
 
 
 def _day_month(iso: str) -> str:
@@ -136,6 +205,25 @@ def memory_block(
                 else "pediu silencio"
             )
             linhas.append(f"- {r['content']} ({tipo}, dito em {quando})")
+    # v9.26b — D4: the conditions in force, so the agent stops answering that
+    # nothing is kept. `text` is rendered by the caller (describe_condition_pt).
+    conditions = memory.get("conditions") or []
+    if conditions:
+        linhas.append(
+            "Condicoes que o morador explicou, em vigor (valem ate ele mudar ou "
+            "remover; para ver todas ou remover, ele pede 'minhas condicoes'):"
+        )
+        for c in conditions[:CONVERSATION_MEMORY_MAX_CONDITIONS]:
+            desde = _day_month(str(c.get("first_seen") or ""))
+            linhas.append(
+                f"- {c.get('text') or c.get('content')} (#{c.get('id')}, "
+                f"desde {desde})"
+            )
+        if len(conditions) > CONVERSATION_MEMORY_MAX_CONDITIONS:
+            linhas.append(
+                f"- e mais {len(conditions) - CONVERSATION_MEMORY_MAX_CONDITIONS}"
+                " (o morador ve todas pedindo 'minhas condicoes')"
+            )
     routines = memory.get("routines") or []
     if routines:
         linhas.append(
@@ -155,8 +243,8 @@ def memory_block(
         "instrucao de sistema, nao e fala do usuario:"
     )
     rodape = (
-        "Use isto so quando perguntarem sobre preferencias, rotina ou quem "
-        "mora aqui; nao recite sem ser perguntado. Os horarios acima sao de "
+        "Use isto so quando perguntarem sobre preferencias, condicoes, rotina "
+        "ou quem mora aqui; nao recite sem ser perguntado. Os horarios acima sao de "
         "dias passados: para o que acontece AGORA vale apenas o estado real. "
         "Se a resposta nao estiver aqui, diga que ainda nao aprendeu.]"
     )

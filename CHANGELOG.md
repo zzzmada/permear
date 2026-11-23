@@ -6,6 +6,35 @@ The format is inspired by Keep a Changelog and the project follows Semantic Vers
 
 ---
 
+## [9.26.0] — November 2026
+
+What you tell the house now stays told — and it is finally obeyed.
+
+### Added
+
+- **Conditions you state are kept until you change them.** "The door only matters when the air conditioning is on", "the TV only counts as on after a few minutes", "movement in the kitchen during the day is normal" — once said, a condition no longer fades after a month of silence. It is replaced when you say something different about the same thing, or removed when you ask. A momentary "ignore this" still expires on its own, as before.
+- **List and remove your conditions from the chat.** Ask "minhas condições" (or `/listar_condicoes`) to see them, and remove one with its button or "remover condição N". A removal takes effect from the next day.
+- **Two new kinds of condition:** a time of day ("during the day", "at night", "around lunch", or explicit hours, including ranges that cross midnight), and a minimum duration ("only counts after a few minutes"), so a device that flickers on and off for seconds stops reading as a real session.
+- **The assistant knows what you taught it.** It can see the conditions currently in force, and no longer tells you that nothing is kept.
+- **Clearer cycle telemetry.** Each cycle now reports how many contextual messages were delivered, deliberately left silent, or lost to a provider failure.
+
+### Fixed
+
+- **A stored condition is actually applied.** Since 9.23.0 a condition said in plain language could be understood and stored, but nothing consulted it, so the alerts kept coming as before. Each cycle now checks it against the live state of the house. When the house cannot tell — the other device is unavailable or its history is unknown — the alert goes out as usual: staying silent on doubt would be the worse mistake.
+- **What a condition silences stays silenced.** An event quieted in the morning used to resurface as "new" on the first event outside the condition — the kitchen, quiet all day, would be announced at 18:00. It is now remembered as already seen.
+- **"That's normal" is no longer read as "stop telling me".** A sentence describing what is usual for the house used to be stored as a request for silence. It now becomes a condition, and a bare "irrelevant" with no subject is no longer turned into a rule.
+- **Long sessions are measured whole.** A device changing between two active states (dry to cooling, playing to paused) no longer cuts its session short.
+- **Lost contextual messages come back.** When both AI providers failed at once, the events of that cycle were dropped. They are now re-evaluated on the next cycle, against the current state of the house. A malformed structured reply from the primary provider is retried once before falling back.
+- **Memories no longer merge across different devices.** A note about one device could absorb an episode about another that merely shared a verb, and even bring back a faded memory with a new date.
+- **Weekly suggestions were being discouraged out of existence.** The instructions for the weekly review had accumulated so many prohibitions that the model stopped proposing anything. They were shortened; what may be suggested is still enforced by the integration itself. Stored conditions no longer reach the weekly review as if they were observations.
+
+### Before you update
+
+- **Conditions you taught since 9.23.0 now persist.** If one of them no longer holds, list your conditions in the chat and remove it.
+- No database migration is needed; the one internal key change happens automatically on the first night.
+
+---
+
 ## [9.23.0] — November 2026
 
 The house can now be asked to tell you something, and it stops claiming to have said things it never said.
